@@ -1,0 +1,1 @@
+[23:42:33.195] Namespace(epochs=1, num_users=1, local_ep=1, local_bs=4, train_datasets='I', verbose=False, deterministic=False, seed=0, dim=256, device=device(type='cuda', index=0))

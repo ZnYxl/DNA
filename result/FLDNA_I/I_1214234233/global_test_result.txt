@@ -1,0 +1,6 @@
+train num: 1
+init weight: [1.]
+client I:	u_gepi	0.19378	u_lepi	0.00472	u_gale	1.19249	u_lale	0.07135
+FL round 1
+weight: [1.]
+client I.	acc	98.88000
