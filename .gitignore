@@ -16,3 +16,17 @@ __pycache__/
 .DS_Store
 .ipynb_checkpoints/
 venv/
+
+#忽略真实数据和压缩包
+*.fastq
+*.gz
+
+#忽略生成的图片
+*.png
+
+# 忽略真实数据和压缩包
+*.fastq
+*.gz
+
+# 忽略生成的图片
+*.png
