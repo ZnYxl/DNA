@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DNA 聚类 Metadata 生成脚本 - 修复张量维度问题
+🧬 无监督证据驱动DNA聚类与纠错模型
+核心策略: 迭代自举 (Iterative Self-Refinement)
+- 不依赖Ground Truth
+- 通过迭代更新consensus逐步逼近真实序列
 """
 
 import os
@@ -12,9 +15,16 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import torch.nn.functional as F
+from typing import Dict, List, Tuple, Optional
+import random
+from collections import defaultdict
+import matplotlib.pyplot as plt
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
 
 # ==========================================
-# 导入基础组件
+# 导入FedDNA核心组件
 # ==========================================
 try:
     from models.conmamba import ConmambaBlock
@@ -24,707 +34,769 @@ except ImportError as e:
     sys.exit(1)
 
 # ==========================================
-# 核心组件（保持不变）
+# 工具函数
 # ==========================================
 
-class SimpleEncoder(nn.Module):
-    def __init__(self, input_dim=4, hidden_dim=64, seq_len=150):
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim // 2),
+def safe_log(x, eps=1e-8):
+    return torch.log(torch.clamp(x, min=eps))
+
+def safe_div(x, y, eps=1e-8):
+    return x / torch.clamp(y, min=eps)
+
+def check_tensor_health(tensor, name="tensor"):
+    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+        return False
+    return True
+
+# ==========================================
+# FedDNA核心组件
+# ==========================================
+
+def calc_same_padding(kernel_size):
+    pad = kernel_size // 2
+    return (pad, pad - (kernel_size + 1) % 2)
+
+class Conv2dUpampling(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, conv_dropout_p: float, kernel_size=3):
+        super(Conv2dUpampling, self).__init__()
+        padding = calc_same_padding(kernel_size)
+        self.sequential = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim),
-            nn.LayerNorm(hidden_dim)
+            nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding),
+            nn.BatchNorm2d(num_features=out_channels),
+            nn.ReLU(),
         )
-        
-        self.conmamba = ConmambaBlock(dim=hidden_dim)
-        
+        self.dropout = nn.Dropout(p=conv_dropout_p)
+
+    def forward(self, inputs):
+        outputs = self.sequential(inputs.unsqueeze(1))
+        batch_size, channels, subsampled_lengths, sumsampled_dim = outputs.size()
+        outputs = outputs.permute(0, 2, 1, 3)
+        outputs = outputs.contiguous().view(batch_size, subsampled_lengths, channels * sumsampled_dim)
+        outputs = self.dropout(outputs)
+        return outputs
+
+class FedDNAEncoder(nn.Module):
+    def __init__(self, dim: int = 128):
+        super(FedDNAEncoder, self).__init__()
+        self.dim = dim
+        self.upsampling = Conv2dUpampling(in_channels=1, out_channels=dim//4, conv_dropout_p=0.1)
+        self.conmamba = ConmambaBlock(
+            dim=dim, ff_mult=4, conv_expansion_factor=2, conv_kernel_size=31,
+            attn_dropout=0.1, ff_dropout=0.1, conv_dropout=0.1
+        )
+
     def forward(self, x):
-        x = self.feature_extractor(x)
+        x = self.upsampling(x)
         x = self.conmamba(x)
         return x
 
-class ContrastiveLearning(nn.Module):
-    def __init__(self, hidden_dim=64, temperature=0.1):
-        super().__init__()
-        self.temperature = temperature
-        self.projection = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2)
+class FedDNARNNBlock(nn.Module):
+    def __init__(self, in_channels: int, lstm_hidden_dim: int = 256, rnn_dropout_p=0.1):
+        super(FedDNARNNBlock, self).__init__()
+        self.rnn = nn.LSTM(
+            input_size=in_channels, hidden_size=lstm_hidden_dim, 
+            num_layers=2, bidirectional=False, batch_first=True
         )
+        self.linear = nn.Linear(in_features=lstm_hidden_dim, out_features=4)
+        self.dropout = nn.Dropout(rnn_dropout_p)
+
+    def forward(self, input):
+        output, _ = self.rnn(input)
+        output = self.linear(output)
+        output = self.dropout(output)
+        return F.softplus(output) + 0.1
+
+def ds_fusion(evidence: torch.Tensor) -> torch.Tensor:
+    """证据融合：在reads维度上取平均"""
+    fused_evidence = torch.mean(evidence, dim=0)
+    return torch.clamp(fused_evidence, min=0.1, max=100.0)
+
+# ==========================================
+# 无监督损失函数
+# ==========================================
+
+class UnsupervisedConsensusLoss(nn.Module):
+    """
+    无监督损失函数：不依赖GT
     
-    def forward(self, embeddings):
-        seq_repr = torch.mean(embeddings, dim=1)
-        projected = self.projection(seq_repr)
-        return F.normalize(projected, dim=-1)
-
-class DirichletEvidenceDecoder(nn.Module):
-    def __init__(self, hidden_dim=64, output_dim=4):
-        super().__init__()
-        self.output_dim = output_dim
-        
-        self.evidence_net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
-            nn.Softplus()
-        )
-        
-    def forward(self, x):
-        evidence = self.evidence_net(x)
-        alpha = evidence + 1.0
-        alpha_sum = torch.sum(alpha, dim=-1, keepdim=True)
-        predictions = alpha / alpha_sum
-        K = self.output_dim
-        uncertainty = K / alpha_sum.squeeze(-1)
-        evidence_strength = torch.sum(evidence, dim=-1)
-        
-        return {
-            'evidence': evidence,
-            'alpha': alpha,
-            'predictions': predictions,
-            'uncertainty': uncertainty,
-            'strength': evidence_strength
-        }
-
-class DirichletEvidenceFusion(nn.Module):
+    核心思想：
+    1. 让模型输出的evidence与当前伪标签一致
+    2. 同时鼓励模型输出高置信度的预测
+    """
     def __init__(self):
         super().__init__()
-        
-    def forward(self, dirichlet_outputs):
-        evidence = dirichlet_outputs['evidence']
-        uncertainty = dirichlet_outputs['uncertainty']
-        
-        fusion_weights = 1.0 / (uncertainty + 1e-8)
-        fusion_weights = fusion_weights.unsqueeze(-1)
-        
-        weighted_evidence = evidence * fusion_weights
-        fused_evidence = torch.sum(weighted_evidence, dim=0)
-        total_weights = torch.sum(fusion_weights, dim=0)
-        
-        fused_evidence = fused_evidence / (total_weights + 1e-8)
-        
-        fused_alpha = fused_evidence + 1.0
-        fused_alpha_sum = torch.sum(fused_alpha, dim=-1, keepdim=True)
-        fused_predictions = fused_alpha / fused_alpha_sum
-        fused_uncertainty = evidence.shape[-1] / fused_alpha_sum.squeeze(-1)
-        
-        return {
-            'fused_evidence': fused_evidence,
-            'fused_alpha': fused_alpha,
-            'fused_predictions': fused_predictions,
-            'fused_uncertainty': fused_uncertainty,
-            'fusion_weights': fusion_weights.squeeze(-1)
-        }
-
-class SimplifiedFedDNA(nn.Module):
-    def __init__(self, input_dim=4, hidden_dim=64, seq_len=150):
-        super().__init__()
-        self.encoder = SimpleEncoder(input_dim, hidden_dim, seq_len)
-        self.contrastive = ContrastiveLearning(hidden_dim)
-        self.evidence_decoder = DirichletEvidenceDecoder(hidden_dim, input_dim)
-        self.evidence_fusion = DirichletEvidenceFusion()
-        
-    def forward(self, reads_batch):
-        B, N, L, D = reads_batch.shape
-        reads_flat = reads_batch.view(B * N, L, D)
-        
-        embeddings = self.encoder(reads_flat)
-        contrastive_features = self.contrastive(embeddings)
-        dirichlet_outputs = self.evidence_decoder(embeddings)
-        
-        for key in dirichlet_outputs:
-            if dirichlet_outputs[key].dim() == 3:
-                dirichlet_outputs[key] = dirichlet_outputs[key].view(B, N, L, -1)
-            elif dirichlet_outputs[key].dim() == 2:
-                dirichlet_outputs[key] = dirichlet_outputs[key].view(B, N, L)
-        
-        contrastive_features = contrastive_features.view(B, N, -1)
-        
-        return dirichlet_outputs, contrastive_features
-
-class DirichletComprehensiveLoss(nn.Module):
-    def __init__(self, alpha=1.0, beta=0.1, gamma=0.01, temperature=0.1):
-        super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.temperature = temperature
-        
-    def dirichlet_expected_mse(self, fused_predictions, target):
-        mse = torch.mean((fused_predictions - target) ** 2)
-        return mse
     
-    def dirichlet_kl_divergence(self, alpha, target_alpha=None):
-        if target_alpha is None:
-            K = alpha.shape[-1]
-            target_alpha = torch.ones_like(alpha)
+    def forward(self, evidence, pseudo_label):
+        """
+        evidence: [L, 4] - 模型融合后的evidence
+        pseudo_label: [L, 4] - 当前的伪标签 (one-hot)
+        """
+        evidence = torch.clamp(evidence, min=0.1, max=100.0)
+        alpha = evidence + 1.0
+        S = torch.sum(alpha, dim=-1, keepdim=True)
         
-        alpha_sum = torch.sum(alpha, dim=-1, keepdim=True)
-        target_alpha_sum = torch.sum(target_alpha, dim=-1, keepdim=True)
+        # 预测概率
+        prob = safe_div(alpha, S)
+        prob = torch.clamp(prob, min=1e-8, max=1.0)
         
-        kl_div = (
-            torch.lgamma(alpha_sum) - torch.lgamma(target_alpha_sum) +
-            torch.sum(torch.lgamma(target_alpha) - torch.lgamma(alpha), dim=-1, keepdim=True) +
-            torch.sum((alpha - target_alpha) * (torch.digamma(alpha) - torch.digamma(alpha_sum)), dim=-1, keepdim=True)
-        )
+        # 1. 与伪标签的交叉熵
+        log_prob = safe_log(prob)
+        ce_loss = -torch.sum(pseudo_label * log_prob, dim=-1)
+        
+        # 2. 置信度奖励：鼓励高置信度预测（低熵）
+        entropy = -torch.sum(prob * log_prob, dim=-1)
+        
+        # 总损失 = 交叉熵 + 熵正则（较小权重）
+        total_loss = ce_loss + 0.1 * entropy
+        
+        return torch.mean(total_loss), torch.mean(ce_loss), torch.mean(entropy)
+
+
+class ReadConsistencyLoss(nn.Module):
+    """
+    Reads一致性损失：鼓励同一cluster内的reads产生相似的evidence
+    """
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, evidence_per_read):
+        """
+        evidence_per_read: [N, L, 4] - 每条read的evidence
+        """
+        N = evidence_per_read.shape[0]
+        if N <= 1:
+            return torch.tensor(0.0, device=evidence_per_read.device)
+        
+        # 计算每条read的概率分布
+        alpha = evidence_per_read + 1.0
+        S = torch.sum(alpha, dim=-1, keepdim=True)
+        prob = alpha / S  # [N, L, 4]
+        
+        # 计算均值分布
+        mean_prob = torch.mean(prob, dim=0, keepdim=True)  # [1, L, 4]
+        
+        # 每条read与均值的KL散度
+        kl_div = torch.sum(prob * (safe_log(prob) - safe_log(mean_prob)), dim=-1)  # [N, L]
         
         return torch.mean(kl_div)
-    
-    def contrastive_loss(self, features, cluster_labels=None):
-        if features.shape[0] <= 1:
-            return torch.tensor(0.0, device=features.device)
-            
-        features_norm = F.normalize(features, dim=1)
-        similarity_matrix = torch.matmul(features_norm, features_norm.T) / self.temperature
-        
-        batch_size = features.shape[0]
-        mask = torch.eye(batch_size, device=features.device).bool()
-        
-        exp_sim = torch.exp(similarity_matrix)
-        exp_sim = exp_sim.masked_fill(mask, 0)
-        
-        pos_sim = torch.sum(exp_sim, dim=1) / (batch_size - 1)
-        neg_sim = torch.sum(exp_sim, dim=1)
-        
-        loss = -torch.log(pos_sim / (neg_sim + 1e-8))
-        return torch.mean(loss)
-    
-    def forward(self, fusion_results, target, contrastive_features):
-        fused_predictions = fusion_results['fused_predictions']
-        fused_alpha = fusion_results['fused_alpha']
-        
-        expected_mse = self.dirichlet_expected_mse(fused_predictions, target)
-        contrastive_loss = self.contrastive_loss(contrastive_features)
-        dirichlet_kl = self.dirichlet_kl_divergence(fused_alpha)
-        
-        total_loss = (self.alpha * expected_mse + 
-                     self.beta * contrastive_loss + 
-                     self.gamma * dirichlet_kl)
-        
-        return {
-            'total_loss': total_loss,
-            'expected_mse': expected_mse,
-            'contrastive_loss': contrastive_loss,
-            'dirichlet_kl': dirichlet_kl
-        }
 
 # ==========================================
-# 🔥 修复版修正模块 - 解决张量维度问题
+# 主模型
 # ==========================================
 
-class DirichletEvidenceRefinementFixed(nn.Module):
-    def __init__(self, 
-                 uncertainty_threshold_start=0.4,
-                 uncertainty_threshold_end=0.3,
-                 confidence_threshold_start=0.3,
-                 confidence_threshold_end=0.6,
-                 distance_threshold=2.0,
-                 max_refinement_ratio=0.5,
-                 force_refinement_ratio=0.1):
+class UnsupervisedDNACorrector(nn.Module):
+    """无监督DNA纠错模型"""
+    
+    def __init__(self, input_dim: int = 4, hidden_dim: int = 128, seq_len: int = 150):
         super().__init__()
-        self.uncertainty_threshold_start = uncertainty_threshold_start
-        self.uncertainty_threshold_end = uncertainty_threshold_end
-        self.confidence_threshold_start = confidence_threshold_start
-        self.confidence_threshold_end = confidence_threshold_end
-        self.distance_threshold = distance_threshold
-        self.max_refinement_ratio = max_refinement_ratio
-        self.force_refinement_ratio = force_refinement_ratio
         
-        self.global_cluster_centers = None
-        
-    def get_adaptive_thresholds(self, epoch, max_epochs):
-        progress = min(epoch / max(max_epochs - 1, 1), 1.0)
-        uncertainty_threshold = (self.uncertainty_threshold_start + 
-                               progress * (self.uncertainty_threshold_end - self.uncertainty_threshold_start))
-        confidence_threshold = (self.confidence_threshold_start + 
-                              progress * (self.confidence_threshold_end - self.confidence_threshold_start))
-        return uncertainty_threshold, confidence_threshold
-    
-    def calculate_dirichlet_confidence(self, uncertainty):
-        avg_uncertainty = torch.mean(uncertainty, dim=1)
-        confidence_scores = torch.exp(-1.0 * avg_uncertainty)
-        return confidence_scores, avg_uncertainty
-    
-    def update_global_centers(self, embeddings, labels):
-        if embeddings.shape[0] > 1:
-            unique_labels = torch.unique(labels[labels != -1])
-            if len(unique_labels) > 1:
-                device = embeddings.device
-                feature_dim = embeddings.shape[1]
-                centers = torch.zeros(3, feature_dim, device=device)
-                
-                for i, label in enumerate(unique_labels):
-                    if i >= 3: break
-                    mask = (labels == label)
-                    if mask.sum() > 0:
-                        centers[i] = torch.mean(embeddings[mask], dim=0)
-                
-                for i in range(len(unique_labels), 3):
-                    centers[i] = torch.randn(feature_dim, device=device) * 0.1
-                
-                self.global_cluster_centers = centers
-    
-    def create_initial_labels_improved(self, embeddings, num_clusters=3):
-        N = embeddings.shape[0]
-        device = embeddings.device
-        
-        if N == 1:
-            if self.global_cluster_centers is not None:
-                distances = torch.cdist(embeddings, self.global_cluster_centers)
-                label = torch.argmin(distances, dim=1)
-                return label
-            else:
-                label = torch.randint(0, num_clusters, (1,), device=device)
-                return label
-        
-        if N <= num_clusters:
-            return torch.arange(N, device=device)
-        
-        try:
-            from sklearn.cluster import KMeans
-            embeddings_np = embeddings.detach().cpu().numpy()
-            kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(embeddings_np)
-            return torch.tensor(labels, device=device, dtype=torch.long)
-        except ImportError:
-            center_indices = torch.randperm(N, device=device)[:num_clusters]
-            centers = embeddings[center_indices]
-            distances = torch.cdist(embeddings, centers)
-            labels = torch.argmin(distances, dim=1)
-            return labels
-    
-    def identify_hard_samples(self, uncertainty, confidence_scores, 
-                             uncertainty_threshold, confidence_threshold, N):
-        avg_uncertainty = torch.mean(uncertainty, dim=1)
-        
-        if N == 1:
-            single_uncertainty = avg_uncertainty[0].item()
-            single_confidence = confidence_scores[0].item()
-            should_modify = (single_uncertainty > 0.35) or (single_confidence < 0.65)
-            hard_sample_mask = torch.tensor([should_modify], device=uncertainty.device)
-            
-            return hard_sample_mask, {
-                'avg_uncertainty': single_uncertainty,
-                'uncertainty_threshold_used': uncertainty_threshold,
-                'confidence_threshold_used': confidence_threshold,
-            }
-        
-        high_uncertainty_mask = avg_uncertainty > uncertainty_threshold
-        low_confidence_mask = confidence_scores < confidence_threshold
-        hard_sample_mask = high_uncertainty_mask | low_confidence_mask
-        
-        if hard_sample_mask.sum() == 0:
-            num_force = max(1, int(N * self.force_refinement_ratio))
-            _, worst_indices = torch.topk(avg_uncertainty, num_force)
-            hard_sample_mask = torch.zeros(N, dtype=torch.bool, device=uncertainty.device)
-            hard_sample_mask[worst_indices] = True
-        
-        if hard_sample_mask.sum() > N * self.max_refinement_ratio:
-            num_hard = int(N * self.max_refinement_ratio)
-            hard_indices = torch.where(hard_sample_mask)[0]
-            hard_uncertainties = avg_uncertainty[hard_indices]
-            _, selected_indices = torch.topk(hard_uncertainties, num_hard)
-            new_hard_mask = torch.zeros(N, dtype=torch.bool, device=uncertainty.device)
-            new_hard_mask[hard_indices[selected_indices]] = True
-            hard_sample_mask = new_hard_mask
-        
-        return hard_sample_mask, {
-            'avg_uncertainty': avg_uncertainty.mean().item(),
-            'uncertainty_threshold_used': uncertainty_threshold,
-            'confidence_threshold_used': confidence_threshold,
-        }
-    
-    def reassign_single_sample(self, embedding, current_label, num_clusters=3):
-        """🔥 修复版单样本重分配 - 返回标量值"""
-        device = embedding.device
-        current_label_value = current_label.item() if current_label.dim() > 0 else current_label
-        
-        if self.global_cluster_centers is not None:
-            distances = torch.cdist(embedding.unsqueeze(0), self.global_cluster_centers)
-            nearest_label = torch.argmin(distances).item()
-            
-            if nearest_label != current_label_value:
-                print(f"       🎯 单样本重分配: {current_label_value} → {nearest_label}")
-                return nearest_label, distances.min().item()
-            else:
-                if torch.rand(1).item() < 0.3:
-                    available_labels = [i for i in range(num_clusters) if i != current_label_value]
-                    if available_labels:
-                        new_label = np.random.choice(available_labels)
-                        print(f"       🎲 单样本随机改变: {current_label_value} → {new_label}")
-                        return new_label, distances.min().item()
-        
-        if torch.rand(1).item() < 0.2:
-            available_labels = [i for i in range(num_clusters) if i != current_label_value]
-            if available_labels:
-                new_label = np.random.choice(available_labels)
-                print(f"       🎲 单样本随机改变: {current_label_value} → {new_label}")
-                return new_label, 1.0
-        
-        print(f"       ✅ 单样本保持: {current_label_value}")
-        return current_label_value, 0.0
-    
-    def compute_cluster_centers(self, embeddings, labels, num_clusters):
-        device = embeddings.device
-        feature_dim = embeddings.shape[1]
-        centers = torch.zeros(num_clusters, feature_dim, device=device)
-        
-        for k in range(num_clusters):
-            mask = (labels == k)
-            if mask.sum() > 0:
-                centers[k] = torch.mean(embeddings[mask], dim=0)
-            else:
-                centers[k] = torch.randn(feature_dim, device=device) * 0.1
-                
-        return centers
-    
-    def reassign_hard_samples(self, hard_embeddings, cluster_centers, 
-                            hard_indices, current_labels):
-        if hard_embeddings.shape[0] == 0:
-            return torch.tensor([], dtype=torch.long, device=hard_embeddings.device), torch.tensor([], device=hard_embeddings.device)
-            
-        distances = torch.cdist(hard_embeddings, cluster_centers)
-        min_distances, nearest_clusters = torch.min(distances, dim=1)
-        
-        current_hard_labels = current_labels[hard_indices]
-        new_labels = nearest_clusters.clone()
-        
-        current_distances = distances[torch.arange(len(hard_indices)), current_hard_labels]
-        improvement_ratio = (current_distances - min_distances) / (current_distances + 1e-8)
-        
-        # 宽松策略：只要有1%改善就改变
-        significant_improvement = improvement_ratio > 0.01
-        
-        # 对没有改善的样本，50%概率随机改变
-        no_improvement_mask = ~significant_improvement
-        if no_improvement_mask.sum() > 0:
-            random_change = torch.rand(no_improvement_mask.sum(), device=hard_embeddings.device) < 0.5
-            # 保持最近邻分配（已经在new_labels中）
-        
-        noise_mask = min_distances > self.distance_threshold
-        new_labels[noise_mask] = -1
-        
-        changed_count = (new_labels != current_hard_labels).sum().item()
-        print(f"       🔧 多样本重分配: {changed_count}/{len(hard_indices)} 个标签改变")
-        
-        return new_labels, min_distances
-    
-    def forward(self, embeddings, dirichlet_uncertainty, current_labels, num_clusters, 
-                epoch=0, max_epochs=10):
-        """🔥 修复版主流程 - 解决张量维度问题"""
-        N = embeddings.shape[0]
-        device = embeddings.device
-        
-        uncertainty_threshold, confidence_threshold = self.get_adaptive_thresholds(epoch, max_epochs)
-        
-        if N > 1:
-            self.update_global_centers(embeddings, current_labels)
-        
-        unique_labels = torch.unique(current_labels)
-        if len(unique_labels) == 1:
-            print(f"    🔄 重新初始化标签...")
-            current_labels = self.create_initial_labels_improved(embeddings, num_clusters)
-        
-        confidence_scores, avg_uncertainty = self.calculate_dirichlet_confidence(dirichlet_uncertainty)
-        
-        hard_sample_mask, criteria_stats = self.identify_hard_samples(
-            dirichlet_uncertainty, confidence_scores, uncertainty_threshold, confidence_threshold, N
-        )
-        
-        high_confidence_mask = ~hard_sample_mask
-        new_labels = current_labels.clone()
-        
-        reassignment_stats = {'label_change_count': 0}
-        
-        if hard_sample_mask.sum() > 0:
-            print(f"    🔧 处理 {hard_sample_mask.sum().item()} 个困难样本...")
-            
-            if N == 1:
-                # 🔥 修复单样本处理
-                hard_embedding = embeddings[0]
-                current_label = current_labels[0]
-                new_label_value, distance = self.reassign_single_sample(hard_embedding, current_label, num_clusters)
-                
-                # 🔥 正确赋值：直接使用标量值
-                new_labels[0] = new_label_value
-                reassignment_stats['label_change_count'] = 1 if new_label_value != current_label.item() else 0
-                
-            else:
-                # 多样本处理
-                if high_confidence_mask.sum() > 0:
-                    high_conf_embeddings = embeddings[high_confidence_mask]
-                    high_conf_labels = current_labels[high_confidence_mask]
-                    cluster_centers = self.compute_cluster_centers(
-                        high_conf_embeddings, high_conf_labels, num_clusters
-                    )
-                else:
-                    cluster_centers = self.compute_cluster_centers(
-                        embeddings, current_labels, num_clusters
-                    )
-                
-                hard_embeddings = embeddings[hard_sample_mask]
-                hard_indices = torch.where(hard_sample_mask)[0]
-                
-                reassigned_labels, distances = self.reassign_hard_samples(
-                    hard_embeddings, cluster_centers, hard_indices, current_labels
-                )
-                
-                old_hard_labels = new_labels[hard_sample_mask].clone()
-                new_labels[hard_sample_mask] = reassigned_labels
-                reassignment_stats['label_change_count'] = (reassigned_labels != old_hard_labels).sum().item()
-        
-        total_label_changes = (new_labels != current_labels).sum().item()
-        
-        return new_labels, {
-            'total_samples': N,
-            'hard_samples_count': hard_sample_mask.sum().item(),
-            'label_changes': total_label_changes,
-            'refinement_ratio': total_label_changes / N if N > 0 else 0.0,
-            'avg_confidence': confidence_scores.mean().item(),
-            'avg_uncertainty': avg_uncertainty.mean().item(),
-            **criteria_stats,
-            **reassignment_stats
-        }
-
-# ==========================================
-# 数据集（保持不变）
-# ==========================================
-
-class CloverClusterDataset(Dataset):
-    def __init__(self, data_dir, seq_len=150):
+        self.dim = hidden_dim
         self.seq_len = seq_len
-        self.clusters = [] 
         
+        self.encoder = FedDNAEncoder(dim=hidden_dim)
+        self.length_adapter = nn.Linear(seq_len, seq_len)
+        self.rnnblock = FedDNARNNBlock(in_channels=hidden_dim, lstm_hidden_dim=256)
+        
+        self._init_weights()
+        
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, reads_batch, return_per_read=False):
+        """
+        reads_batch: [N, L, 4] - 单个cluster的N条reads
+        
+        返回:
+            fused_evidence: [L, 4] - 融合后的evidence
+            (可选) evidence_per_read: [N, L, 4]
+        """
+        N, L, D = reads_batch.shape
+        
+        # 编码
+        encoded = self.encoder(reads_batch)  # [N, L, dim]
+        
+        if not check_tensor_health(encoded, "encoded"):
+            safe_output = torch.ones(L, 4, device=reads_batch.device) * 0.25
+            if return_per_read:
+                return safe_output, torch.ones(N, L, 4, device=reads_batch.device) * 0.25
+            return safe_output
+        
+        # 长度适配
+        encoded = encoded.permute(0, 2, 1)
+        encoded = self.length_adapter(encoded)
+        encoded = encoded.permute(0, 2, 1)
+        
+        # 生成evidence
+        evidence_per_read = self.rnnblock(encoded)  # [N, L, 4]
+        
+        # 融合
+        fused_evidence = ds_fusion(evidence_per_read)  # [L, 4]
+        
+        if return_per_read:
+            return fused_evidence, evidence_per_read
+        return fused_evidence
+    
+    def predict_consensus(self, reads_batch) -> str:
+        """从reads预测consensus序列"""
+        self.eval()
+        with torch.no_grad():
+            fused_evidence = self.forward(reads_batch)
+            alpha = fused_evidence + 1.0
+            prob = alpha / torch.sum(alpha, dim=-1, keepdim=True)
+            pred_indices = torch.argmax(prob, dim=-1)
+            
+            idx_to_base = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
+            consensus = ''.join([idx_to_base[i.item()] for i in pred_indices])
+        return consensus
+
+# ==========================================
+# 数据集
+# ==========================================
+
+class UnsupervisedDNADataset(Dataset):
+    """无监督DNA数据集：伪标签可动态更新"""
+    
+    def __init__(self, data_dir: str, seq_len: int = 150):
+        self.seq_len = seq_len
+        self.clusters = []
+        self.base_mapping = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+        self.idx_to_base = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
+        
+        self._load_data(data_dir)
+        
+    def _load_data(self, data_dir):
         read_path = os.path.join(data_dir, "read.txt")
         ref_path = os.path.join(data_dir, "ref.txt")
         if not os.path.exists(ref_path):
             ref_path = os.path.join(data_dir, "reference.txt")
             
-        if not os.path.exists(read_path):
-            print(f"❌ 错误: 找不到数据文件 {read_path}")
-            return
+        print(f"📂 加载数据: {data_dir}")
         
-        print(f"📂 正在加载数据: {data_dir}")
+        # 加载初始伪标签（聚类中心）
         with open(ref_path, 'r') as f:
-            refs = [line.strip() for line in f if line.strip()]
+            pseudo_labels = [line.strip() for line in f if line.strip()]
+        
+        # 加载reads
         with open(read_path, 'r') as f:
             content = f.read().strip()
         raw_clusters = content.split("===============================")
         
         for i, cluster_block in enumerate(raw_clusters):
-            if not cluster_block.strip(): continue
-            if i >= len(refs): break
+            if not cluster_block.strip() or i >= len(pseudo_labels):
+                continue
+                
             reads = [r.strip() for r in cluster_block.strip().split('\n') if r.strip()]
             if len(reads) > 0:
-                self.clusters.append({'ref': refs[i], 'reads': reads})
+                self.clusters.append({
+                    'cluster_id': i,
+                    'pseudo_label': pseudo_labels[i],  # 可更新的伪标签
+                    'reads': reads
+                })
                 
         print(f"✅ 加载完成: {len(self.clusters)} 个簇")
-
-    def one_hot(self, seq):
-        mapping = {'A':0, 'C':1, 'G':2, 'T':3}
+        
+        # 打印初始统计
+        self._print_cluster_stats()
+    
+    def _print_cluster_stats(self):
+        """打印cluster统计信息"""
+        reads_counts = [len(c['reads']) for c in self.clusters]
+        print(f"📊 Cluster统计:")
+        print(f"   - 数量: {len(self.clusters)}")
+        print(f"   - Reads/cluster: {np.mean(reads_counts):.1f} ± {np.std(reads_counts):.1f}")
+        print(f"   - 范围: [{min(reads_counts)}, {max(reads_counts)}]")
+    
+    def one_hot_encode(self, seq: str) -> np.ndarray:
         arr = np.zeros((self.seq_len, 4), dtype=np.float32)
-        l = min(len(seq), self.seq_len)
-        for i in range(l):
-            char = seq[i]
-            if char in mapping: arr[i, mapping[char]] = 1.0
+        for i, char in enumerate(seq[:self.seq_len]):
+            if char in self.base_mapping:
+                arr[i, self.base_mapping[char]] = 1.0
         return arr
-
-    def __len__(self): return len(self.clusters)
-
+    
+    def update_pseudo_label(self, cluster_id: int, new_label: str):
+        """更新某个cluster的伪标签"""
+        if cluster_id < len(self.clusters):
+            self.clusters[cluster_id]['pseudo_label'] = new_label
+    
+    def get_cluster_data(self, cluster_id: int, num_reads: int = 8):
+        """获取单个cluster的数据"""
+        if cluster_id >= len(self.clusters):
+            return None, None
+            
+        cluster = self.clusters[cluster_id]
+        reads = cluster['reads']
+        pseudo_label = cluster['pseudo_label']
+        
+        # 随机采样reads
+        selected_reads = random.sample(reads, min(num_reads, len(reads)))
+        
+        reads_encoded = [self.one_hot_encode(read) for read in selected_reads]
+        label_encoded = self.one_hot_encode(pseudo_label)
+        
+        return (
+            torch.tensor(np.array(reads_encoded)),
+            torch.tensor(label_encoded)
+        )
+    
+    def __len__(self):
+        return len(self.clusters)
+    
     def __getitem__(self, idx):
-        cluster = self.clusters[idx]
-        reads_vec = np.array([self.one_hot(r) for r in cluster['reads']])
-        ref_vec = self.one_hot(cluster['ref'])
-        return torch.tensor(reads_vec), torch.tensor(ref_vec)
+        return self.get_cluster_data(idx)
 
 # ==========================================
-# 训练器（保持不变）
+# 🎯 无监督训练器（核心！）
 # ==========================================
 
-class DirichletRefinementTrainerFixed:
-    def __init__(self, model, criterion, optimizer, refinement_module, 
-                 convergence_threshold=0.05, max_epochs=15, min_epochs=5):
-        self.model = model
-        self.criterion = criterion
-        self.optimizer = optimizer
-        self.refinement = refinement_module
-        self.convergence_threshold = convergence_threshold
-        self.max_epochs = max_epochs
-        self.min_epochs = min_epochs
-        self.persistent_labels = {}
+class UnsupervisedTrainer:
+    """
+    无监督训练器
+    
+    核心策略: 迭代自举
+    1. 用当前伪标签训练模型
+    2. 用模型输出更新伪标签
+    3. 重复直到收敛
+    """
+    
+    def __init__(self, 
+                 model: UnsupervisedDNACorrector,
+                 dataset: UnsupervisedDNADataset,
+                 device: torch.device,
+                 num_reads: int = 8,
+                 lr: float = 1e-4):
         
-    def train_epoch_with_refinement(self, dataloader, device, epoch):
-        self.model.train()
-        epoch_losses = {'total_loss': 0, 'expected_mse': 0, 'contrastive_loss': 0, 'dirichlet_kl': 0}
-        all_refinement_stats = []
-        step_count = 0
+        self.model = model.to(device)
+        self.dataset = dataset
+        self.device = device
+        self.num_reads = num_reads
         
-        print(f"\n🔄 Epoch {epoch+1}...")
+        # 损失函数
+        self.consensus_loss = UnsupervisedConsensusLoss()
+        self.consistency_loss = ReadConsistencyLoss()
         
-        for i, (reads, ref) in enumerate(dataloader):
-            reads = reads.to(device)
-            ref = ref.squeeze(0).to(device)
-            N = reads.shape[1]
-            
-            self.optimizer.zero_grad()
-            dirichlet_outputs, contrastive_features = self.model(reads)
-            
-            single_batch_outputs = {}
-            for key in dirichlet_outputs:
-                single_batch_outputs[key] = dirichlet_outputs[key].squeeze(0)
-            
-            fusion_results = self.model.evidence_fusion(single_batch_outputs)
-            contrastive_features_flat = contrastive_features.squeeze(0)
-            losses = self.criterion(fusion_results, ref, contrastive_features_flat)
-            
-            losses['total_loss'].backward()
-            self.optimizer.step()
-            
-            with torch.no_grad():
-                batch_key = f"batch_{i}"
-                if batch_key not in self.persistent_labels:
-                    initial_labels = torch.randint(0, 3, (N,), device=device)
-                    self.persistent_labels[batch_key] = initial_labels
-                
-                current_labels = self.persistent_labels[batch_key]
-                dirichlet_uncertainty = single_batch_outputs['uncertainty']
-                
-                new_labels, refinement_stats = self.refinement(
-                    embeddings=contrastive_features_flat,
-                    dirichlet_uncertainty=dirichlet_uncertainty,
-                    current_labels=current_labels,
-                    num_clusters=3,
-                    epoch=epoch,
-                    max_epochs=self.max_epochs
-                )
-                
-                self.persistent_labels[batch_key] = new_labels
-                all_refinement_stats.append(refinement_stats)
-            
-            for key in epoch_losses:
-                epoch_losses[key] += losses[key].item()
-            step_count += 1
-            
-            # 每10个batch输出一次进度
-            if (i + 1) % 10 == 0:
-                print(f"  📊 Step {i+1:3d} | Loss: {losses['total_loss'].item():.4f} | "
-                      f"修正: {refinement_stats['refinement_ratio']:.3f}")
+        # 优化器
+        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=50)
         
-        avg_losses = {key: val / max(1, step_count) for key, val in epoch_losses.items()}
-        
-        if all_refinement_stats:
-            avg_refinement_ratio = np.mean([s['refinement_ratio'] for s in all_refinement_stats])
-            avg_confidence = np.mean([s['avg_confidence'] for s in all_refinement_stats])
-            avg_uncertainty = np.mean([s['avg_uncertainty'] for s in all_refinement_stats])
-            total_hard_samples = sum([s['hard_samples_count'] for s in all_refinement_stats])
-            total_label_changes = sum([s['label_changes'] for s in all_refinement_stats])
-        else:
-            avg_refinement_ratio = 0.0
-            avg_confidence = 0.0
-            avg_uncertainty = 0.0
-            total_hard_samples = 0
-            total_label_changes = 0
-            
-        return avg_losses, {
-            'refinement_ratio': avg_refinement_ratio,
-            'avg_confidence': avg_confidence,
-            'avg_uncertainty': avg_uncertainty,
-            'total_hard_samples': total_hard_samples,
-            'total_label_changes': total_label_changes
+        # 训练历史
+        self.history = {
+            'total_loss': [],
+            'ce_loss': [],
+            'entropy': [],
+            'consistency': [],
+            'pseudo_label_change_rate': [],
+            'consensus_stability': []
         }
     
-    def train_with_refinement(self, dataloader, device):
-        print("🚀 开始训练...")
-        training_history = {
-            'losses': [],
-            'refinement_ratios': [],
-            'uncertainties': []
+    def compute_reads_agreement(self, cluster_id: int) -> float:
+        """计算reads与当前伪标签的一致性"""
+        cluster = self.dataset.clusters[cluster_id]
+        pseudo_label = cluster['pseudo_label']
+        reads = cluster['reads']
+        
+        total_matches = 0
+        total_positions = 0
+        
+        for read in reads:
+            min_len = min(len(read), len(pseudo_label))
+            matches = sum(r == p for r, p in zip(read[:min_len], pseudo_label[:min_len]))
+            total_matches += matches
+            total_positions += min_len
+        
+        return total_matches / max(total_positions, 1)
+    
+    def update_pseudo_labels(self) -> Tuple[float, float]:
+        """
+        用模型输出更新所有cluster的伪标签
+        
+        返回:
+            change_rate: 伪标签变化比例
+            avg_agreement: 平均一致性
+        """
+        self.model.eval()
+        
+        total_changed = 0
+        total_positions = 0
+        agreements = []
+        
+        with torch.no_grad():
+            for cluster_id in range(len(self.dataset.clusters)):
+                cluster = self.dataset.clusters[cluster_id]
+                reads = cluster['reads']
+                old_label = cluster['pseudo_label']
+                
+                # 编码所有reads
+                reads_encoded = [self.dataset.one_hot_encode(r) for r in reads]
+                reads_tensor = torch.tensor(np.array(reads_encoded)).to(self.device)
+                
+                # 预测新的consensus
+                new_label = self.model.predict_consensus(reads_tensor)
+                
+                # 计算变化
+                min_len = min(len(old_label), len(new_label))
+                changed = sum(o != n for o, n in zip(old_label[:min_len], new_label[:min_len]))
+                total_changed += changed
+                total_positions += min_len
+                
+                # 更新伪标签
+                self.dataset.update_pseudo_label(cluster_id, new_label)
+                
+                # 计算一致性
+                agreement = self.compute_reads_agreement(cluster_id)
+                agreements.append(agreement)
+        
+        change_rate = total_changed / max(total_positions, 1)
+        avg_agreement = np.mean(agreements)
+        
+        return change_rate, avg_agreement
+    
+    def train_epoch(self, epoch: int) -> Dict:
+        """训练一个epoch"""
+        self.model.train()
+        
+        epoch_stats = {
+            'total_loss': 0.0,
+            'ce_loss': 0.0,
+            'entropy': 0.0,
+            'consistency': 0.0
         }
         
-        for epoch in range(self.max_epochs):
-            avg_losses, refinement_stats = self.train_epoch_with_refinement(dataloader, device, epoch)
-            
-            training_history['losses'].append(avg_losses)
-            training_history['refinement_ratios'].append(refinement_stats['refinement_ratio'])
-            training_history['uncertainties'].append(refinement_stats['avg_uncertainty'])
-            
-            print(f"\n📈 Epoch {epoch+1} 完成:")
-            print(f"   损失: {avg_losses['total_loss']:.4f}")
-            print(f"   修正比例: {refinement_stats['refinement_ratio']:.4f} ({refinement_stats['refinement_ratio']*100:.1f}%)")
-            print(f"   标签变化: {refinement_stats['total_label_changes']}")
-            print(f"   不确定性: {refinement_stats['avg_uncertainty']:.4f}")
-            print(f"   置信度: {refinement_stats['avg_confidence']:.4f}")
-            
-            if (epoch >= self.min_epochs and 
-                refinement_stats['refinement_ratio'] < self.convergence_threshold):
-                print(f"\n✅ 收敛！修正比例 {refinement_stats['refinement_ratio']:.4f} < {self.convergence_threshold}")
-                break
-            else:
-                if epoch < self.min_epochs:
-                    print(f"   🔄 继续训练 (未达到最小轮数 {self.min_epochs})")
-                else:
-                    print(f"   🔄 继续训练 (修正比例 {refinement_stats['refinement_ratio']:.4f} >= {self.convergence_threshold})")
-            
-            print("-" * 60)
+        valid_batches = 0
+        cluster_indices = list(range(len(self.dataset.clusters)))
+        random.shuffle(cluster_indices)
         
-        return training_history
+        for batch_idx, cluster_id in enumerate(cluster_indices):
+            reads, pseudo_label = self.dataset.get_cluster_data(cluster_id, self.num_reads)
+            
+            if reads is None or len(reads) == 0:
+                continue
+            
+            reads = reads.to(self.device)
+            pseudo_label = pseudo_label.to(self.device)
+            
+            self.optimizer.zero_grad()
+            
+            # 前向传播
+            fused_evidence, evidence_per_read = self.model(reads, return_per_read=True)
+            
+            # 计算损失
+            total_loss, ce_loss, entropy = self.consensus_loss(fused_evidence, pseudo_label)
+            consistency = self.consistency_loss(evidence_per_read)
+            
+            # 总损失
+            loss = total_loss + 0.1 * consistency
+            
+            if not check_tensor_health(loss, "loss"):
+                continue
+            
+            # 反向传播
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            
+            # 记录
+            epoch_stats['total_loss'] += loss.item()
+            epoch_stats['ce_loss'] += ce_loss.item()
+            epoch_stats['entropy'] += entropy.item()
+            epoch_stats['consistency'] += consistency.item()
+            valid_batches += 1
+            
+            # 定期输出
+            if (batch_idx + 1) % 20 == 0:
+                print(f"  Batch {batch_idx + 1}/{len(cluster_indices)} | "
+                      f"Loss: {loss.item():.4f} | CE: {ce_loss.item():.4f} | "
+                      f"Entropy: {entropy.item():.4f}")
+        
+        # 平均
+        if valid_batches > 0:
+            for key in epoch_stats:
+                epoch_stats[key] /= valid_batches
+        
+        return epoch_stats
+    
+    def train(self, 
+              max_epochs: int = 30,
+              update_interval: int = 3,
+              convergence_threshold: float = 0.01):
+        """
+        完整训练流程
+        
+        参数:
+            max_epochs: 最大epoch数
+            update_interval: 每隔多少epoch更新伪标签
+            convergence_threshold: 收敛阈值（伪标签变化率）
+        """
+        print("=" * 60)
+        print("🧬 无监督DNA纠错训练")
+        print("=" * 60)
+        print(f"策略: 迭代自举 (每{update_interval}个epoch更新伪标签)")
+        print(f"收敛条件: 伪标签变化率 < {convergence_threshold * 100}%")
+        print("=" * 60)
+        
+        # 初始一致性
+        initial_agreements = [self.compute_reads_agreement(i) for i in range(len(self.dataset))]
+        print(f"\n📊 初始状态:")
+        print(f"   Reads与伪标签一致性: {np.mean(initial_agreements)*100:.2f}%")
+        
+        prev_change_rate = 1.0
+        
+        for epoch in range(max_epochs):
+            print(f"\n{'='*60}")
+            print(f"🔄 Epoch {epoch + 1}/{max_epochs}")
+            print(f"{'='*60}")
+            
+            # 训练
+            epoch_stats = self.train_epoch(epoch)
+            
+            print(f"\n📈 Epoch {epoch + 1} 结果:")
+            print(f"   Total Loss: {epoch_stats['total_loss']:.4f}")
+            print(f"   CE Loss: {epoch_stats['ce_loss']:.4f}")
+            print(f"   Entropy: {epoch_stats['entropy']:.4f}")
+            print(f"   Consistency: {epoch_stats['consistency']:.4f}")
+            
+            # 记录历史
+            self.history['total_loss'].append(epoch_stats['total_loss'])
+            self.history['ce_loss'].append(epoch_stats['ce_loss'])
+            self.history['entropy'].append(epoch_stats['entropy'])
+            self.history['consistency'].append(epoch_stats['consistency'])
+            
+            # 更新伪标签
+            if (epoch + 1) % update_interval == 0:
+                print(f"\n🔄 更新伪标签...")
+                change_rate, avg_agreement = self.update_pseudo_labels()
+                
+                self.history['pseudo_label_change_rate'].append(change_rate)
+                self.history['consensus_stability'].append(1.0 - change_rate)
+                
+                print(f"   伪标签变化率: {change_rate*100:.2f}%")
+                print(f"   Reads一致性: {avg_agreement*100:.2f}%")
+                
+                # 收敛检查
+                if change_rate < convergence_threshold:
+                    print(f"\n✅ 收敛！伪标签变化率 {change_rate*100:.2f}% < {convergence_threshold*100}%")
+                    break
+                
+                # 改进检查
+                if change_rate < prev_change_rate:
+                    print(f"   📈 伪标签趋于稳定 ({prev_change_rate*100:.2f}% → {change_rate*100:.2f}%)")
+                prev_change_rate = change_rate
+            
+            self.scheduler.step()
+        
+        # 最终评估
+        print(f"\n{'='*60}")
+        print("🎉 训练完成!")
+        print(f"{'='*60}")
+        
+        final_agreements = [self.compute_reads_agreement(i) for i in range(len(self.dataset))]
+        print(f"📊 最终状态:")
+        print(f"   Reads与consensus一致性: {np.mean(final_agreements)*100:.2f}%")
+        print(f"   (提升: {(np.mean(final_agreements) - np.mean(initial_agreements))*100:.2f}%)")
+        
+        return self.history
+
+# ==========================================
+# 评估函数
+# ==========================================
+
+def evaluate_correction_quality(dataset: UnsupervisedDNADataset, 
+                                 ground_truth_path: str = None) -> Dict:
+    """
+    评估纠错质量
+    
+    如果有ground truth，计算与真实序列的一致性
+    否则，计算内部一致性指标
+    """
+    results = {
+        'internal_consistency': [],
+        'gt_accuracy': [] if ground_truth_path else None
+    }
+    
+    # 内部一致性：reads与consensus的匹配度
+    for cluster in dataset.clusters:
+        consensus = cluster['pseudo_label']
+        reads = cluster['reads']
+        
+        matches = []
+        for read in reads:
+            min_len = min(len(read), len(consensus))
+            match_rate = sum(r == c for r, c in zip(read[:min_len], consensus[:min_len])) / min_len
+            matches.append(match_rate)
+        
+        results['internal_consistency'].append(np.mean(matches))
+    
+    # 如果有ground truth
+    if ground_truth_path and os.path.exists(ground_truth_path):
+        # 加载GT
+        gt_refs = {}
+        with open(ground_truth_path, 'r') as f:
+            next(f)  # skip header
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) >= 3:
+                    cluster_id = parts[1]
+                    ref_seq = parts[2]
+                    if cluster_id not in gt_refs:
+                        gt_refs[cluster_id] = ref_seq
+        
+        # 计算与GT的一致性
+        for i, cluster in enumerate(dataset.clusters):
+            consensus = cluster['pseudo_label']
+            cluster_id = str(i)
+            
+            if cluster_id in gt_refs:
+                gt = gt_refs[cluster_id]
+                min_len = min(len(consensus), len(gt))
+                accuracy = sum(c == g for c, g in zip(consensus[:min_len], gt[:min_len])) / min_len
+                results['gt_accuracy'].append(accuracy)
+    
+    return results
+
+# ==========================================
+# 可视化
+# ==========================================
+
+def plot_training_history(history: Dict, output_path: str = "unsupervised_training.png"):
+    """绘制训练历史"""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle('Unsupervised DNA Correction Training', fontsize=14, fontweight='bold')
+    
+    epochs = range(1, len(history['total_loss']) + 1)
+    
+    # 1. 损失曲线
+    ax1 = axes[0, 0]
+    ax1.plot(epochs, history['total_loss'], 'b-', label='Total Loss', linewidth=2)
+    ax1.plot(epochs, history['ce_loss'], 'r--', label='CE Loss', linewidth=2)
+    ax1.set_title('Loss Curves')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. 熵
+    ax2 = axes[0, 1]
+    ax2.plot(epochs, history['entropy'], 'g-', linewidth=2)
+    ax2.set_title('Prediction Entropy (Lower = More Confident)')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Entropy')
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. 伪标签变化率
+    ax3 = axes[1, 0]
+    if history['pseudo_label_change_rate']:
+        update_epochs = [i * 3 for i in range(1, len(history['pseudo_label_change_rate']) + 1)]
+        ax3.bar(update_epochs, history['pseudo_label_change_rate'], alpha=0.7, color='orange')
+        ax3.axhline(y=0.01, color='r', linestyle='--', label='Convergence Threshold')
+        ax3.set_title('Pseudo-Label Change Rate')
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('Change Rate')
+        ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # 4. 一致性
+    ax4 = axes[1, 1]
+    ax4.plot(epochs, history['consistency'], 'purple', linewidth=2)
+    ax4.set_title('Reads Consistency Loss')
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Consistency')
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"✅ 图表已保存: {output_path}")
 
 # ==========================================
 # 主函数
 # ==========================================
 
-def train_with_fixed_dirichlet_refinement():
-    print("🚀 开始修复版Dirichlet训练...")
+def main():
+    print("=" * 60)
+    print("🧬 无监督DNA纠错模型")
+    print("=" * 60)
     
+    # 配置
     DATA_DIR = "CC/Step0/Experiments/20251216_145746_Improved_Data_Test/03_FedDNA_In"
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🔧 使用设备: {device}")
+    print(f"🔧 设备: {device}")
     
-    dataset = CloverClusterDataset(DATA_DIR)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
-    print(f"📦 数据加载完成: {len(dataset)} 个样本")
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
     
-    model = SimplifiedFedDNA(input_dim=4, hidden_dim=128, seq_len=150).to(device)
-    criterion = DirichletComprehensiveLoss(alpha=1.0, beta=0.1, gamma=0.01, temperature=0.1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    # 加载数据
+    dataset = UnsupervisedDNADataset(DATA_DIR, seq_len=150)
     
-    refinement_module = DirichletEvidenceRefinementFixed(
-        uncertainty_threshold_start=0.4,
-        uncertainty_threshold_end=0.3,
-        confidence_threshold_start=0.3,
-        confidence_threshold_end=0.6,
-        distance_threshold=2.0,
-        max_refinement_ratio=0.5,
-        force_refinement_ratio=0.1
+    # 创建模型
+    model = UnsupervisedDNACorrector(
+        input_dim=4,
+        hidden_dim=128,
+        seq_len=150
     )
     
-    trainer = DirichletRefinementTrainerFixed(
+    # 尝试加载预训练权重
+    pretrained_path = "step1_model.pth"
+    if os.path.exists(pretrained_path):
+        try:
+            checkpoint = torch.load(pretrained_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            else:
+                model.load_state_dict(checkpoint, strict=False)
+            print(f"✅ 加载预训练权重: {pretrained_path}")
+        except Exception as e:
+            print(f"⚠️ 加载失败: {e}")
+    
+    # 创建训练器
+    trainer = UnsupervisedTrainer(
         model=model,
-        criterion=criterion,
-        optimizer=optimizer,
-        refinement_module=refinement_module,
-        convergence_threshold=0.05,
-        max_epochs=10,
-        min_epochs=3
+        dataset=dataset,
+        device=device,
+        num_reads=8,
+        lr=1e-4
     )
     
-    training_history = trainer.train_with_refinement(dataloader, device)
+    # 训练
+    history = trainer.train(
+        max_epochs=30,
+        update_interval=3,  # 每3个epoch更新伪标签
+        convergence_threshold=0.01  # 变化率<1%则收敛
+    )
     
-    model_save_path = "fixed_dirichlet_model.pth"
+    # 保存结果
+    print("\n💾 保存结果...")
+    
+    # 保存纠错后的consensus
+    with open("consensus_corrected.txt", 'w') as f:
+        for cluster in dataset.clusters:
+            f.write(cluster['pseudo_label'] + '\n')
+    print("✅ 纠错结果: consensus_corrected.txt")
+    
+    # 绘制训练曲线
+    plot_training_history(history, "unsupervised_training.png")
+    
+    # 保存模型
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_path = f"unsupervised_model_{timestamp}.pth"
     torch.save({
         'model_state_dict': model.state_dict(),
-        'training_history': training_history,
-        'persistent_labels': trainer.persistent_labels,
-    }, model_save_path)
+        'history': history
+    }, model_path)
+    print(f"✅ 模型已保存: {model_path}")
     
-    print(f"\n💾 模型已保存到: {model_save_path}")
+    # 评估
+    print("\n📊 最终评估:")
+    results = evaluate_correction_quality(dataset)
+    print(f"   内部一致性: {np.mean(results['internal_consistency'])*100:.2f}%")
     
-    return model, training_history
+    return model, dataset, history
 
 if __name__ == "__main__":
-    model, history = train_with_fixed_dirichlet_refinement()
+    model, dataset, history = main()
