@@ -1,802 +1,1437 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-🧬 无监督证据驱动DNA聚类与纠错模型
-核心策略: 迭代自举 (Iterative Self-Refinement)
-- 不依赖Ground Truth
-- 通过迭代更新consensus逐步逼近真实序列
+FedDNA 簇序列重建系统 - 适配版 v3
+=====================================
+适配你的数据格式：
+- read.txt: 按簇分组，用=======分隔
+- ground_truth_clusters.txt: Cluster_ID \t Ref_Seq
+- ground_truth_reads.txt: Read_ID \t Cluster_ID \t Ref_Seq \t Quality
 """
 
 import os
 import sys
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional
-import random
-from collections import defaultdict
+from torch.utils.data import Dataset, DataLoader
+from typing import Dict, List, Tuple, Optional, Set
+from collections import defaultdict, Counter
+from dataclasses import dataclass
 import matplotlib.pyplot as plt
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-# ==========================================
-# 导入FedDNA核心组件
-# ==========================================
-try:
-    from models.conmamba import ConmambaBlock
-    print("✅ 成功导入 ConmambaBlock")
-except ImportError as e:
-    print(f"❌ 导入失败: {e}")
-    sys.exit(1)
+# ============================================================================
+# 配置
+# ============================================================================
+@dataclass
+class Config:
+    """训练配置"""
+    # 数据路径
+    experiment_dir: str = ""  # 实验根目录
+    
+    # 模型参数
+    input_dim: int = 6
+    hidden_dim: int = 128
+    latent_dim: int = 64
+    num_heads: int = 4
+    num_layers: int = 3
+    dropout: float = 0.1
+    
+    # 训练参数
+    k_target: int = 50
+    batch_size: int = 64
+    num_epochs: int = 50
+    learning_rate: float = 1e-3
+    
+    # 损失权重
+    lambda_contrastive: float = 1.0
+    lambda_del: float = 0.5
+    lambda_k: float = 2.0
+    
+    # 阈值
+    similarity_threshold: float = 0.7
+    min_cluster_ratio: float = 0.005
+    weak_consistency_threshold: float = 0.6
+    
+    # 设备
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ==========================================
-# 工具函数
-# ==========================================
 
-def safe_log(x, eps=1e-8):
-    return torch.log(torch.clamp(x, min=eps))
-
-def safe_div(x, y, eps=1e-8):
-    return x / torch.clamp(y, min=eps)
-
-def check_tensor_health(tensor, name="tensor"):
-    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-        return False
-    return True
-
-# ==========================================
-# FedDNA核心组件
-# ==========================================
-
-def calc_same_padding(kernel_size):
-    pad = kernel_size // 2
-    return (pad, pad - (kernel_size + 1) % 2)
-
-class Conv2dUpampling(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, conv_dropout_p: float, kernel_size=3):
-        super(Conv2dUpampling, self).__init__()
-        padding = calc_same_padding(kernel_size)
-        self.sequential = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding),
-            nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding),
-            nn.BatchNorm2d(num_features=out_channels),
-            nn.ReLU(),
-        )
-        self.dropout = nn.Dropout(p=conv_dropout_p)
-
-    def forward(self, inputs):
-        outputs = self.sequential(inputs.unsqueeze(1))
-        batch_size, channels, subsampled_lengths, sumsampled_dim = outputs.size()
-        outputs = outputs.permute(0, 2, 1, 3)
-        outputs = outputs.contiguous().view(batch_size, subsampled_lengths, channels * sumsampled_dim)
-        outputs = self.dropout(outputs)
-        return outputs
-
-class FedDNAEncoder(nn.Module):
-    def __init__(self, dim: int = 128):
-        super(FedDNAEncoder, self).__init__()
-        self.dim = dim
-        self.upsampling = Conv2dUpampling(in_channels=1, out_channels=dim//4, conv_dropout_p=0.1)
-        self.conmamba = ConmambaBlock(
-            dim=dim, ff_mult=4, conv_expansion_factor=2, conv_kernel_size=31,
-            attn_dropout=0.1, ff_dropout=0.1, conv_dropout=0.1
-        )
-
-    def forward(self, x):
-        x = self.upsampling(x)
-        x = self.conmamba(x)
-        return x
-
-class FedDNARNNBlock(nn.Module):
-    def __init__(self, in_channels: int, lstm_hidden_dim: int = 256, rnn_dropout_p=0.1):
-        super(FedDNARNNBlock, self).__init__()
-        self.rnn = nn.LSTM(
-            input_size=in_channels, hidden_size=lstm_hidden_dim, 
-            num_layers=2, bidirectional=False, batch_first=True
-        )
-        self.linear = nn.Linear(in_features=lstm_hidden_dim, out_features=4)
-        self.dropout = nn.Dropout(rnn_dropout_p)
-
-    def forward(self, input):
-        output, _ = self.rnn(input)
-        output = self.linear(output)
-        output = self.dropout(output)
-        return F.softplus(output) + 0.1
-
-def ds_fusion(evidence: torch.Tensor) -> torch.Tensor:
-    """证据融合：在reads维度上取平均"""
-    fused_evidence = torch.mean(evidence, dim=0)
-    return torch.clamp(fused_evidence, min=0.1, max=100.0)
-
-# ==========================================
-# 无监督损失函数
-# ==========================================
-
-class UnsupervisedConsensusLoss(nn.Module):
+# ============================================================================
+# 数据加载 - 适配你的格式
+# ============================================================================
+def load_feddna_format(feddna_dir: str) -> Tuple[List[str], List[int]]:
     """
-    无监督损失函数：不依赖GT
+    加载 FedDNA 格式的数据
+    read.txt: 按簇分组，用 =============================== 分隔
     
-    核心思想：
-    1. 让模型输出的evidence与当前伪标签一致
-    2. 同时鼓励模型输出高置信度的预测
+    返回: (reads列表, 簇标签列表)
     """
-    def __init__(self):
-        super().__init__()
+    read_path = os.path.join(feddna_dir, "read.txt")
     
-    def forward(self, evidence, pseudo_label):
-        """
-        evidence: [L, 4] - 模型融合后的evidence
-        pseudo_label: [L, 4] - 当前的伪标签 (one-hot)
-        """
-        evidence = torch.clamp(evidence, min=0.1, max=100.0)
-        alpha = evidence + 1.0
-        S = torch.sum(alpha, dim=-1, keepdim=True)
-        
-        # 预测概率
-        prob = safe_div(alpha, S)
-        prob = torch.clamp(prob, min=1e-8, max=1.0)
-        
-        # 1. 与伪标签的交叉熵
-        log_prob = safe_log(prob)
-        ce_loss = -torch.sum(pseudo_label * log_prob, dim=-1)
-        
-        # 2. 置信度奖励：鼓励高置信度预测（低熵）
-        entropy = -torch.sum(prob * log_prob, dim=-1)
-        
-        # 总损失 = 交叉熵 + 熵正则（较小权重）
-        total_loss = ce_loss + 0.1 * entropy
-        
-        return torch.mean(total_loss), torch.mean(ce_loss), torch.mean(entropy)
-
-
-class ReadConsistencyLoss(nn.Module):
-    """
-    Reads一致性损失：鼓励同一cluster内的reads产生相似的evidence
-    """
-    def __init__(self):
-        super().__init__()
+    if not os.path.exists(read_path):
+        raise FileNotFoundError(f"找不到 read.txt: {read_path}")
     
-    def forward(self, evidence_per_read):
-        """
-        evidence_per_read: [N, L, 4] - 每条read的evidence
-        """
-        N = evidence_per_read.shape[0]
-        if N <= 1:
-            return torch.tensor(0.0, device=evidence_per_read.device)
-        
-        # 计算每条read的概率分布
-        alpha = evidence_per_read + 1.0
-        S = torch.sum(alpha, dim=-1, keepdim=True)
-        prob = alpha / S  # [N, L, 4]
-        
-        # 计算均值分布
-        mean_prob = torch.mean(prob, dim=0, keepdim=True)  # [1, L, 4]
-        
-        # 每条read与均值的KL散度
-        kl_div = torch.sum(prob * (safe_log(prob) - safe_log(mean_prob)), dim=-1)  # [N, L]
-        
-        return torch.mean(kl_div)
-
-# ==========================================
-# 主模型
-# ==========================================
-
-class UnsupervisedDNACorrector(nn.Module):
-    """无监督DNA纠错模型"""
+    reads = []
+    labels = []
+    current_cluster = 0
     
-    def __init__(self, input_dim: int = 4, hidden_dim: int = 128, seq_len: int = 150):
-        super().__init__()
-        
-        self.dim = hidden_dim
-        self.seq_len = seq_len
-        
-        self.encoder = FedDNAEncoder(dim=hidden_dim)
-        self.length_adapter = nn.Linear(seq_len, seq_len)
-        self.rnnblock = FedDNARNNBlock(in_channels=hidden_dim, lstm_hidden_dim=256)
-        
-        self._init_weights()
-        
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+    print(f"📂 加载 FedDNA 格式数据: {read_path}")
     
-    def forward(self, reads_batch, return_per_read=False):
-        """
-        reads_batch: [N, L, 4] - 单个cluster的N条reads
-        
-        返回:
-            fused_evidence: [L, 4] - 融合后的evidence
-            (可选) evidence_per_read: [N, L, 4]
-        """
-        N, L, D = reads_batch.shape
-        
-        # 编码
-        encoded = self.encoder(reads_batch)  # [N, L, dim]
-        
-        if not check_tensor_health(encoded, "encoded"):
-            safe_output = torch.ones(L, 4, device=reads_batch.device) * 0.25
-            if return_per_read:
-                return safe_output, torch.ones(N, L, 4, device=reads_batch.device) * 0.25
-            return safe_output
-        
-        # 长度适配
-        encoded = encoded.permute(0, 2, 1)
-        encoded = self.length_adapter(encoded)
-        encoded = encoded.permute(0, 2, 1)
-        
-        # 生成evidence
-        evidence_per_read = self.rnnblock(encoded)  # [N, L, 4]
-        
-        # 融合
-        fused_evidence = ds_fusion(evidence_per_read)  # [L, 4]
-        
-        if return_per_read:
-            return fused_evidence, evidence_per_read
-        return fused_evidence
-    
-    def predict_consensus(self, reads_batch) -> str:
-        """从reads预测consensus序列"""
-        self.eval()
-        with torch.no_grad():
-            fused_evidence = self.forward(reads_batch)
-            alpha = fused_evidence + 1.0
-            prob = alpha / torch.sum(alpha, dim=-1, keepdim=True)
-            pred_indices = torch.argmax(prob, dim=-1)
-            
-            idx_to_base = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
-            consensus = ''.join([idx_to_base[i.item()] for i in pred_indices])
-        return consensus
-
-# ==========================================
-# 数据集
-# ==========================================
-
-class UnsupervisedDNADataset(Dataset):
-    """无监督DNA数据集：伪标签可动态更新"""
-    
-    def __init__(self, data_dir: str, seq_len: int = 150):
-        self.seq_len = seq_len
-        self.clusters = []
-        self.base_mapping = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
-        self.idx_to_base = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
-        
-        self._load_data(data_dir)
-        
-    def _load_data(self, data_dir):
-        read_path = os.path.join(data_dir, "read.txt")
-        ref_path = os.path.join(data_dir, "ref.txt")
-        if not os.path.exists(ref_path):
-            ref_path = os.path.join(data_dir, "reference.txt")
-            
-        print(f"📂 加载数据: {data_dir}")
-        
-        # 加载初始伪标签（聚类中心）
-        with open(ref_path, 'r') as f:
-            pseudo_labels = [line.strip() for line in f if line.strip()]
-        
-        # 加载reads
-        with open(read_path, 'r') as f:
-            content = f.read().strip()
-        raw_clusters = content.split("===============================")
-        
-        for i, cluster_block in enumerate(raw_clusters):
-            if not cluster_block.strip() or i >= len(pseudo_labels):
+    with open(read_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
-                
-            reads = [r.strip() for r in cluster_block.strip().split('\n') if r.strip()]
-            if len(reads) > 0:
-                self.clusters.append({
-                    'cluster_id': i,
-                    'pseudo_label': pseudo_labels[i],  # 可更新的伪标签
-                    'reads': reads
-                })
-                
-        print(f"✅ 加载完成: {len(self.clusters)} 个簇")
-        
-        # 打印初始统计
-        self._print_cluster_stats()
-    
-    def _print_cluster_stats(self):
-        """打印cluster统计信息"""
-        reads_counts = [len(c['reads']) for c in self.clusters]
-        print(f"📊 Cluster统计:")
-        print(f"   - 数量: {len(self.clusters)}")
-        print(f"   - Reads/cluster: {np.mean(reads_counts):.1f} ± {np.std(reads_counts):.1f}")
-        print(f"   - 范围: [{min(reads_counts)}, {max(reads_counts)}]")
-    
-    def one_hot_encode(self, seq: str) -> np.ndarray:
-        arr = np.zeros((self.seq_len, 4), dtype=np.float32)
-        for i, char in enumerate(seq[:self.seq_len]):
-            if char in self.base_mapping:
-                arr[i, self.base_mapping[char]] = 1.0
-        return arr
-    
-    def update_pseudo_label(self, cluster_id: int, new_label: str):
-        """更新某个cluster的伪标签"""
-        if cluster_id < len(self.clusters):
-            self.clusters[cluster_id]['pseudo_label'] = new_label
-    
-    def get_cluster_data(self, cluster_id: int, num_reads: int = 8):
-        """获取单个cluster的数据"""
-        if cluster_id >= len(self.clusters):
-            return None, None
             
-        cluster = self.clusters[cluster_id]
-        reads = cluster['reads']
-        pseudo_label = cluster['pseudo_label']
+            # 检测分隔符
+            if line.startswith("====="):
+                current_cluster += 1
+            else:
+                # 这是一个read序列
+                reads.append(line)
+                labels.append(current_cluster)
+    
+    print(f"   ✅ 加载 {len(reads)} 条 reads")
+    print(f"   ✅ 检测到 {current_cluster + 1} 个簇 (Clover聚类结果)")
+    
+    return reads, labels
+
+
+def load_raw_reads_with_ids(raw_dir: str) -> Dict[str, str]:
+    """
+    加载原始reads (带ID)
+    raw_reads.txt: Read_ID \t Sequence
+    
+    返回: {read_id: sequence}
+    """
+    raw_path = os.path.join(raw_dir, "raw_reads.txt")
+    
+    if not os.path.exists(raw_path):
+        print(f"   ⚠️ raw_reads.txt 不存在")
+        return {}
+    
+    reads_dict = {}
+    with open(raw_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2:
+                reads_dict[parts[0]] = parts[1]
+    
+    print(f"   ✅ 加载 {len(reads_dict)} 条原始reads (带ID)")
+    return reads_dict
+
+
+def load_read_level_gt(raw_dir: str) -> Dict[str, Tuple[int, str, str]]:
+    """
+    加载 Read 级别的 GT
+    ground_truth_reads.txt: Read_ID \t Cluster_ID \t Ref_Seq \t Quality
+    
+    返回: {read_id: (cluster_id, ref_seq, quality)}
+    """
+    gt_path = os.path.join(raw_dir, "ground_truth_reads.txt")
+    
+    if not os.path.exists(gt_path):
+        print(f"   ⚠️ ground_truth_reads.txt 不存在")
+        return {}
+    
+    gt_dict = {}
+    with open(gt_path, 'r') as f:
+        header = f.readline()  # 跳过表头
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 4:
+                read_id = parts[0]
+                cluster_id = int(parts[1])
+                ref_seq = parts[2]
+                quality = parts[3]
+                gt_dict[read_id] = (cluster_id, ref_seq, quality)
+    
+    print(f"   ✅ 加载 {len(gt_dict)} 条 Read-Level GT")
+    return gt_dict
+
+
+def load_cluster_level_gt(raw_dir: str) -> Dict[int, str]:
+    """
+    加载 Cluster 级别的 GT
+    ground_truth_clusters.txt: Cluster_ID \t Ref_Seq
+    
+    返回: {cluster_id: ref_seq}
+    """
+    gt_path = os.path.join(raw_dir, "ground_truth_clusters.txt")
+    
+    if not os.path.exists(gt_path):
+        print(f"   ⚠️ ground_truth_clusters.txt 不存在")
+        return {}
+    
+    print(f"\n🔍 加载 Cluster-Level GT: {gt_path}")
+    
+    gt_dict = {}
+    with open(gt_path, 'r') as f:
+        header = f.readline()  # 跳过表头
+        print(f"   表头: {header.strip()}")
         
-        # 随机采样reads
-        selected_reads = random.sample(reads, min(num_reads, len(reads)))
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2:
+                try:
+                    cluster_id = int(parts[0])
+                    ref_seq = parts[1]
+                    gt_dict[cluster_id] = ref_seq
+                    
+                    if len(gt_dict) <= 3:
+                        print(f"     GT[{cluster_id}]: {ref_seq[:50]}...")
+                except ValueError:
+                    continue
+    
+    print(f"   ✅ 加载 {len(gt_dict)} 个 Cluster GT 序列")
+    if gt_dict:
+        print(f"   GT簇ID范围: {min(gt_dict.keys())} - {max(gt_dict.keys())}")
+    
+    return gt_dict
+
+
+def build_sequence_to_gt_mapping(feddna_reads: List[str], 
+                                 raw_reads: Dict[str, str],
+                                 read_gt: Dict[str, Tuple[int, str, str]]) -> List[int]:
+    """
+    建立 FedDNA reads 到原始 GT 簇的映射
+    
+    通过序列匹配找到每个read对应的原始GT簇ID
+    """
+    # 反向映射：sequence -> read_id
+    seq_to_id = {seq: rid for rid, seq in raw_reads.items()}
+    
+    original_gt_labels = []
+    matched = 0
+    
+    for seq in feddna_reads:
+        if seq in seq_to_id:
+            read_id = seq_to_id[seq]
+            if read_id in read_gt:
+                gt_cluster_id = read_gt[read_id][0]
+                original_gt_labels.append(gt_cluster_id)
+                matched += 1
+            else:
+                original_gt_labels.append(-1)
+        else:
+            original_gt_labels.append(-1)
+    
+    print(f"   ✅ GT标签匹配: {matched}/{len(feddna_reads)} ({matched/len(feddna_reads)*100:.1f}%)")
+    
+    return original_gt_labels
+
+
+# ============================================================================
+# 数据管理器 - 适配版
+# ============================================================================
+class ClusterDataManager:
+    """簇数据管理器 - 适配你的数据格式"""
+    
+    def __init__(self, experiment_dir: str, config: Config):
+        self.experiment_dir = experiment_dir
+        self.config = config
         
-        reads_encoded = [self.one_hot_encode(read) for read in selected_reads]
-        label_encoded = self.one_hot_encode(pseudo_label)
+        # 路径
+        self.raw_dir = os.path.join(experiment_dir, "01_RawData")
+        self.feddna_dir = os.path.join(experiment_dir, "03_FedDNA_In")
         
-        return (
-            torch.tensor(np.array(reads_encoded)),
-            torch.tensor(label_encoded)
-        )
+        # 数据存储
+        self.reads: List[str] = []
+        self.qualities: List[str] = []
+        self.clover_labels: np.ndarray = None  # Clover聚类结果
+        self.original_gt_labels: np.ndarray = None  # 原始GT簇标签
+        self.current_labels: np.ndarray = None
+        
+        # 簇管理
+        self.cluster_assignments: Dict[int, Set[int]] = defaultdict(set)
+        self.cluster_status: Dict[int, str] = {}
+        self.noise_reads: Set[int] = set()
+        
+        # GT
+        self.cluster_gt: Dict[int, str] = {}  # 簇级GT
+        
+        # 加载数据
+        self._load_data()
+    
+    def _load_data(self):
+        """加载所有数据"""
+        print("\n" + "=" * 60)
+        print("📂 加载数据")
+        print("=" * 60)
+        
+        # 1. 加载 FedDNA 格式的 reads
+        self.reads, clover_labels = load_feddna_format(self.feddna_dir)
+        self.clover_labels = np.array(clover_labels)
+        
+        # 2. 生成默认质量分数
+        self.qualities = ['I' * len(read) for read in self.reads]
+        print(f"   ✅ 生成默认质量分数")
+        
+        # 3. 加载原始reads和GT
+        raw_reads = load_raw_reads_with_ids(self.raw_dir)
+        read_gt = load_read_level_gt(self.raw_dir)
+        self.cluster_gt = load_cluster_level_gt(self.raw_dir)
+        
+        # 4. 建立GT映射
+        if raw_reads and read_gt:
+            self.original_gt_labels = np.array(
+                build_sequence_to_gt_mapping(self.reads, raw_reads, read_gt)
+            )
+        else:
+            self.original_gt_labels = np.full(len(self.reads), -1)
+            print(f"   ⚠️ 无法建立GT映射，使用-1填充")
+        
+        # 5. 初始化当前标签 (使用Clover结果作为起点)
+        self.current_labels = self.clover_labels.copy()
+        
+        # 6. 初始化簇分配
+        for idx, label in enumerate(self.current_labels):
+            if label >= 0:
+                self.cluster_assignments[label].add(idx)
+                self.cluster_status[label] = 'healthy'
+        
+        self.total_reads = len(self.reads)
+        
+        print(f"\n📊 数据摘要:")
+        print(f"   - 总Reads: {self.total_reads}")
+        print(f"   - Clover簇数: {len(np.unique(self.clover_labels))}")
+        print(f"   - GT簇数: {len(self.cluster_gt)}")
+        print(f"   - 目标K: {self.config.k_target}")
+    
+    def get_cluster_reads(self, cluster_id: int) -> List[int]:
+        """获取簇内所有read索引"""
+        return list(self.cluster_assignments.get(cluster_id, set()))
+    
+    def get_active_clusters(self) -> List[int]:
+        """获取所有活跃簇ID"""
+        return [cid for cid, reads in self.cluster_assignments.items() 
+                if len(reads) > 0 and self.cluster_status.get(cid) != 'eliminated']
+    
+    def reassign_read(self, read_idx: int, new_cluster_id: int):
+        """重分配read到新簇"""
+        old_cluster = self.current_labels[read_idx]
+        
+        if old_cluster >= 0 and old_cluster in self.cluster_assignments:
+            self.cluster_assignments[old_cluster].discard(read_idx)
+        
+        self.noise_reads.discard(read_idx)
+        
+        self.current_labels[read_idx] = new_cluster_id
+        self.cluster_assignments[new_cluster_id].add(read_idx)
+        
+        if new_cluster_id not in self.cluster_status:
+            self.cluster_status[new_cluster_id] = 'healthy'
+    
+    def mark_as_noise(self, read_idx: int):
+        """标记read为噪声"""
+        old_cluster = self.current_labels[read_idx]
+        
+        if old_cluster >= 0 and old_cluster in self.cluster_assignments:
+            self.cluster_assignments[old_cluster].discard(read_idx)
+        
+        self.current_labels[read_idx] = -1
+        self.noise_reads.add(read_idx)
+    
+    def remove_cluster(self, cluster_id: int):
+        """移除簇"""
+        if cluster_id in self.cluster_assignments:
+            del self.cluster_assignments[cluster_id]
+        self.cluster_status[cluster_id] = 'eliminated'
+    
+    def get_k_effective(self) -> int:
+        """获取当前有效簇数"""
+        return len([cid for cid, reads in self.cluster_assignments.items() 
+                   if len(reads) > 0])
+
+
+# ============================================================================
+# 序列编码
+# ============================================================================
+class SequenceEncoder:
+    """序列编码器"""
+    
+    BASE_MAP = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4}
+    
+    @staticmethod
+    def encode_sequence(seq: str, quality: str, max_len: int = 150) -> torch.Tensor:
+        """编码序列为张量"""
+        seq_len = min(len(seq), max_len)
+        encoding = torch.zeros(max_len, 6)
+        
+        for i in range(seq_len):
+            base = seq[i].upper()
+            if base in SequenceEncoder.BASE_MAP and SequenceEncoder.BASE_MAP[base] < 4:
+                encoding[i, SequenceEncoder.BASE_MAP[base]] = 1.0
+            
+            if i < len(quality):
+                q = ord(quality[i]) - 33
+                encoding[i, 4] = q / 40.0
+            else:
+                encoding[i, 4] = 0.5
+            
+            encoding[i, 5] = i / max_len
+        
+        return encoding
+
+
+# ============================================================================
+# 数据集
+# ============================================================================
+class ClusterDataset(Dataset):
+    """簇数据集"""
+    
+    def __init__(self, data_manager: ClusterDataManager, max_len: int = 150):
+        self.data_manager = data_manager
+        self.max_len = max_len
+        self.encoder = SequenceEncoder()
+        
+        self.valid_indices = [i for i in range(len(data_manager.reads))
+                             if i not in data_manager.noise_reads]
     
     def __len__(self):
-        return len(self.clusters)
+        return len(self.valid_indices)
     
     def __getitem__(self, idx):
-        return self.get_cluster_data(idx)
-
-# ==========================================
-# 🎯 无监督训练器（核心！）
-# ==========================================
-
-class UnsupervisedTrainer:
-    """
-    无监督训练器
-    
-    核心策略: 迭代自举
-    1. 用当前伪标签训练模型
-    2. 用模型输出更新伪标签
-    3. 重复直到收敛
-    """
-    
-    def __init__(self, 
-                 model: UnsupervisedDNACorrector,
-                 dataset: UnsupervisedDNADataset,
-                 device: torch.device,
-                 num_reads: int = 8,
-                 lr: float = 1e-4):
+        real_idx = self.valid_indices[idx]
         
-        self.model = model.to(device)
-        self.dataset = dataset
-        self.device = device
-        self.num_reads = num_reads
+        seq = self.data_manager.reads[real_idx]
+        qual = self.data_manager.qualities[real_idx]
+        label = self.data_manager.current_labels[real_idx]
         
-        # 损失函数
-        self.consensus_loss = UnsupervisedConsensusLoss()
-        self.consistency_loss = ReadConsistencyLoss()
+        encoding = self.encoder.encode_sequence(seq, qual, self.max_len)
         
-        # 优化器
-        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=50)
-        
-        # 训练历史
-        self.history = {
-            'total_loss': [],
-            'ce_loss': [],
-            'entropy': [],
-            'consistency': [],
-            'pseudo_label_change_rate': [],
-            'consensus_stability': []
+        return {
+            'encoding': encoding,
+            'label': label,
+            'index': real_idx
         }
+
+
+# ============================================================================
+# 模型
+# ============================================================================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 200):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
     
-    def compute_reads_agreement(self, cluster_id: int) -> float:
-        """计算reads与当前伪标签的一致性"""
-        cluster = self.dataset.clusters[cluster_id]
-        pseudo_label = cluster['pseudo_label']
-        reads = cluster['reads']
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.input_proj = nn.Linear(config.input_dim, config.hidden_dim)
+        self.pos_encoding = PositionalEncoding(config.hidden_dim)
         
-        total_matches = 0
-        total_positions = 0
-        
-        for read in reads:
-            min_len = min(len(read), len(pseudo_label))
-            matches = sum(r == p for r, p in zip(read[:min_len], pseudo_label[:min_len]))
-            total_matches += matches
-            total_positions += min_len
-        
-        return total_matches / max(total_positions, 1)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_dim,
+            nhead=config.num_heads,
+            dim_feedforward=config.hidden_dim * 4,
+            dropout=config.dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
+        self.output_proj = nn.Linear(config.hidden_dim, config.latent_dim)
     
-    def update_pseudo_labels(self) -> Tuple[float, float]:
-        """
-        用模型输出更新所有cluster的伪标签
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.pos_encoding(x)
+        x = self.transformer(x)
+        x = x.mean(dim=1)
+        x = self.output_proj(x)
+        return F.normalize(x, p=2, dim=-1)
+
+
+class SequenceDecoder(nn.Module):
+    def __init__(self, config: Config, max_len: int = 150):
+        super().__init__()
+        self.max_len = max_len
+        self.latent_proj = nn.Linear(config.latent_dim, config.hidden_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim * 2, max_len * 4)
+        )
+    
+    def forward(self, z):
+        x = self.latent_proj(z)
+        x = self.decoder(x)
+        x = x.view(-1, self.max_len, 4)
+        return x
+
+
+class ClusterReconstructionModel(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.encoder = TransformerEncoder(config)
+        self.decoder = SequenceDecoder(config)
+        self.cluster_centers = nn.Parameter(
+            torch.randn(config.k_target + 20, config.latent_dim)
+        )
+        nn.init.xavier_uniform_(self.cluster_centers)
+    
+    def forward(self, x):
+        z = self.encoder(x)
+        logits = self.decoder(z)
+        return z, logits
+
+
+# ============================================================================
+# 损失函数
+# ============================================================================
+class ContrastiveLoss(nn.Module):
+    def __init__(self, temperature: float = 0.1):
+        super().__init__()
+        self.temperature = temperature
+    
+    def forward(self, z: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        batch_size = z.size(0)
+        if batch_size < 2:
+            return torch.tensor(0.0, device=z.device)
         
-        返回:
-            change_rate: 伪标签变化比例
-            avg_agreement: 平均一致性
-        """
-        self.model.eval()
+        sim_matrix = torch.mm(z, z.t()) / self.temperature
         
-        total_changed = 0
-        total_positions = 0
-        agreements = []
+        labels = labels.view(-1, 1)
+        positive_mask = (labels == labels.t()).float()
+        positive_mask.fill_diagonal_(0)
+        
+        diag_mask = torch.eye(batch_size, device=z.device)
+        exp_sim = torch.exp(sim_matrix) * (1 - diag_mask)
+        
+        positive_sum = (exp_sim * positive_mask).sum(dim=1)
+        total_sum = exp_sim.sum(dim=1)
+        
+        valid_mask = positive_sum > 0
+        if valid_mask.sum() == 0:
+            return torch.tensor(0.0, device=z.device)
+        
+        loss = -torch.log(positive_sum[valid_mask] / (total_sum[valid_mask] + 1e-8))
+        return loss.mean()
+
+
+class DELLoss(nn.Module):
+    def forward(self, z: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        unique_labels = torch.unique(labels[labels >= 0])
+        
+        if len(unique_labels) < 2:
+            return torch.tensor(0.0, device=z.device)
+        
+        centers = []
+        intra_vars = []
+        
+        for label in unique_labels:
+            mask = labels == label
+            if mask.sum() > 0:
+                cluster_z = z[mask]
+                center = cluster_z.mean(dim=0)
+                centers.append(center)
+                
+                if cluster_z.size(0) > 1:
+                    var = ((cluster_z - center) ** 2).sum(dim=1).mean()
+                    intra_vars.append(var)
+        
+        if len(centers) < 2:
+            return torch.tensor(0.0, device=z.device)
+        
+        centers = torch.stack(centers)
+        
+        inter_dist = torch.cdist(centers, centers)
+        inter_dist = inter_dist[torch.triu(torch.ones_like(inter_dist), diagonal=1) == 1]
+        
+        intra_loss = torch.stack(intra_vars).mean() if intra_vars else torch.tensor(0.0, device=z.device)
+        inter_loss = -inter_dist.mean() if inter_dist.numel() > 0 else torch.tensor(0.0, device=z.device)
+        
+        return intra_loss + 0.5 * inter_loss
+
+
+class StrictKConstraintLoss(nn.Module):
+    def __init__(self, k_target: int, lambda_k: float = 2.0):
+        super().__init__()
+        self.k_target = k_target
+        self.lambda_k = lambda_k
+    
+    def forward(self, k_effective: int, epoch: int, max_epochs: int) -> torch.Tensor:
+        diff = k_effective - self.k_target
+        tolerance = 2
+        
+        if abs(diff) <= tolerance:
+            penalty = (diff ** 2) * 0.1
+        else:
+            excess = abs(diff) - tolerance
+            penalty = tolerance ** 2 * 0.1 + excess ** 3
+        
+        epoch_factor = 1.0 + (epoch / max_epochs) * 2.0
+        
+        return torch.tensor(self.lambda_k * penalty * epoch_factor, dtype=torch.float32)
+
+
+# ============================================================================
+# 辅助函数
+# ============================================================================
+def calculate_sequence_similarity(seq1: str, seq2: str) -> float:
+    """计算两个序列的相似度"""
+    min_len = min(len(seq1), len(seq2))
+    if min_len == 0:
+        return 0.0
+    matches = sum(c1 == c2 for c1, c2 in zip(seq1[:min_len], seq2[:min_len]))
+    return matches / min_len
+
+
+def calculate_cluster_consistency(reads: List[str]) -> float:
+    """计算簇内一致性"""
+    if len(reads) < 2:
+        return 1.0
+    
+    sample_size = min(20, len(reads))
+    sampled_reads = list(np.random.choice(reads, sample_size, replace=False)) if len(reads) > sample_size else reads
+    
+    max_len = max(len(r) for r in sampled_reads)
+    consensus = []
+    
+    for pos in range(max_len):
+        bases = [read[pos] for read in sampled_reads if pos < len(read)]
+        if bases:
+            base_counts = Counter(bases)
+            consensus.append(base_counts.most_common(1)[0][0])
+    
+    consensus_seq = ''.join(consensus)
+    
+    consistencies = [calculate_sequence_similarity(read, consensus_seq) for read in sampled_reads]
+    return np.mean(consistencies)
+
+
+def build_consensus_sequence(reads: List[str]) -> str:
+    """构建consensus序列"""
+    if not reads:
+        return ""
+    if len(reads) == 1:
+        return reads[0]
+    
+    max_len = max(len(r) for r in reads)
+    consensus = []
+    
+    for pos in range(max_len):
+        bases = [read[pos] for read in reads if pos < len(read)]
+        if bases:
+            base_counts = Counter(bases)
+            consensus.append(base_counts.most_common(1)[0][0])
+    
+    return ''.join(consensus)
+
+
+def find_nearest_healthy_cluster(data_manager: ClusterDataManager, 
+                                read_idx: int, 
+                                exclude_cids: Set[int] = None,
+                                min_cluster_size: int = 5) -> Optional[int]:
+    """找到最近的健康簇"""
+    exclude_cids = exclude_cids or set()
+    
+    read_seq = data_manager.reads[read_idx]
+    best_cid = None
+    best_similarity = 0.0
+    
+    for cid in data_manager.cluster_assignments.keys():
+        if cid in exclude_cids:
+            continue
+        if data_manager.cluster_status.get(cid) == 'eliminated':
+            continue
+        
+        cluster_reads = data_manager.get_cluster_reads(cid)
+        if len(cluster_reads) < min_cluster_size:
+            continue
+        
+        sample_indices = cluster_reads[:min(5, len(cluster_reads))]
+        similarities = []
+        
+        for center_idx in sample_indices:
+            center_seq = data_manager.reads[center_idx]
+            sim = calculate_sequence_similarity(read_seq, center_seq)
+            similarities.append(sim)
+        
+        avg_similarity = np.mean(similarities)
+        
+        if avg_similarity > best_similarity and avg_similarity > 0.65:
+            best_similarity = avg_similarity
+            best_cid = cid
+    
+    return best_cid
+
+
+# ============================================================================
+# 簇健康度评估与淘汰
+# ============================================================================
+def evaluate_cluster_health(data_manager: ClusterDataManager, 
+                           config: Config) -> Tuple[List[int], List[int]]:
+    """评估簇健康度"""
+    healthy_clusters = []
+    weak_clusters = []
+    
+    min_cluster_size = max(5, int(data_manager.total_reads * config.min_cluster_ratio))
+    
+    for cid in data_manager.get_active_clusters():
+        cluster_reads = data_manager.get_cluster_reads(cid)
+        cluster_size = len(cluster_reads)
+        
+        is_weak = False
+        
+        if cluster_size < min_cluster_size:
+            is_weak = True
+        
+        if not is_weak and cluster_size >= 3:
+            reads = [data_manager.reads[idx] for idx in cluster_reads[:20]]
+            consistency = calculate_cluster_consistency(reads)
+            if consistency < config.weak_consistency_threshold:
+                is_weak = True
+        
+        if is_weak:
+            weak_clusters.append(cid)
+            data_manager.cluster_status[cid] = 'weak'
+        else:
+            healthy_clusters.append(cid)
+            data_manager.cluster_status[cid] = 'healthy'
+    
+    return healthy_clusters, weak_clusters
+
+
+def eliminate_weak_clusters(data_manager: ClusterDataManager,
+                           config: Config,
+                           epoch: int,
+                           max_epochs: int) -> int:
+    """淘汰弱簇"""
+    eliminated = 0
+    
+    progress = epoch / max_epochs
+    min_cluster_size = max(5, int(data_manager.total_reads * config.min_cluster_ratio))
+    
+    if progress > 0.7:
+        min_cluster_size = max(10, int(data_manager.total_reads * 0.01))
+    
+    weak_clusters_info = []
+    
+    for cid in list(data_manager.cluster_assignments.keys()):
+        if data_manager.cluster_status.get(cid) == 'eliminated':
+            continue
+        
+        cluster_reads = data_manager.get_cluster_reads(cid)
+        cluster_size = len(cluster_reads)
+        
+        is_weak = False
+        reason = ""
+        
+        if cluster_size < min_cluster_size and cluster_size > 0:
+            is_weak = True
+            reason = f"size={cluster_size}<{min_cluster_size}"
+        
+        if not is_weak and cluster_size >= 3:
+            reads = [data_manager.reads[idx] for idx in cluster_reads[:15]]
+            consistency = calculate_cluster_consistency(reads)
+            if consistency < config.weak_consistency_threshold:
+                is_weak = True
+                reason = f"consistency={consistency:.1%}"
+        
+        if is_weak:
+            weak_clusters_info.append((cid, cluster_size, reason))
+    
+    weak_clusters_info.sort(key=lambda x: x[1])
+    
+    if weak_clusters_info:
+        print(f"   发现 {len(weak_clusters_info)} 个弱簇待淘汰")
+    
+    for cid, size, reason in weak_clusters_info:
+        cluster_reads = data_manager.get_cluster_reads(cid)
+        
+        reassigned = 0
+        marked_noise = 0
+        
+        for read_idx in list(cluster_reads):
+            best_cid = find_nearest_healthy_cluster(
+                data_manager, read_idx, exclude_cids={cid}, min_cluster_size=min_cluster_size
+            )
+            
+            if best_cid is not None:
+                data_manager.reassign_read(read_idx, best_cid)
+                reassigned += 1
+            else:
+                data_manager.mark_as_noise(read_idx)
+                marked_noise += 1
+        
+        data_manager.remove_cluster(cid)
+        eliminated += 1
+        
+        print(f"   ❌ 淘汰簇{cid}: {reason}, 重分配{reassigned}, 噪声{marked_noise}")
+    
+    return eliminated
+
+
+# ============================================================================
+# 困难样本挖掘
+# ============================================================================
+def mine_hard_samples(data_manager: ClusterDataManager,
+                     model: ClusterReconstructionModel,
+                     config: Config) -> Tuple[int, int]:
+    """困难样本挖掘"""
+    device = config.device
+    model.eval()
+    
+    reassigned = 0
+    new_noise = 0
+    
+    encoder = SequenceEncoder()
+    
+    cluster_centers = {}
+    for cid in data_manager.get_active_clusters():
+        cluster_reads = data_manager.get_cluster_reads(cid)
+        if len(cluster_reads) < 3:
+            continue
+        
+        sample_indices = cluster_reads[:min(20, len(cluster_reads))]
+        encodings = []
+        
+        for idx in sample_indices:
+            enc = encoder.encode_sequence(
+                data_manager.reads[idx], 
+                data_manager.qualities[idx]
+            )
+            encodings.append(enc)
+        
+        encodings = torch.stack(encodings).to(device)
         
         with torch.no_grad():
-            for cluster_id in range(len(self.dataset.clusters)):
-                cluster = self.dataset.clusters[cluster_id]
-                reads = cluster['reads']
-                old_label = cluster['pseudo_label']
-                
-                # 编码所有reads
-                reads_encoded = [self.dataset.one_hot_encode(r) for r in reads]
-                reads_tensor = torch.tensor(np.array(reads_encoded)).to(self.device)
-                
-                # 预测新的consensus
-                new_label = self.model.predict_consensus(reads_tensor)
-                
-                # 计算变化
-                min_len = min(len(old_label), len(new_label))
-                changed = sum(o != n for o, n in zip(old_label[:min_len], new_label[:min_len]))
-                total_changed += changed
-                total_positions += min_len
-                
-                # 更新伪标签
-                self.dataset.update_pseudo_label(cluster_id, new_label)
-                
-                # 计算一致性
-                agreement = self.compute_reads_agreement(cluster_id)
-                agreements.append(agreement)
-        
-        change_rate = total_changed / max(total_positions, 1)
-        avg_agreement = np.mean(agreements)
-        
-        return change_rate, avg_agreement
+            z, _ = model(encodings)
+            center = z.mean(dim=0)
+            cluster_centers[cid] = center
     
-    def train_epoch(self, epoch: int) -> Dict:
-        """训练一个epoch"""
-        self.model.train()
-        
-        epoch_stats = {
-            'total_loss': 0.0,
-            'ce_loss': 0.0,
-            'entropy': 0.0,
-            'consistency': 0.0
-        }
-        
-        valid_batches = 0
-        cluster_indices = list(range(len(self.dataset.clusters)))
-        random.shuffle(cluster_indices)
-        
-        for batch_idx, cluster_id in enumerate(cluster_indices):
-            reads, pseudo_label = self.dataset.get_cluster_data(cluster_id, self.num_reads)
-            
-            if reads is None or len(reads) == 0:
-                continue
-            
-            reads = reads.to(self.device)
-            pseudo_label = pseudo_label.to(self.device)
-            
-            self.optimizer.zero_grad()
-            
-            # 前向传播
-            fused_evidence, evidence_per_read = self.model(reads, return_per_read=True)
-            
-            # 计算损失
-            total_loss, ce_loss, entropy = self.consensus_loss(fused_evidence, pseudo_label)
-            consistency = self.consistency_loss(evidence_per_read)
-            
-            # 总损失
-            loss = total_loss + 0.1 * consistency
-            
-            if not check_tensor_health(loss, "loss"):
-                continue
-            
-            # 反向传播
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            
-            # 记录
-            epoch_stats['total_loss'] += loss.item()
-            epoch_stats['ce_loss'] += ce_loss.item()
-            epoch_stats['entropy'] += entropy.item()
-            epoch_stats['consistency'] += consistency.item()
-            valid_batches += 1
-            
-            # 定期输出
-            if (batch_idx + 1) % 20 == 0:
-                print(f"  Batch {batch_idx + 1}/{len(cluster_indices)} | "
-                      f"Loss: {loss.item():.4f} | CE: {ce_loss.item():.4f} | "
-                      f"Entropy: {entropy.item():.4f}")
-        
-        # 平均
-        if valid_batches > 0:
-            for key in epoch_stats:
-                epoch_stats[key] /= valid_batches
-        
-        return epoch_stats
+    if not cluster_centers:
+        return 0, 0
     
-    def train(self, 
-              max_epochs: int = 30,
-              update_interval: int = 3,
-              convergence_threshold: float = 0.01):
-        """
-        完整训练流程
+    for idx in range(data_manager.total_reads):
+        if idx in data_manager.noise_reads:
+            continue
         
-        参数:
-            max_epochs: 最大epoch数
-            update_interval: 每隔多少epoch更新伪标签
-            convergence_threshold: 收敛阈值（伪标签变化率）
-        """
-        print("=" * 60)
-        print("🧬 无监督DNA纠错训练")
-        print("=" * 60)
-        print(f"策略: 迭代自举 (每{update_interval}个epoch更新伪标签)")
-        print(f"收敛条件: 伪标签变化率 < {convergence_threshold * 100}%")
-        print("=" * 60)
+        current_label = data_manager.current_labels[idx]
+        if current_label < 0 or current_label not in cluster_centers:
+            continue
         
-        # 初始一致性
-        initial_agreements = [self.compute_reads_agreement(i) for i in range(len(self.dataset))]
-        print(f"\n📊 初始状态:")
-        print(f"   Reads与伪标签一致性: {np.mean(initial_agreements)*100:.2f}%")
+        enc = encoder.encode_sequence(
+            data_manager.reads[idx],
+            data_manager.qualities[idx]
+        ).unsqueeze(0).to(device)
         
-        prev_change_rate = 1.0
+        with torch.no_grad():
+            z, _ = model(enc)
+            z = z.squeeze(0)
         
-        for epoch in range(max_epochs):
-            print(f"\n{'='*60}")
-            print(f"🔄 Epoch {epoch + 1}/{max_epochs}")
-            print(f"{'='*60}")
+        current_center = cluster_centers[current_label]
+        current_sim = F.cosine_similarity(z.unsqueeze(0), current_center.unsqueeze(0)).item()
+        
+        if current_sim < 0.5:
+            best_cid = None
+            best_sim = current_sim
             
-            # 训练
-            epoch_stats = self.train_epoch(epoch)
-            
-            print(f"\n📈 Epoch {epoch + 1} 结果:")
-            print(f"   Total Loss: {epoch_stats['total_loss']:.4f}")
-            print(f"   CE Loss: {epoch_stats['ce_loss']:.4f}")
-            print(f"   Entropy: {epoch_stats['entropy']:.4f}")
-            print(f"   Consistency: {epoch_stats['consistency']:.4f}")
-            
-            # 记录历史
-            self.history['total_loss'].append(epoch_stats['total_loss'])
-            self.history['ce_loss'].append(epoch_stats['ce_loss'])
-            self.history['entropy'].append(epoch_stats['entropy'])
-            self.history['consistency'].append(epoch_stats['consistency'])
-            
-            # 更新伪标签
-            if (epoch + 1) % update_interval == 0:
-                print(f"\n🔄 更新伪标签...")
-                change_rate, avg_agreement = self.update_pseudo_labels()
+            for cid, center in cluster_centers.items():
+                if cid == current_label:
+                    continue
                 
-                self.history['pseudo_label_change_rate'].append(change_rate)
-                self.history['consensus_stability'].append(1.0 - change_rate)
-                
-                print(f"   伪标签变化率: {change_rate*100:.2f}%")
-                print(f"   Reads一致性: {avg_agreement*100:.2f}%")
-                
-                # 收敛检查
-                if change_rate < convergence_threshold:
-                    print(f"\n✅ 收敛！伪标签变化率 {change_rate*100:.2f}% < {convergence_threshold*100}%")
-                    break
-                
-                # 改进检查
-                if change_rate < prev_change_rate:
-                    print(f"   📈 伪标签趋于稳定 ({prev_change_rate*100:.2f}% → {change_rate*100:.2f}%)")
-                prev_change_rate = change_rate
+                sim = F.cosine_similarity(z.unsqueeze(0), center.unsqueeze(0)).item()
+                if sim > best_sim + 0.1:
+                    best_sim = sim
+                    best_cid = cid
             
-            self.scheduler.step()
-        
-        # 最终评估
-        print(f"\n{'='*60}")
-        print("🎉 训练完成!")
-        print(f"{'='*60}")
-        
-        final_agreements = [self.compute_reads_agreement(i) for i in range(len(self.dataset))]
-        print(f"📊 最终状态:")
-        print(f"   Reads与consensus一致性: {np.mean(final_agreements)*100:.2f}%")
-        print(f"   (提升: {(np.mean(final_agreements) - np.mean(initial_agreements))*100:.2f}%)")
-        
-        return self.history
+            if best_cid is not None and best_sim > 0.6:
+                data_manager.reassign_read(idx, best_cid)
+                reassigned += 1
+            elif current_sim < 0.3:
+                data_manager.mark_as_noise(idx)
+                new_noise += 1
+    
+    model.train()
+    return reassigned, new_noise
 
-# ==========================================
-# 评估函数
-# ==========================================
 
-def evaluate_correction_quality(dataset: UnsupervisedDNADataset, 
-                                 ground_truth_path: str = None) -> Dict:
-    """
-    评估纠错质量
+# ============================================================================
+# 序列重建
+# ============================================================================
+def reconstruct_sequences(data_manager: ClusterDataManager,
+                         model: ClusterReconstructionModel,
+                         config: Config) -> Dict[int, str]:
+    """为每个簇重建参考序列"""
+    model.eval()
     
-    如果有ground truth，计算与真实序列的一致性
-    否则，计算内部一致性指标
-    """
+    reconstructed = {}
+    
+    print("\n🧬 序列重建...")
+    
+    for cid in sorted(data_manager.get_active_clusters()):
+        cluster_reads = data_manager.get_cluster_reads(cid)
+        
+        if len(cluster_reads) == 0:
+            continue
+        
+        reads = [data_manager.reads[idx] for idx in cluster_reads]
+        consensus = build_consensus_sequence(reads)
+        reconstructed[cid] = consensus
+        
+        print(f"   簇{cid:>2} ({len(cluster_reads):>3} reads): {consensus[:50]}...")
+    
+    model.train()
+    return reconstructed
+
+
+# ============================================================================
+# 验证
+# ============================================================================
+def validate_results(reconstructed: Dict[int, str], 
+                    data_manager: ClusterDataManager) -> Dict:
+    """验证结果 - 使用已加载的GT"""
+    
     results = {
-        'internal_consistency': [],
-        'gt_accuracy': [] if ground_truth_path else None
+        'cluster_info': [],
+        'avg_consistency': 0.0,
+        'avg_gt_accuracy': 0.0,
+        'total_clusters': 0,
+        'gt_matched_clusters': 0
     }
     
-    # 内部一致性：reads与consensus的匹配度
-    for cluster in dataset.clusters:
-        consensus = cluster['pseudo_label']
-        reads = cluster['reads']
-        
-        matches = []
-        for read in reads:
-            min_len = min(len(read), len(consensus))
-            match_rate = sum(r == c for r, c in zip(read[:min_len], consensus[:min_len])) / min_len
-            matches.append(match_rate)
-        
-        results['internal_consistency'].append(np.mean(matches))
+    cluster_gt = data_manager.cluster_gt
     
-    # 如果有ground truth
-    if ground_truth_path and os.path.exists(ground_truth_path):
-        # 加载GT
-        gt_refs = {}
-        with open(ground_truth_path, 'r') as f:
-            next(f)  # skip header
-            for line in f:
-                parts = line.strip().split('\t')
-                if len(parts) >= 3:
-                    cluster_id = parts[1]
-                    ref_seq = parts[2]
-                    if cluster_id not in gt_refs:
-                        gt_refs[cluster_id] = ref_seq
+    print("\n" + "=" * 90)
+    print("📊 验证结果")
+    print("=" * 90)
+    print(f"{'簇ID':>6} | {'Reads':>6} | {'一致性':>10} | {'GT准确率':>10} | {'匹配GT簇':>8} | {'状态':>8}")
+    print("-" * 90)
+    
+    consistency_scores = []
+    gt_accuracy_scores = []
+    
+    for cid in sorted(reconstructed.keys()):
+        recon_seq = reconstructed[cid]
+        read_indices = data_manager.get_cluster_reads(cid)
+        num_reads = len(read_indices)
+        status = data_manager.cluster_status.get(cid, 'unknown')
         
-        # 计算与GT的一致性
-        for i, cluster in enumerate(dataset.clusters):
-            consensus = cluster['pseudo_label']
-            cluster_id = str(i)
+        # 1. 簇内一致性
+        reads = [data_manager.reads[idx] for idx in read_indices]
+        avg_consistency = calculate_cluster_consistency(reads) if reads else 0.0
+        consistency_scores.append(avg_consistency)
+        
+        # 2. GT准确率 - 通过原始GT标签找到对应的GT序列
+        gt_accuracy = None
+        matched_gt_cid = None
+        
+        if cluster_gt:
+            # 找到该簇中reads的原始GT标签
+            original_labels = [data_manager.original_gt_labels[idx] for idx in read_indices
+                             if data_manager.original_gt_labels[idx] >= 0]
             
-            if cluster_id in gt_refs:
-                gt = gt_refs[cluster_id]
-                min_len = min(len(consensus), len(gt))
-                accuracy = sum(c == g for c, g in zip(consensus[:min_len], gt[:min_len])) / min_len
-                results['gt_accuracy'].append(accuracy)
+            if original_labels:
+                # 多数投票
+                label_counts = Counter(original_labels)
+                most_common_label, count = label_counts.most_common(1)[0]
+                
+                if most_common_label in cluster_gt:
+                    gt_seq = cluster_gt[most_common_label]
+                    gt_accuracy = calculate_sequence_similarity(recon_seq, gt_seq)
+                    gt_accuracy_scores.append(gt_accuracy)
+                    matched_gt_cid = most_common_label
+        
+        # 状态显示
+        status_str = '✓ 健康' if status == 'healthy' else ('⚠ 弱' if status == 'weak' else '❓')
+        gt_str = f"{gt_accuracy*100:>8.1f}%" if gt_accuracy is not None else "      N/A"
+        gt_cid_str = f"{matched_gt_cid:>8}" if matched_gt_cid is not None else "     N/A"
+        
+        print(f"{cid:>6} | {num_reads:>6} | {avg_consistency*100:>9.1f}% | {gt_str:>10} | {gt_cid_str:>8} | {status_str:>8}")
+        
+        results['cluster_info'].append({
+            'cluster_id': cid,
+            'num_reads': num_reads,
+            'consistency': avg_consistency,
+            'gt_accuracy': gt_accuracy,
+            'matched_gt_cid': matched_gt_cid,
+            'status': status,
+            'sequence': recon_seq
+        })
+    
+    print("-" * 90)
+    
+    # 汇总
+    results['avg_consistency'] = np.mean(consistency_scores) if consistency_scores else 0.0
+    results['avg_gt_accuracy'] = np.mean(gt_accuracy_scores) if gt_accuracy_scores else 0.0
+    results['total_clusters'] = len(reconstructed)
+    results['gt_matched_clusters'] = len(gt_accuracy_scores)
+    
+    print(f"\n📈 汇总:")
+    print(f"   - 总簇数: {results['total_clusters']} (目标: {data_manager.config.k_target})")
+    print(f"   - 平均Read一致性: {results['avg_consistency']*100:.2f}%")
+    
+    if gt_accuracy_scores:
+        print(f"   - 平均GT准确率: {results['avg_gt_accuracy']*100:.2f}%")
+        print(f"   - GT验证覆盖: {results['gt_matched_clusters']}/{results['total_clusters']} 簇")
+        
+        # 分级统计
+        excellent = sum(1 for acc in gt_accuracy_scores if acc >= 0.95)
+        good = sum(1 for acc in gt_accuracy_scores if 0.9 <= acc < 0.95)
+        fair = sum(1 for acc in gt_accuracy_scores if 0.8 <= acc < 0.9)
+        poor = sum(1 for acc in gt_accuracy_scores if acc < 0.8)
+        
+        print(f"   - GT准确率分布:")
+        print(f"     ≥95%: {excellent} ({excellent/len(gt_accuracy_scores)*100:.1f}%)")
+        print(f"     90-95%: {good} ({good/len(gt_accuracy_scores)*100:.1f}%)")
+        print(f"     80-90%: {fair} ({fair/len(gt_accuracy_scores)*100:.1f}%)")
+        print(f"     <80%: {poor} ({poor/len(gt_accuracy_scores)*100:.1f}%)")
+    
+    noise_ratio = len(data_manager.noise_reads) / data_manager.total_reads * 100
+    print(f"   - 噪声Reads: {len(data_manager.noise_reads)} ({noise_ratio:.1f}%)")
     
     return results
 
-# ==========================================
-# 可视化
-# ==========================================
 
-def plot_training_history(history: Dict, output_path: str = "unsupervised_training.png"):
-    """绘制训练历史"""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    fig.suptitle('Unsupervised DNA Correction Training', fontsize=14, fontweight='bold')
+# ============================================================================
+# 保存结果
+# ============================================================================
+def save_results(reconstructed: Dict[int, str],
+                data_manager: ClusterDataManager,
+                results: Dict,
+                output_dir: str,
+                training_history: Dict = None):
+    """保存所有结果"""
     
-    epochs = range(1, len(history['total_loss']) + 1)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"\n💾 保存结果到: {output_dir}")
     
-    # 1. 损失曲线
-    ax1 = axes[0, 0]
-    ax1.plot(epochs, history['total_loss'], 'b-', label='Total Loss', linewidth=2)
-    ax1.plot(epochs, history['ce_loss'], 'r--', label='CE Loss', linewidth=2)
-    ax1.set_title('Loss Curves')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Loss')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    # 1. FASTA
+    fasta_path = os.path.join(output_dir, "reconstructed_sequences.fasta")
+    with open(fasta_path, 'w') as f:
+        for cid in sorted(reconstructed.keys()):
+            seq = reconstructed[cid]
+            num_reads = len(data_manager.get_cluster_reads(cid))
+            status = data_manager.cluster_status.get(cid, 'unknown')
+            f.write(f">cluster_{cid}_reads_{num_reads}_status_{status}\n")
+            f.write(f"{seq}\n")
+    print(f"   ✅ 序列: reconstructed_sequences.fasta")
     
-    # 2. 熵
-    ax2 = axes[0, 1]
-    ax2.plot(epochs, history['entropy'], 'g-', linewidth=2)
-    ax2.set_title('Prediction Entropy (Lower = More Confident)')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Entropy')
-    ax2.grid(True, alpha=0.3)
+    # 2. 纯序列
+    ref_path = os.path.join(output_dir, "ref.txt")
+    with open(ref_path, 'w') as f:
+        for cid in sorted(reconstructed.keys()):
+            f.write(f"{reconstructed[cid]}\n")
+    print(f"   ✅ 纯序列: ref.txt")
     
-    # 3. 伪标签变化率
-    ax3 = axes[1, 0]
-    if history['pseudo_label_change_rate']:
-        update_epochs = [i * 3 for i in range(1, len(history['pseudo_label_change_rate']) + 1)]
-        ax3.bar(update_epochs, history['pseudo_label_change_rate'], alpha=0.7, color='orange')
-        ax3.axhline(y=0.01, color='r', linestyle='--', label='Convergence Threshold')
-        ax3.set_title('Pseudo-Label Change Rate')
-        ax3.set_xlabel('Epoch')
-        ax3.set_ylabel('Change Rate')
-        ax3.legend()
-    ax3.grid(True, alpha=0.3)
+    # 3. 簇分配
+    assign_path = os.path.join(output_dir, "cluster_assignments.txt")
+    with open(assign_path, 'w') as f:
+        f.write("Read_Index\tCluster_ID\tOriginal_GT_Cluster\n")
+        for idx in range(data_manager.total_reads):
+            label = data_manager.current_labels[idx]
+            gt_label = data_manager.original_gt_labels[idx]
+            f.write(f"{idx}\t{label}\t{gt_label}\n")
+    print(f"   ✅ 分配: cluster_assignments.txt")
     
-    # 4. 一致性
-    ax4 = axes[1, 1]
-    ax4.plot(epochs, history['consistency'], 'purple', linewidth=2)
-    ax4.set_title('Reads Consistency Loss')
-    ax4.set_xlabel('Epoch')
-    ax4.set_ylabel('Consistency')
-    ax4.grid(True, alpha=0.3)
+    # 4. 簇健康度
+    health_path = os.path.join(output_dir, "cluster_health.txt")
+    with open(health_path, 'w') as f:
+        f.write("Cluster_ID\tNum_Reads\tConsistency\tGT_Accuracy\tMatched_GT_Cluster\tStatus\n")
+        for info in results['cluster_info']:
+            gt_acc = info['gt_accuracy'] if info['gt_accuracy'] is not None else -1
+            gt_cid = info['matched_gt_cid'] if info['matched_gt_cid'] is not None else -1
+            f.write(f"{info['cluster_id']}\t{info['num_reads']}\t")
+            f.write(f"{info['consistency']:.4f}\t{gt_acc:.4f}\t{gt_cid}\t{info['status']}\n")
+    print(f"   ✅ 健康度: cluster_health.txt")
     
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.show()
-    print(f"✅ 图表已保存: {output_path}")
-
-# ==========================================
-# 主函数
-# ==========================================
-
-def main():
-    print("=" * 60)
-    print("🧬 无监督DNA纠错模型")
-    print("=" * 60)
-    
-    # 配置
-    DATA_DIR = "CC/Step0/Experiments/20251216_145746_Improved_Data_Test/03_FedDNA_In"
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🔧 设备: {device}")
-    
-    # 设置随机种子
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
-    
-    # 加载数据
-    dataset = UnsupervisedDNADataset(DATA_DIR, seq_len=150)
-    
-    # 创建模型
-    model = UnsupervisedDNACorrector(
-        input_dim=4,
-        hidden_dim=128,
-        seq_len=150
-    )
-    
-    # 尝试加载预训练权重
-    pretrained_path = "step1_model.pth"
-    if os.path.exists(pretrained_path):
+    # 5. 训练历史
+    if training_history:
+        history_path = os.path.join(output_dir, "training_history.txt")
+        with open(history_path, 'w') as f:
+            f.write("Epoch\tTotal_Loss\tContrastive\tDEL\tK_Constraint\tK_Effective\n")
+            for i in range(len(training_history['total_loss'])):
+                f.write(f"{i+1}\t{training_history['total_loss'][i]:.4f}\t")
+                f.write(f"{training_history['contrastive_loss'][i]:.4f}\t")
+                f.write(f"{training_history['del_loss'][i]:.4f}\t")
+                f.write(f"{training_history['k_loss'][i]:.4f}\t")
+                f.write(f"{training_history['k_effective'][i]}\n")
+        print(f"   ✅ 历史: training_history.txt")
+        
+        # 绘图
         try:
-            checkpoint = torch.load(pretrained_path, map_location=device)
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-            else:
-                model.load_state_dict(checkpoint, strict=False)
-            print(f"✅ 加载预训练权重: {pretrained_path}")
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            epochs = range(1, len(training_history['total_loss']) + 1)
+            
+            axes[0, 0].plot(epochs, training_history['total_loss'], 'b-')
+            axes[0, 0].set_title('Total Loss')
+            axes[0, 0].grid(True)
+            
+            axes[0, 1].plot(epochs, training_history['contrastive_loss'], 'r-', label='Contrastive')
+            axes[0, 1].plot(epochs, training_history['del_loss'], 'g-', label='DEL')
+            axes[0, 1].set_title('Loss Components')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True)
+            
+            axes[1, 0].plot(epochs, training_history['k_loss'], 'm-')
+            axes[1, 0].set_title('K Constraint Loss')
+            axes[1, 0].grid(True)
+            
+            axes[1, 1].plot(epochs, training_history['k_effective'], 'c-')
+            axes[1, 1].axhline(y=data_manager.config.k_target, color='r', linestyle='--', label=f'Target K={data_manager.config.k_target}')
+            axes[1, 1].set_title('Effective Cluster Count')
+            axes[1, 1].legend()
+            axes[1, 1].grid(True)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, "training_history.png"), dpi=150)
+            plt.close()
+            print(f"   ✅ 训练曲线: training_history.png")
         except Exception as e:
-            print(f"⚠️ 加载失败: {e}")
+            print(f"   ⚠️ 绘图失败: {e}")
     
-    # 创建训练器
-    trainer = UnsupervisedTrainer(
-        model=model,
-        dataset=dataset,
-        device=device,
-        num_reads=8,
-        lr=1e-4
+    # 6. 噪声
+    noise_path = os.path.join(output_dir, "noise_reads.txt")
+    with open(noise_path, 'w') as f:
+        f.write(f"# Total: {len(data_manager.noise_reads)}\n")
+        for idx in sorted(data_manager.noise_reads):
+            f.write(f"{idx}\n")
+    print(f"   ✅ 噪声: noise_reads.txt ({len(data_manager.noise_reads)} reads)")
+
+
+# ============================================================================
+# 训练
+# ============================================================================
+def train(data_manager: ClusterDataManager,
+         model: ClusterReconstructionModel,
+         config: Config) -> Dict:
+    """训练主循环"""
+    
+    device = config.device
+    model = model.to(device)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.num_epochs)
+    
+    contrastive_loss_fn = ContrastiveLoss()
+    del_loss_fn = DELLoss()
+    k_constraint_fn = StrictKConstraintLoss(config.k_target, config.lambda_k)
+    
+    history = {
+        'total_loss': [],
+        'contrastive_loss': [],
+        'del_loss': [],
+        'k_loss': [],
+        'k_effective': []
+    }
+    
+    print("\n" + "=" * 70)
+    print("🚀 开始训练")
+    print("=" * 70)
+    
+    for epoch in range(1, config.num_epochs + 1):
+        dataset = ClusterDataset(data_manager)
+        dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+        
+        epoch_losses = {'total': 0, 'contrastive': 0, 'del': 0, 'k': 0}
+        num_batches = 0
+        
+        model.train()
+        
+        for batch in dataloader:
+            encodings = batch['encoding'].to(device)
+            labels = batch['label'].to(device)
+            
+            optimizer.zero_grad()
+            
+            z, logits = model(encodings)
+            
+            loss_contrastive = contrastive_loss_fn(z, labels)
+            loss_del = del_loss_fn(z, labels)
+            
+            total_loss = config.lambda_contrastive * loss_contrastive + config.lambda_del * loss_del
+            
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            epoch_losses['total'] += total_loss.item()
+            epoch_losses['contrastive'] += loss_contrastive.item()
+            epoch_losses['del'] += loss_del.item()
+            num_batches += 1
+        
+        scheduler.step()
+        
+        k_effective = data_manager.get_k_effective()
+        loss_k = k_constraint_fn(k_effective, epoch, config.num_epochs)
+        epoch_losses['k'] = loss_k.item()
+        
+        avg_total = epoch_losses['total'] / num_batches if num_batches > 0 else 0
+        avg_contrastive = epoch_losses['contrastive'] / num_batches if num_batches > 0 else 0
+        avg_del = epoch_losses['del'] / num_batches if num_batches > 0 else 0
+        
+        history['total_loss'].append(avg_total + epoch_losses['k'])
+        history['contrastive_loss'].append(avg_contrastive)
+        history['del_loss'].append(avg_del)
+        history['k_loss'].append(epoch_losses['k'])
+        history['k_effective'].append(k_effective)
+        
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"\n{'='*70}")
+            print(f"📍 Epoch {epoch}/{config.num_epochs}")
+            print(f"{'='*70}")
+            print(f"\n📈 损失:")
+            print(f"   - Total: {avg_total + epoch_losses['k']:.4f}")
+            print(f"   - Contrastive: {avg_contrastive:.4f}")
+            print(f"   - DEL: {avg_del:.4f}")
+            print(f"   - K-constraint: {epoch_losses['k']:.4f}")
+        
+        if epoch % 5 == 0:
+            if epoch % 10 == 0:
+                print(f"\n🏥 簇健康度评估...")
+            healthy, weak = evaluate_cluster_health(data_manager, config)
+            if epoch % 10 == 0:
+                print(f"   - 健康簇: {len(healthy)}")
+                print(f"   - 弱簇: {len(weak)}")
+        
+        if epoch % 10 == 0 and epoch > 10:
+            print(f"\n🔧 困难样本修正...")
+            reassigned, new_noise = mine_hard_samples(data_manager, model, config)
+            print(f"   - 重分配: {reassigned}")
+            print(f"   - 新噪声: {new_noise}")
+        
+        eliminate_freq = 10 if epoch < config.num_epochs * 0.7 else 5
+        if epoch % eliminate_freq == 0 and epoch > 10:
+            if epoch % 10 == 0:
+                print(f"\n🗑️ 弱簇淘汰检查...")
+            eliminated = eliminate_weak_clusters(data_manager, config, epoch, config.num_epochs)
+            if eliminated > 0 and epoch % 10 != 0:
+                print(f"   淘汰了 {eliminated} 个弱簇")
+        
+        if epoch % 10 == 0:
+            k_eff = data_manager.get_k_effective()
+            noise_count = len(data_manager.noise_reads)
+            noise_ratio = noise_count / data_manager.total_reads * 100
+            
+            print(f"\n📊 当前状态:")
+            print(f"   - K_effective: {k_eff} (目标: {config.k_target})")
+            print(f"   - 噪声率: {noise_ratio:.1f}%")
+    
+    print("\n" + "=" * 70)
+    print("🎉 训练完成!")
+    print("=" * 70)
+    
+    k_final = data_manager.get_k_effective()
+    healthy_final, weak_final = evaluate_cluster_health(data_manager, config)
+    valid_reads = data_manager.total_reads - len(data_manager.noise_reads)
+    avg_cluster_size = valid_reads / k_final if k_final > 0 else 0
+    
+    print(f"\n📊 最终状态:")
+    print(f"   - K_effective: {k_final}")
+    print(f"   - K_healthy: {len(healthy_final)}")
+    print(f"   - 有效Reads: {valid_reads}")
+    print(f"   - 噪声Reads: {len(data_manager.noise_reads)} ({len(data_manager.noise_reads)/data_manager.total_reads*100:.1f}%)")
+    print(f"   - 平均簇大小: {avg_cluster_size:.1f}")
+    
+    return history
+
+
+# ============================================================================
+# 主函数
+# ============================================================================
+def main():
+    """主函数"""
+    
+    # ==========================================
+    # 配置路径 - 修改这里！
+    # ==========================================
+    # 实验目录 (包含 01_RawData, 02_CloverOut, 03_FedDNA_In)
+    EXPERIMENT_DIR = "CC/Step0/Experiments/20251217_015615_Cluster_GT_Test"
+    
+    # 输出目录
+    OUTPUT_DIR = f"./results_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # ==========================================
+    # 配置参数
+    # ==========================================
+    config = Config(
+        experiment_dir=EXPERIMENT_DIR,
+        
+        # 模型
+        hidden_dim=128,
+        latent_dim=64,
+        num_heads=4,
+        num_layers=3,
+        dropout=0.1,
+        
+        # 训练
+        k_target=50,
+        batch_size=64,
+        num_epochs=50,
+        learning_rate=1e-3,
+        
+                # 损失
+        lambda_contrastive=1.0,
+        lambda_del=0.5,
+        lambda_k=2.0,
+        
+        # 阈值
+        similarity_threshold=0.7,
+        min_cluster_ratio=0.005,
+        weak_consistency_threshold=0.6,
     )
     
+    print("=" * 70)
+    print("🧬 FedDNA 簇序列重建系统 v3 (适配版)")
+    print("=" * 70)
+    print(f"📂 实验目录: {EXPERIMENT_DIR}")
+    print(f"📂 输出目录: {OUTPUT_DIR}")
+    print(f"🎯 目标簇数K: {config.k_target}")
+    print(f"🖥️ 设备: {config.device}")
+    print("=" * 70)
+    
+    # ==========================================
+    # 检查目录
+    # ==========================================
+    if not os.path.exists(EXPERIMENT_DIR):
+        print(f"❌ 实验目录不存在: {EXPERIMENT_DIR}")
+        print(f"💡 请确保路径正确，或先运行数据生成脚本")
+        return
+    
+    feddna_dir = os.path.join(EXPERIMENT_DIR, "03_FedDNA_In")
+    if not os.path.exists(feddna_dir):
+        print(f"❌ FedDNA数据目录不存在: {feddna_dir}")
+        return
+    
+    # ==========================================
+    # 加载数据
+    # ==========================================
+    try:
+        data_manager = ClusterDataManager(EXPERIMENT_DIR, config)
+    except FileNotFoundError as e:
+        print(f"❌ 数据加载失败: {e}")
+        return
+    
+    # ==========================================
+    # 创建模型
+    # ==========================================
+    model = ClusterReconstructionModel(config)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n🧠 模型参数: {total_params:,} (可训练: {trainable_params:,})")
+    
+    # ==========================================
     # 训练
-    history = trainer.train(
-        max_epochs=30,
-        update_interval=3,  # 每3个epoch更新伪标签
-        convergence_threshold=0.01  # 变化率<1%则收敛
-    )
+    # ==========================================
+    training_history = train(data_manager, model, config)
     
+    # ==========================================
+    # 序列重建
+    # ==========================================
+    reconstructed = reconstruct_sequences(data_manager, model, config)
+    
+    # ==========================================
+    # 验证结果
+    # ==========================================
+    results = validate_results(reconstructed, data_manager)
+    
+    # ==========================================
     # 保存结果
-    print("\n💾 保存结果...")
-    
-    # 保存纠错后的consensus
-    with open("consensus_corrected.txt", 'w') as f:
-        for cluster in dataset.clusters:
-            f.write(cluster['pseudo_label'] + '\n')
-    print("✅ 纠错结果: consensus_corrected.txt")
-    
-    # 绘制训练曲线
-    plot_training_history(history, "unsupervised_training.png")
+    # ==========================================
+    save_results(reconstructed, data_manager, results, OUTPUT_DIR, training_history)
     
     # 保存模型
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = f"unsupervised_model_{timestamp}.pth"
+    model_path = os.path.join(OUTPUT_DIR, "model.pth")
     torch.save({
         'model_state_dict': model.state_dict(),
-        'history': history
+        'config': config.__dict__,
+        'k_effective': data_manager.get_k_effective(),
     }, model_path)
-    print(f"✅ 模型已保存: {model_path}")
+    print(f"   ✅ 模型: model.pth")
     
-    # 评估
-    print("\n📊 最终评估:")
-    results = evaluate_correction_quality(dataset)
-    print(f"   内部一致性: {np.mean(results['internal_consistency'])*100:.2f}%")
+    print("\n" + "=" * 70)
+    print("🎉 全部完成!")
+    print("=" * 70)
     
-    return model, dataset, history
+    return results
+
+
+# ============================================================================
+# 命令行接口
+# ============================================================================
+def parse_args():
+    """解析命令行参数"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='FedDNA 簇序列重建系统 v3')
+    
+    parser.add_argument('--experiment_dir', type=str, required=False,
+                       help='实验目录路径 (包含01_RawData, 03_FedDNA_In等)')
+    parser.add_argument('--output_dir', type=str, required=False,
+                       help='输出目录')
+    parser.add_argument('--k_target', type=int, default=50,
+                       help='目标簇数K')
+    parser.add_argument('--num_epochs', type=int, default=50,
+                       help='训练轮数')
+    parser.add_argument('--batch_size', type=int, default=64,
+                       help='批大小')
+    parser.add_argument('--learning_rate', type=float, default=1e-3,
+                       help='学习率')
+    parser.add_argument('--lambda_k', type=float, default=2.0,
+                       help='K约束权重')
+    
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    model, dataset, history = main()
+    # 检查是否有命令行参数
+    if len(sys.argv) > 1:
+        args = parse_args()
+        
+        if args.experiment_dir:
+            # 更新主函数中的路径
+            # 这里简单处理：直接修改全局变量或重新调用
+            config = Config(
+                experiment_dir=args.experiment_dir,
+                k_target=args.k_target,
+                num_epochs=args.num_epochs,
+                batch_size=args.batch_size,
+                learning_rate=args.learning_rate,
+                lambda_k=args.lambda_k,
+            )
+            
+            output_dir = args.output_dir or f"./results_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
+            print("=" * 70)
+            print("🧬 FedDNA 簇序列重建系统 v3 (命令行模式)")
+            print("=" * 70)
+            
+            # 加载数据
+            data_manager = ClusterDataManager(args.experiment_dir, config)
+            
+            # 创建模型
+            model = ClusterReconstructionModel(config)
+            
+            # 训练
+            training_history = train(data_manager, model, config)
+            
+            # 重建
+            reconstructed = reconstruct_sequences(data_manager, model, config)
+            
+            # 验证
+            results = validate_results(reconstructed, data_manager)
+            
+            # 保存
+            save_results(reconstructed, data_manager, results, output_dir, training_history)
+            
+            print("\n🎉 完成!")
+        else:
+            print("请提供 --experiment_dir 参数")
+    else:
+        # 直接运行
+        main()

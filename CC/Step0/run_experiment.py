@@ -2,17 +2,14 @@ import os
 import sys
 import subprocess
 import datetime
-import utils  # 现在它包含了你的高级生成逻辑
+import utils  
 
 # ================= 实验配置 =================
-EXP_NAME = "Improved_Data_Test"
+EXP_NAME = "Cluster_GT_Test"
 SEQ_LENGTH = 150
-NUM_CLUSTERS = 50       # 簇数量
-READS_PER_CLUSTER = 50  # 每簇 Read 数 (增加一点数据量)
-CLOVER_PROCESSES = 0    # 0=单进程
-
-# 新增配置: 数据生成模式
-# 可选: "diverse" (高区分度随机) 或 "motif" (生物学模体)
+NUM_CLUSTERS = 50       
+READS_PER_CLUSTER = 50  
+CLOVER_PROCESSES = 0    
 REF_TYPE = "diverse" 
 # ===========================================
 
@@ -32,20 +29,24 @@ def run():
         
     print(f"🚀 开始实验: {EXP_NAME} (Mode: {REF_TYPE})")
     
-    # 2. 生成数据 (调用升级后的 utils)
-    print("\n[Step 1] 生成高级模拟数据...")
-    raw_reads_path, gt_path = utils.generate_data(
+    # 2. 生成数据 (接收 3 个返回值)
+    print("\n[Step 1] 生成数据 (含 Cluster-Level GT)...")
+    # 注意这里解包了 3 个变量
+    raw_reads_path, read_gt_path, cluster_gt_path = utils.generate_data(
         output_dir=dir_raw, 
         num_clusters=NUM_CLUSTERS, 
         reads_per_cluster=READS_PER_CLUSTER, 
         seq_len=SEQ_LENGTH,
-        reference_type=REF_TYPE  # 传入新参数
+        reference_type=REF_TYPE
     )
-    print(f"✅ 数据已生成: {raw_reads_path}")
+    
+    print(f"✅ 数据就绪。")
+    print(f"   - Raw Reads: {os.path.basename(raw_reads_path)}")
+    print(f"   - Cluster GT (Key!): {os.path.basename(cluster_gt_path)}")
     
     # 3. 运行 Clover
     print("\n[Step 2] 运行 Clover 聚类...")
-    clover_out_file = os.path.join(dir_clover, "clover_result") # 不带后缀
+    clover_out_file = os.path.join(dir_clover, "clover_result")
     clover_out_real = clover_out_file + ".txt"
     
     env = os.environ.copy()
@@ -76,8 +77,9 @@ def run():
         )
         print("-" * 40)
         print(f"🎉 实验完成！")
-        print(f"📊 有效簇数量: {count}")
-        print(f"👉 数据已准备好: {dir_feddna}")
+        print(f"📊 有效簇数量: {count} (Clover 聚类结果)")
+        print(f"🎯 真实簇数量: {NUM_CLUSTERS} (Ground Truth)")
+        print(f"👉 数据目录: {base_dir}")
         print("-" * 40)
     except Exception as e:
         print(f"❌ 转换失败: {e}")
