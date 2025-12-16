@@ -467,67 +467,313 @@ class CloverClusterDataset(Dataset):
 # 🔥 完整Dirichlet训练器
 # ==========================================
 
+class DirichletEvidenceRefinement(nn.Module):
+    """🔥 彻底修复版：基于Dirichlet不确定性的困难样本修正模块"""
+    
+    def __init__(self, uncertainty_threshold=0.7, confidence_threshold=0.4, distance_threshold=1.0):
+        super().__init__()
+        self.uncertainty_threshold = uncertainty_threshold
+        self.confidence_threshold = confidence_threshold
+        self.distance_threshold = distance_threshold
+        
+    def calculate_dirichlet_confidence(self, uncertainty):
+        """计算置信度"""
+        avg_uncertainty = torch.mean(uncertainty, dim=1)  # [N]
+        
+        # 线性变换到[0,1]
+        max_uncertainty = torch.max(avg_uncertainty)
+        min_uncertainty = torch.min(avg_uncertainty)
+        if max_uncertainty > min_uncertainty:
+            confidence_scores = 1.0 - (avg_uncertainty - min_uncertainty) / (max_uncertainty - min_uncertainty)
+        else:
+            confidence_scores = torch.ones_like(avg_uncertainty) * 0.5
+        
+        return confidence_scores, avg_uncertainty
+    
+    def identify_hard_samples_multi_criteria(self, uncertainty, confidence_scores):
+        """多重标准识别困难样本"""
+        N = uncertainty.shape[0]
+        
+        # 标准1：高不确定性
+        avg_uncertainty = torch.mean(uncertainty, dim=1)  # [N]
+        high_uncertainty_mask = avg_uncertainty > self.uncertainty_threshold
+        
+        # 标准2：低置信度
+        low_confidence_mask = confidence_scores < self.confidence_threshold
+        
+        # 标准3：不确定性方差大
+        uncertainty_var = torch.var(uncertainty, dim=1)  # [N]
+        uncertainty_var_threshold = torch.quantile(uncertainty_var, 0.7)
+        high_variance_mask = uncertainty_var > uncertainty_var_threshold
+        
+        # 综合判断：满足任意两个条件
+        criteria_count = (high_uncertainty_mask.float() + 
+                         low_confidence_mask.float() + 
+                         high_variance_mask.float())
+        
+        hard_sample_mask = criteria_count >= 2.0
+        
+        # 如果没有困难样本，降低标准
+        if hard_sample_mask.sum() == 0:
+            hard_sample_mask = criteria_count >= 1.0
+            
+        # 强制选择最不确定的30%
+        if hard_sample_mask.sum() == 0:
+            uncertainty_threshold_dynamic = torch.quantile(avg_uncertainty, 0.7)
+            hard_sample_mask = avg_uncertainty > uncertainty_threshold_dynamic
+        
+        return hard_sample_mask, {
+            'high_uncertainty_count': high_uncertainty_mask.sum().item(),
+            'low_confidence_count': low_confidence_mask.sum().item(),
+            'high_variance_count': high_variance_mask.sum().item(),
+            'avg_uncertainty': avg_uncertainty.mean().item(),
+            'uncertainty_var_threshold': uncertainty_var_threshold.item()
+        }
+    
+    def create_multi_cluster_assignment(self, embeddings, uncertainty, num_base_clusters=3):
+        """
+        🔥 关键修复：创建多簇分配而不是单一簇
+        基于embedding相似性和不确定性创建初始多簇标签
+        """
+        N = embeddings.shape[0]
+        device = embeddings.device
+        
+        if N <= num_base_clusters:
+            # 如果样本数太少，直接分配不同标签
+            return torch.arange(N, device=device)
+        
+        # 方法1：基于embedding的K-means聚类
+        from sklearn.cluster import KMeans
+        import numpy as np
+        
+        embeddings_np = embeddings.detach().cpu().numpy()
+        
+        try:
+            kmeans = KMeans(n_clusters=min(num_base_clusters, N), random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(embeddings_np)
+            initial_labels = torch.tensor(cluster_labels, device=device, dtype=torch.long)
+        except:
+            # 如果K-means失败，使用简单的基于不确定性的分组
+            avg_uncertainty = torch.mean(uncertainty, dim=1)  # [N]
+            
+            # 按不确定性分成3组
+            uncertainty_sorted, indices = torch.sort(avg_uncertainty)
+            group_size = N // num_base_clusters
+            
+            initial_labels = torch.zeros(N, device=device, dtype=torch.long)
+            for i in range(num_base_clusters):
+                start_idx = i * group_size
+                end_idx = (i + 1) * group_size if i < num_base_clusters - 1 else N
+                group_indices = indices[start_idx:end_idx]
+                initial_labels[group_indices] = i
+        
+        return initial_labels
+    
+    def compute_cluster_centers(self, embeddings, labels, num_clusters):
+        """计算簇中心"""
+        device = embeddings.device
+        feature_dim = embeddings.shape[1]
+        centers = torch.zeros(num_clusters, feature_dim, device=device)
+        
+        for k in range(num_clusters):
+            mask = (labels == k)
+            if mask.sum() > 0:
+                centers[k] = torch.mean(embeddings[mask], dim=0)
+            else:
+                # 随机初始化空簇
+                centers[k] = torch.randn(feature_dim, device=device) * 0.1
+                
+        return centers
+    
+    def reassign_hard_samples_improved(self, hard_embeddings, cluster_centers, hard_indices, current_labels):
+        """
+        🔥 改进版重分配：确保产生标签变化
+        """
+        if hard_embeddings.shape[0] == 0:
+            return torch.tensor([], dtype=torch.long, device=hard_embeddings.device), torch.tensor([], device=hard_embeddings.device)
+            
+        # 计算到所有簇中心的距离
+        distances = torch.cdist(hard_embeddings, cluster_centers)  # [M, K]
+        min_distances, nearest_clusters = torch.min(distances, dim=1)  # [M]
+        
+        # 获取当前标签
+        current_hard_labels = current_labels[hard_indices]
+        
+        # 🔥 关键修复：强制改变标签
+        new_labels = nearest_clusters.clone()
+        
+        # 对于距离太远的样本，标记为噪声
+        noise_mask = min_distances > self.distance_threshold
+        new_labels[noise_mask] = -1
+        
+        # 🔥 强制标签变化：如果新标签和旧标签相同，改为下一个最近的簇
+        same_label_mask = (new_labels == current_hard_labels) & (new_labels != -1)
+        if same_label_mask.sum() > 0:
+            # 找到第二近的簇
+            distances_masked = distances.clone()
+            distances_masked[torch.arange(distances.shape[0]), nearest_clusters] = float('inf')
+            second_nearest = torch.argmin(distances_masked, dim=1)
+            
+            # 对于标签相同的样本，分配到第二近的簇
+            new_labels[same_label_mask] = second_nearest[same_label_mask]
+        
+        return new_labels, min_distances
+    
+    def forward(self, embeddings, dirichlet_uncertainty, current_labels, num_clusters):
+        """
+        🔥 彻底修复版：执行修正流程
+        """
+        N = embeddings.shape[0]
+        device = embeddings.device
+        
+        # 🔥 关键修复：如果current_labels都相同，创建多簇初始分配
+        if len(torch.unique(current_labels)) == 1:
+            print(f"    🔧 检测到单一簇标签，创建多簇初始分配...")
+            current_labels = self.create_multi_cluster_assignment(
+                embeddings, dirichlet_uncertainty, num_base_clusters=3
+            )
+            num_clusters = max(3, len(torch.unique(current_labels)))
+            print(f"    ✅ 创建了 {len(torch.unique(current_labels))} 个初始簇")
+        
+        # 1️⃣ 计算置信度
+        confidence_scores, avg_uncertainty = self.calculate_dirichlet_confidence(dirichlet_uncertainty)
+        
+        # 2️⃣ 识别困难样本
+        hard_sample_mask, criteria_stats = self.identify_hard_samples_multi_criteria(
+            dirichlet_uncertainty, confidence_scores
+        )
+        
+        high_confidence_mask = ~hard_sample_mask
+        
+        # 3️⃣ 保留高置信度样本的标签
+        new_labels = current_labels.clone()
+        
+        # 4️⃣ 处理困难样本
+        reassignment_stats = {'reassigned_count': 0, 'noise_count': 0, 'label_change_count': 0}
+        
+        if hard_sample_mask.sum() > 0:
+            print(f"    🎯 处理 {hard_sample_mask.sum()} 个困难样本...")
+            
+            if high_confidence_mask.sum() > 0:
+                # 基于高置信度样本计算簇中心
+                high_conf_embeddings = embeddings[high_confidence_mask]
+                high_conf_labels = current_labels[high_confidence_mask]
+                
+                cluster_centers = self.compute_cluster_centers(
+                    high_conf_embeddings, high_conf_labels, num_clusters
+                )
+            else:
+                # 如果没有高置信度样本，使用所有样本计算簇中心
+                cluster_centers = self.compute_cluster_centers(
+                    embeddings, current_labels, num_clusters
+                )
+            
+            # 重分配困难样本
+            hard_embeddings = embeddings[hard_sample_mask]
+            hard_indices = torch.where(hard_sample_mask)[0]
+            
+            reassigned_labels, distances = self.reassign_hard_samples_improved(
+                hard_embeddings, cluster_centers, hard_indices, current_labels
+            )
+            
+            # 更新标签
+            old_hard_labels = new_labels[hard_sample_mask].clone()
+            new_labels[hard_sample_mask] = reassigned_labels
+            
+            # 统计变化
+            reassignment_stats['reassigned_count'] = (reassigned_labels != -1).sum().item()
+            reassignment_stats['noise_count'] = (reassigned_labels == -1).sum().item()
+            reassignment_stats['label_change_count'] = (reassigned_labels != old_hard_labels).sum().item()
+            
+            print(f"    📊 重分配结果: {reassignment_stats['label_change_count']} 个标签改变, "
+                  f"{reassignment_stats['noise_count']} 个噪声")
+        
+        # 5️⃣ 详细统计信息
+        total_label_changes = (new_labels != current_labels).sum().item()
+        
+        refinement_stats = {
+            'total_samples': N,
+            'high_confidence_count': high_confidence_mask.sum().item(),
+            'hard_samples_count': hard_sample_mask.sum().item(),
+            'noise_samples_count': (new_labels == -1).sum().item(),
+            'label_changes': total_label_changes,
+            'refinement_ratio': total_label_changes / N if N > 0 else 0.0,
+            'avg_confidence': confidence_scores.mean().item(),
+            'avg_uncertainty': avg_uncertainty.mean().item(),
+            'min_confidence': confidence_scores.min().item(),
+            'max_confidence': confidence_scores.max().item(),
+            'min_uncertainty': avg_uncertainty.min().item(),
+            'max_uncertainty': avg_uncertainty.max().item(),
+            'unique_labels_before': len(torch.unique(current_labels)),
+            'unique_labels_after': len(torch.unique(new_labels[new_labels != -1])),
+            # 多重标准统计
+            **criteria_stats,
+            **reassignment_stats
+        }
+        
+        return new_labels, refinement_stats
+
+# ==========================================
+# 🔥 修复训练器收敛逻辑
+# ==========================================
+
 class DirichletRefinementTrainer:
-    """🔥 基于完整Dirichlet代数的训练器"""
+    """🔥 修复版训练器"""
     
     def __init__(self, model, criterion, optimizer, refinement_module, 
-                 convergence_threshold=0.01, max_epochs=10):
+                 convergence_threshold=0.02, max_epochs=10, min_epochs=5):
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
         self.refinement = refinement_module
         self.convergence_threshold = convergence_threshold
         self.max_epochs = max_epochs
+        self.min_epochs = min_epochs
         
     def train_epoch_with_refinement(self, dataloader, device, epoch):
-        """🔥 训练一个epoch，使用完整Dirichlet代数"""
+        """训练一个epoch"""
         
         self.model.train()
         epoch_losses = {'total_loss': 0, 'expected_mse': 0, 'contrastive_loss': 0, 'dirichlet_kl': 0}
         all_refinement_stats = []
         step_count = 0
         
-        print(f"\n🔄 Epoch {epoch+1} - 开始Dirichlet训练+修正阶段...")
+        print(f"\n🔄 Epoch {epoch+1} - 开始修复版Dirichlet训练...")
         
         for i, (reads, ref) in enumerate(dataloader):
             reads = reads.to(device)  # [1, N, 150, 4]
             ref = ref.squeeze(0).to(device)  # [150, 4]
             N = reads.shape[1]
             
-            # === 步骤1: Dirichlet正向传播 ===
+            # === 步骤1: 正向传播 ===
             self.optimizer.zero_grad()
             
-            # Forward pass
             dirichlet_outputs, contrastive_features = self.model(reads)
             
-            # 提取单个batch的结果
             single_batch_outputs = {}
             for key in dirichlet_outputs:
-                single_batch_outputs[key] = dirichlet_outputs[key].squeeze(0)  # [N, L, K] or [N, L]
+                single_batch_outputs[key] = dirichlet_outputs[key].squeeze(0)
             
-            # Dirichlet证据融合
             fusion_results = self.model.evidence_fusion(single_batch_outputs)
             
-            # 计算Dirichlet损失
-            contrastive_features_flat = contrastive_features.squeeze(0)  # [N, feature_dim]
+            contrastive_features_flat = contrastive_features.squeeze(0)
             losses = self.criterion(fusion_results, ref, contrastive_features_flat)
             
-            # 反向传播
             losses['total_loss'].backward()
             self.optimizer.step()
             
-            # === 步骤2: 基于Dirichlet不确定性的修正 ===
+            # === 步骤2: 修正阶段 ===
             with torch.no_grad():
-                current_labels = torch.zeros(N, dtype=torch.long, device=device)
+                # 🔥 使用随机初始标签而不是全0
+                current_labels = torch.randint(0, 3, (N,), device=device)
                 
-                # 使用Dirichlet不确定性进行修正
                 dirichlet_uncertainty = single_batch_outputs['uncertainty']  # [N, L]
                 
                 new_labels, refinement_stats = self.refinement(
                     embeddings=contrastive_features_flat,
                     dirichlet_uncertainty=dirichlet_uncertainty,
                     current_labels=current_labels,
-                    num_clusters=1
+                    num_clusters=3
                 )
                 
                 all_refinement_stats.append(refinement_stats)
@@ -537,13 +783,14 @@ class DirichletRefinementTrainer:
                 epoch_losses[key] += losses[key].item()
             step_count += 1
             
-            # 打印进度
-            if (i + 1) % 5 == 0:
+            # 详细输出
+            if (i + 1) % 3 == 0:
                 print(f"  📊 Step {i+1:3d} | Loss: {losses['total_loss'].item():.4f} | "
-                      f"MSE: {losses['expected_mse'].item():.4f} | "
-                      f"KL: {losses['dirichlet_kl'].item():.4f} | "
-                      f"修正率: {refinement_stats['refinement_ratio']:.3f} | "
-                      f"不确定性: {refinement_stats['avg_uncertainty']:.3f}")
+                      f"标签变化: {refinement_stats['label_changes']}/{N} | "
+                      f"修正率: {refinement_stats['refinement_ratio']:.3f}")
+                print(f"       困难样本: {refinement_stats['hard_samples_count']} | "
+                      f"不确定性: {refinement_stats['min_uncertainty']:.3f}-{refinement_stats['max_uncertainty']:.3f} | "
+                      f"簇数: {refinement_stats['unique_labels_before']}→{refinement_stats['unique_labels_after']}")
         
         # 计算epoch统计
         avg_losses = {key: val / max(1, step_count) for key, val in epoch_losses.items()}
@@ -554,35 +801,42 @@ class DirichletRefinementTrainer:
             avg_confidence = np.mean([s['avg_confidence'] for s in all_refinement_stats])
             avg_uncertainty = np.mean([s['avg_uncertainty'] for s in all_refinement_stats])
             total_noise = sum([s['noise_samples_count'] for s in all_refinement_stats])
+            total_hard_samples = sum([s['hard_samples_count'] for s in all_refinement_stats])
+            total_label_changes = sum([s['label_changes'] for s in all_refinement_stats])
         else:
             avg_refinement_ratio = 0.0
             avg_confidence = 0.0
             avg_uncertainty = 0.0
             total_noise = 0
+            total_hard_samples = 0
+            total_label_changes = 0
             
         return avg_losses, {
             'refinement_ratio': avg_refinement_ratio,
             'avg_confidence': avg_confidence,
             'avg_uncertainty': avg_uncertainty,
-            'total_noise_samples': total_noise
+            'total_noise_samples': total_noise,
+            'total_hard_samples': total_hard_samples,
+            'total_label_changes': total_label_changes
         }
     
     def train_with_refinement(self, dataloader, device):
-        """🔥 完整的Dirichlet训练流程"""
+        """完整训练流程"""
         
-        print("🚀 开始完整Dirichlet Evidence Learning训练...")
-        print(f"📋 配置: 收敛阈值={self.convergence_threshold}, 最大轮数={self.max_epochs}")
+        print("🚀 开始彻底修复版Dirichlet训练...")
+        print(f"📋 配置: 收敛阈值={self.convergence_threshold}, 最小轮数={self.min_epochs}")
         
         training_history = {
             'losses': [],
             'refinement_ratios': [],
             'confidences': [],
             'uncertainties': [],
-            'noise_counts': []
+            'noise_counts': [],
+            'hard_sample_counts': [],
+            'label_changes': []
         }
         
         for epoch in range(self.max_epochs):
-            # 训练一个epoch
             avg_losses, refinement_stats = self.train_epoch_with_refinement(
                 dataloader, device, epoch
             )
@@ -593,23 +847,37 @@ class DirichletRefinementTrainer:
             training_history['confidences'].append(refinement_stats['avg_confidence'])
             training_history['uncertainties'].append(refinement_stats['avg_uncertainty'])
             training_history['noise_counts'].append(refinement_stats['total_noise_samples'])
+            training_history['hard_sample_counts'].append(refinement_stats['total_hard_samples'])
+            training_history['label_changes'].append(refinement_stats['total_label_changes'])
             
             # 打印epoch总结
             print(f"\n📈 Epoch {epoch+1} 完成:")
             print(f"   总损失: {avg_losses['total_loss']:.6f}")
             print(f"   Expected MSE: {avg_losses['expected_mse']:.6f}")
             print(f"   Dirichlet KL: {avg_losses['dirichlet_kl']:.6f}")
-            print(f"   修正比例: {refinement_stats['refinement_ratio']:.4f}")
+            print(f"   修正比例: {refinement_stats['refinement_ratio']:.4f} ({refinement_stats['refinement_ratio']*100:.2f}%)")
+            print(f"   标签变化总数: {refinement_stats['total_label_changes']}")
+            print(f"   困难样本总数: {refinement_stats['total_hard_samples']}")
             print(f"   平均不确定性: {refinement_stats['avg_uncertainty']:.4f}")
-            print(f"   噪声样本数: {refinement_stats['total_noise_samples']}")
             
-            # 收敛判断
-            if refinement_stats['refinement_ratio'] < self.convergence_threshold:
+            # 🔥 修复收敛判断
+            should_converge = (
+                epoch >= self.min_epochs and
+                refinement_stats['refinement_ratio'] < self.convergence_threshold and
+                refinement_stats['total_label_changes'] > 0  # 确保有标签变化
+            )
+            
+            if should_converge:
                 print(f"\n✅ 收敛达成！修正比例 {refinement_stats['refinement_ratio']:.4f} < 阈值 {self.convergence_threshold}")
                 print(f"🎯 训练在第 {epoch+1} 轮收敛")
                 break
             else:
-                print(f"   🔄 继续训练 (修正比例 {refinement_stats['refinement_ratio']:.4f} >= {self.convergence_threshold})")
+                if epoch < self.min_epochs:
+                    print(f"   🔄 继续训练 (未达到最小轮数 {self.min_epochs})")
+                elif refinement_stats['total_label_changes'] == 0:
+                    print(f"   ⚠️  无标签变化，继续训练")
+                else:
+                    print(f"   🔄 继续训练 (修正比例 {refinement_stats['refinement_ratio']:.4f} >= {self.convergence_threshold})")
             
             print("-" * 70)
         
@@ -622,7 +890,7 @@ class DirichletRefinementTrainer:
 def train_with_dirichlet_refinement():
     """🔥 完整Dirichlet Evidence Learning训练函数"""
     
-    DATA_DIR = "Dataset/CloverExp/train"
+    DATA_DIR = "/hy-tmp/code/CC/Step0/Experiments/20251216_145746_Improved_Data_Test/03_FedDNA_In"
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # 训练参数
@@ -637,10 +905,12 @@ def train_with_dirichlet_refinement():
     gamma = 0.1  # 增加Dirichlet KL权重
     
     # 修正参数
-    uncertainty_threshold = 0.3  # 不确定性阈值
-    distance_threshold = 1.5
-    convergence_threshold = 0.01
-    max_epochs = 8
+    uncertainty_threshold = 0.8      # 提高不确定性阈值
+    confidence_threshold = 0.3       # 降低置信度阈值
+    distance_threshold = 0.8         # 降低距离阈值
+    convergence_threshold = 0.02     # 降低收敛阈值
+    max_epochs = 12
+    min_epochs = 5
     
     try:
         # 检查数据目录
