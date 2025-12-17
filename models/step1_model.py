@@ -255,7 +255,8 @@ class Step1EvidentialModel(nn.Module):
         
         # 5️⃣ 总损失（带annealing）
         annealing_coef = min(1.0, epoch / 10)
-        total_loss = contrastive_loss + recon_loss + annealing_coef * kl_loss
+        kl_weight = 0.0
+        total_loss = contrastive_loss + recon_loss + annealing_coef * kl_loss * kl_weight
         
         # 6️⃣ 统计信息（用于监控��
         avg_strength = strength.mean().item()

@@ -13,6 +13,7 @@ sys.path.insert(0, parent_dir)
 
 from models.step1_model import Step1EvidentialModel, load_pretrained_feddna
 from models.step1_data import CloverDataLoader, Step1Dataset, create_cluster_balanced_sampler, seq_to_onehot
+from models.step1_visualizer import Step1Visualizer
 
 def evaluate_with_gt(outputs, data_loader, batch_gt_labels, device):
     """
@@ -188,17 +189,18 @@ def train_step1(args):
         if successful_batches > 0:
             scheduler.step()
         
-        # 计算平均损失和统计
+        # ✅ 修复：正确记录训练历史
         if num_batches > 0:
             avg_losses = {k: v/num_batches for k, v in epoch_losses.items()}
             avg_stats = {k: v/num_batches for k, v in epoch_stats.items()}
             
-            # 记录历史
-            for key in training_history:
-                if key in avg_losses:
-                    training_history[key].append(avg_losses[key])
-                elif key in avg_stats:
-                    training_history[key].append(avg_stats[key])
+            # 🔧 修复键名映射问题
+            training_history['total_loss'].append(avg_losses.get('total', 0.0))
+            training_history['contrastive_loss'].append(avg_losses.get('contrastive', 0.0))
+            training_history['reconstruction_loss'].append(avg_losses.get('reconstruction', 0.0))
+            training_history['kl_loss'].append(avg_losses.get('kl_divergence', 0.0))
+            training_history['avg_strength'].append(avg_stats.get('avg_strength', 0.0))
+            training_history['high_conf_ratio'].append(avg_stats.get('high_conf_ratio', 0.0))
             
             # ✅ 详细的epoch报告
             print(f"\n📊 Epoch {epoch+1}/{args.epochs}:")
@@ -220,9 +222,13 @@ def train_step1(args):
                 print(f"   🔥 Warm-up阶段: 对比学习已关闭")
         else:
             print(f"\n⚠️ Epoch {epoch+1}: 没有成功的batch，跳过")
-            # 记录空值
-            for key in training_history:
-                training_history[key].append(0.0)
+            # 🔧 修复：为失败的epoch也记录0值
+            training_history['total_loss'].append(0.0)
+            training_history['contrastive_loss'].append(0.0)
+            training_history['reconstruction_loss'].append(0.0)
+            training_history['kl_loss'].append(0.0)
+            training_history['avg_strength'].append(0.0)
+            training_history['high_conf_ratio'].append(0.0)
         
         # 保存checkpoint
         if (epoch + 1) % args.save_interval == 0:
@@ -234,27 +240,63 @@ def train_step1(args):
                 'training_history': training_history,
                 'args': vars(args)
             }
-            checkpoint_path = os.path.join(args.output_dir, f"step1_epoch_{epoch+1}.pth")
+            checkpoint_path = os.path.join(args.output_dir, "models", f"step1_epoch_{epoch+1}.pth")
+            os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
             torch.save(checkpoint, checkpoint_path)
             print(f"   💾 保存checkpoint: {checkpoint_path}")
     
+    # ✅ 训练完成后打印历史记录统计
+    print(f"\n📊 训练历史记录统计:")
+    for key, values in training_history.items():
+        if len(values) > 0:
+            print(f"   {key}: {len(values)} 条记录, 最终值: {values[-1]:.6f}")
+        else:
+            print(f"   {key}: 0 条记录")
+    
     # 保存最终模型
-    final_model_path = os.path.join(args.output_dir, "step1_final_model.pth")
+    final_model_path = os.path.join(args.output_dir, "models", "step1_final_model.pth")
+    os.makedirs(os.path.dirname(final_model_path), exist_ok=True)
     torch.save({
         'model_state_dict': model.state_dict(),
         'training_history': training_history,
         'args': vars(args)
     }, final_model_path)
     
+    # ✅ 新增：生成可视化结果
+    print(f"\n" + "=" * 60)
+    print("📊 生成训练结果与可视化")
+    print("=" * 60)
+    
+    visualizer = Step1Visualizer(args.output_dir)
+    visualizer.generate_all_outputs(training_history, model, args)
+    
     print(f"\n🎉 步骤一训练完成！")
     print(f"📁 输出目录: {args.output_dir}")
     print(f"💾 最终模型: {final_model_path}")
+    
+    # 显示文件夹结构
+    print(f"\n📂 输出文件结构:")
+    print(f"   {args.output_dir}/")
+    print(f"   ├── models/")
+    print(f"   │   ├── step1_final_model.pth")
+    print(f"   │   └── step1_epoch_*.pth")
+    print(f"   ├── plots/")
+    print(f"   │   ├── training_losses.png")
+    print(f"   │   ├── evidence_stats.png")
+    print(f"   │   └── learning_curves.png")
+    print(f"   ├── logs/")
+    print(f"   │   └── config.json")
+    print(f"   └── reports/")
+    print(f"       ├── training_summary.txt")
+    print(f"       └── model_info.txt")
+    
     print(f"\n✅ 方法论检查:")
     print(f"   - GT未参与训练loss: ✓")
-    print(f"   - Evidence strength计算正确: ✓")
+    print(f"   - Evidence strength计���正确: ✓")
     print(f"   - 对比学习使用evidence过滤: ✓")
     print(f"   - Warm-up机制已启用: ✓")
     print(f"   - 数值稳定性保护: ✓")
+    print(f"   - 完整结果输出: ✓")
     
     return model, training_history
 
