@@ -187,7 +187,7 @@ class CloverDataLoader:
 
 def seq_to_onehot(seq: str, max_len: int = 150) -> torch.Tensor:
     """DNA序列转one-hot编码"""
-    base_to_idx = {'A': 0, 'T': 1, 'G': 2, 'C': 3, 'N': 0}  # N当作A处理
+    base_to_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 0}  # N当作A处理
     
     # 填充或截断到最大长度
     seq_padded = seq.ljust(max_len, 'N')[:max_len]

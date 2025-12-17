@@ -1,4 +1,4 @@
-# models/step1_model.py - 完整修复版（基于FedDNA + 硬化目标）
+# models/step1_model.py - 完整修复版
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -102,203 +102,206 @@ class Step1EvidentialModel(nn.Module):
     
     def contrastive_learning_with_evidence_filter(self, pooled_emb, cluster_labels, strength, 
                                                  temperature=0.1, epoch=0, warmup_epochs=5):
-        """✅ 修复：数值稳定的对比学习"""
+        """
+        ✅ 修复版：打破死锁的对比学习
+        策略：
+        1. Warm-up期：无条件信任Clover标签，强制学习特征。
+        2. 后期：利用Evidence筛选高质量样本进行微调。
+        """
+        # ---------------------------------------------------
+        # 1️⃣ Warm-up 阶段：强制学习 (Bootstrap)
+        # ---------------------------------------------------
         if epoch < warmup_epochs:
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
-        
+            # 直接使用所有样本，不进行筛选
+            # 这一步至关重要！没有它，模型永远无法启动。
+            valid_mask = torch.ones_like(strength.mean(dim=1), dtype=torch.bool)
+            
+            # 使用简单的 mask (所有非噪声样本)
+            labels_expanded = cluster_labels.unsqueeze(1)
+            positive_mask = (labels_expanded == labels_expanded.T).float()
+            
+            # 自身mask
+            logits_mask = torch.scatter(
+                torch.ones_like(positive_mask),
+                1,
+                torch.arange(pooled_emb.size(0)).view(-1, 1).to(self.device),
+                0
+            )
+            positive_mask = positive_mask * logits_mask
+            
+            # 计算相似度
+            proj_emb = self.projection_head(pooled_emb)
+            proj_emb = F.normalize(proj_emb, dim=-1)
+            sim_matrix = torch.matmul(proj_emb, proj_emb.T) / temperature
+            
+            # InfoNCE Loss
+            exp_sim = torch.exp(torch.clamp(sim_matrix, max=10))
+            numerator = torch.sum(exp_sim * positive_mask, dim=1) + 1e-8
+            denominator = torch.sum(exp_sim, dim=1) - torch.diag(exp_sim) + 1e-8
+            
+            loss = -torch.log(numerator / denominator)
+            return loss.mean()
+
+        # ---------------------------------------------------
+        # 2️⃣ Refinement 阶段：Evidence 驱动的筛选
+        # ---------------------------------------------------
         if pooled_emb.size(0) < 2:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        # 投影到对比学习空间
-        proj_emb = self.projection_head(pooled_emb)
-        proj_emb = F.normalize(proj_emb, dim=-1)
+        confidence = strength.mean(dim=1)
         
-        # ✅ 修复：数值稳定的confidence计算
-        confidence = strength.mean(dim=1)  # (B,)
-        
-        # 检查NaN
-        if torch.isnan(confidence).any():
-            print(f"   ⚠️ 检测到confidence NaN，跳过对比学习")
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
-        
-        # ✅ 改进：使用分位数而不是均值作为阈值
-        conf_threshold = torch.quantile(confidence, 0.6)  # 更稳定的阈值
-        conf_mask = confidence > conf_threshold
+        # 动态阈值：取当前batch的前60%高置信度样本
+        # 注意：这里加了 detach() 防止梯度回传影响阈值计算，虽然 quantile 本身不可导
+        conf_threshold = torch.quantile(confidence.detach(), 0.4) # 保留60%
+        conf_mask = confidence >= conf_threshold
         
         if conf_mask.sum() < 2:
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
-        
-        # 计算相似度矩阵
+            # 如果batch内都没信心，回退到使用所有样本，避免梯度消失
+            conf_mask = torch.ones_like(confidence, dtype=torch.bool)
+            
+        proj_emb = self.projection_head(pooled_emb)
+        proj_emb = F.normalize(proj_emb, dim=-1)
         sim_matrix = torch.matmul(proj_emb, proj_emb.T) / temperature
         
-        # 构建正样本mask
+        # 构建 Mask: (同簇) AND (两者都是高置信度)
         labels_expanded = cluster_labels.unsqueeze(1)
         clover_positive_mask = (labels_expanded == labels_expanded.T).float()
         evidence_positive_mask = (conf_mask.unsqueeze(1) & conf_mask.unsqueeze(0)).float()
         
         positive_mask = clover_positive_mask * evidence_positive_mask
-        positive_mask.fill_diagonal_(0)
         
-        # ✅ 数值稳定的InfoNCE
-        exp_sim = torch.exp(torch.clamp(sim_matrix, max=10))  # 防止exp爆炸
+        # 自身对角线设为0
+        logits_mask = torch.scatter(
+            torch.ones_like(positive_mask),
+            1,
+            torch.arange(pooled_emb.size(0)).view(-1, 1).to(self.device),
+            0
+        )
+        positive_mask = positive_mask * logits_mask
         
+        exp_sim = torch.exp(torch.clamp(sim_matrix, max=10))
         numerator = torch.sum(exp_sim * positive_mask, dim=1) + 1e-8
         denominator = torch.sum(exp_sim, dim=1) - torch.diag(exp_sim) + 1e-8
         
         loss = -torch.log(numerator / denominator)
         
-        # 只计算有正样本的loss
-        valid_mask = (torch.sum(positive_mask, dim=1) > 0)
-        if valid_mask.sum() > 0:
-            final_loss = loss[valid_mask].mean()
-            # 检查最终loss
-            if torch.isnan(final_loss) or torch.isinf(final_loss):
-                print(f"   ⚠️ 对比学习loss异常，返回0")
-                return torch.tensor(0.0, device=self.device, requires_grad=True)
-            return final_loss
+        # 只对参与计算的样本求平均
+        valid_indices = torch.where(torch.sum(positive_mask, dim=1) > 0)[0]
+        if len(valid_indices) > 0:
+            return loss[valid_indices].mean()
         else:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
     
-    def self_reconstruction_loss(self, evidence, alpha, cluster_labels):
+    def self_reconstruction_loss(self, evidence, alpha, cluster_labels, inputs):  # <--- 新增 inputs
         """
-        🔥 修改版：使用硬化One-Hot目标的自重建损失
-        强迫模型输出高Evidence来拟合硬标签
+        ✅ 修复版：加入 Input Reconstruction，防止 Mode Collapse
         """
-        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        bayes_risk = CEBayesRiskLoss().to(self.device)
+        kld_loss_fn = KLDivergenceLoss().to(self.device)
+
+        # 1. 核心修复：Input Reconstruction Loss (AE Loss)
+        # 让模型必须学会重建输入的 ATCG 序列
+        # inputs 是 one-hot 编码，可以直接作为 target
+        input_recon_loss = bayes_risk(evidence, inputs)
+
+        # --------------------------------------------------------
+        # 下面是你原来的 Consensus Loss (可以保留作为正则项，但要防止主导)
+        # --------------------------------------------------------
+        total_consensus_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        total_kl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         fused_consensus = {}
-        
+
         unique_labels = torch.unique(cluster_labels)
         processed_clusters = 0
-        
+
         for label in unique_labels:
-            if label < 0:
-                continue
-            
+            if label < 0: continue
             cluster_mask = (cluster_labels == label)
-            cluster_count = cluster_mask.sum()
+            if cluster_mask.sum() < 2: continue
+
+            # 获取数据
+            cluster_evidence = evidence[cluster_mask]
             
-            if cluster_count < 2:
-                continue
+            # 计算 Consensus (Target)
+            # 注意：这里 detach() 很重要，防止梯度流向 Target 导致"作弊"
+            weights = F.softmax(torch.sum(alpha[cluster_mask], dim=-1).mean(dim=1), dim=0).view(-1, 1, 1)
+            fused_evidence_val = torch.sum(cluster_evidence * weights, dim=0, keepdim=True).detach() 
+            fused_consensus[label.item()] = fused_evidence_val
+
+            # Soft Target for Consistency
+            fused_alpha_val = fused_evidence_val + 1.0
+            target_prob = (fused_alpha_val / fused_alpha_val.sum(dim=-1, keepdim=True)).expand(cluster_mask.sum(), -1, -1)
             
-            cluster_evidence = evidence[cluster_mask]  # (N_cluster, L, 4)
-            cluster_alpha = alpha[cluster_mask]
-            cluster_strength = torch.sum(cluster_alpha, dim=-1)
-            
-            # ✅ 检查NaN
-            if torch.isnan(cluster_strength).any():
-                print(f"   ⚠️ 簇{label}的strength包含NaN，跳过")
-                continue
-            
-            # Evidence-weighted融合
-            weights = F.softmax(cluster_strength.mean(dim=1), dim=0)  # (N_cluster,)
-            weights = weights.unsqueeze(1).unsqueeze(2)  # (N_cluster, 1, 1)
-            
-            fused_evidence = torch.sum(cluster_evidence * weights, dim=0, keepdim=True)  # (1, L, 4)
-            fused_consensus[label.item()] = fused_evidence.detach()
-            
-            # 🔥 关键修改：硬化目标 (Hard Pseudo-Labeling)
-            # 1. 找到共识中概率最大的碱基 (Break the symmetry)
-            fused_probs = F.softmax(fused_evidence, dim=-1)  # 先转概率
-            target_idx = fused_probs.argmax(dim=-1)  # (1, L)
-            
-            # 2. 转成 One-Hot 硬标签
-            target_onehot = F.one_hot(target_idx, num_classes=4).float()  # (1, L, 4)
-            
-            # 3. 扩展到 Batch 大小
-            target_evidence = target_onehot.expand(cluster_evidence.shape[0], -1, -1)  # (N_cluster, L, 4)
-            
-            # 🎯 强制高Evidence目标：将One-Hot乘以一个大数
-            # 这样模型必须输出高Evidence才能拟合
-            evidence_scale = 15.0  # 可调参数，强制要求高Evidence
-            target_evidence = target_evidence * evidence_scale
-            
-            # 计算重建损失（现在是硬目标）
-            try:
-                cluster_loss = F.mse_loss(cluster_evidence, target_evidence)
-                
-                # 检查loss有效性
-                if not (torch.isnan(cluster_loss) or torch.isinf(cluster_loss)):
-                    total_loss = total_loss + cluster_loss
-                    processed_clusters += 1
-                else:
-                    print(f"   ⚠️ 簇{label}的重建loss异常，跳过")
-                    
-            except Exception as e:
-                print(f"   ⚠️ 簇{label}计算重建loss失败: {e}")
-                continue
-        
-        # 归一化
+            # Hard Target for KL
+            target_one_hot = F.one_hot(fused_evidence_val.argmax(dim=-1), num_classes=4).float().expand(cluster_mask.sum(), -1, -1)
+
+            # 计算簇内一致性损失
+            cons_loss = bayes_risk(cluster_evidence, target_prob)
+            kl = kld_loss_fn(cluster_evidence, target_one_hot)
+
+            total_consensus_loss = total_consensus_loss + cons_loss
+            total_kl_loss = total_kl_loss + kl
+            processed_clusters += 1
+
         if processed_clusters > 0:
-            total_loss = total_loss / processed_clusters
-        
-        # 返回重建损失和空的KL损失（保持接口兼容）
-        kl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-        
-        return total_loss, kl_loss, fused_consensus
-    
-    def evidence_strength_loss(self, evidence):
-        """
-        🔥 新增：Evidence强度激励损失
-        鼓励模型输出高Evidence值
-        """
-        # 计算平均Evidence强度
-        avg_strength = torch.mean(torch.sum(evidence, dim=-1))
-        
-        # 目标强度（可调参数）
-        target_strength = 20.0
-        
-        # 如果强度太低，给予惩罚
-        strength_loss = F.relu(target_strength - avg_strength)
-        
-        return strength_loss
+            total_consensus_loss /= processed_clusters
+            total_kl_loss /= processed_clusters
+
+        # 2. 组合 Loss
+        # 💡 建议权重：90% 重建输入 (确保不瞎猜), 10% 逼近簇中心 (促进聚类)
+        final_recon_loss = 1.0 * input_recon_loss + 0.1 * total_consensus_loss
+
+        return final_recon_loss, total_kl_loss, fused_consensus
     
     def forward(self, reads, cluster_labels, epoch=0):
-        """
-        ✅ 完整的前向传播（集成硬化目标和强度激励）
-        Args:
-            reads: (B, L, 4) mini-batch reads
-            cluster_labels: (B,) Clover标签（仅用于组织对比学习）
-            epoch: 当前epoch
-        """
         # 1️⃣ FedDNA Encoder
         embeddings, pooled_emb = self.encode_reads(reads)
         
         # 2️⃣ FedDNA Decoder
         evidence, strength, alpha = self.decode_to_evidence(embeddings)
         
-        # 3️⃣ Evidence-filtered对比学习
+        # 3️⃣ 对比学习 (保持 Warmup=5)
         contrastive_loss = self.contrastive_learning_with_evidence_filter(
-            pooled_emb, cluster_labels, strength, epoch=epoch
+            pooled_emb, cluster_labels, strength, epoch=epoch, warmup_epochs=5
         )
         
-        # 4️⃣ 硬化目标的自重建损失
+        # 4️⃣ 自重建损失
         recon_loss, kl_loss, fused_consensus = self.self_reconstruction_loss(
-            evidence, alpha, cluster_labels
+            evidence, alpha, cluster_labels, reads
         )
         
-        # 🔥 5️⃣ 新增：Evidence强��激励
-        strength_incentive_loss = self.evidence_strength_loss(evidence)
+        # 5️⃣ 总损失策略调整 (🚨 核心修改点)
         
-        # 6️⃣ 总损失（集成所有损失）
-        annealing_coef = min(1.0, epoch / 10)
-        kl_weight = 0.0  # KL权重已禁用
-        strength_weight = 0.2  # 强度激励权重
+        # 策略 A: 推迟 KL 介入 (让模型先从 Recon/Contrastive 学到自信)
+        # 从 Epoch 10 开始介入，到 Epoch 40 达到最大值
+        if epoch < 10:
+            annealing_coef = 0.0
+        else:
+            annealing_coef = min(1.0, (epoch - 10) / 30)
+            
+        # 策略 B: 永久性缩小 KL 权重 (因为 KL 原始数值 500+ 太大了，必须缩放)
+        # 我们希望 KL Loss 最终在 10-50 左右，而不是 500
+        scaled_kl_loss = kl_loss * 0.05  # 缩小 20 倍
         
-        total_loss = (contrastive_loss + 
-                      recon_loss + 
-                      annealing_coef * kl_loss * kl_weight +
-                      strength_weight * strength_incentive_loss)
+        # 策略 C: 激励项 (防止 Strength 归零)
+        # 如果是 Warm-up 阶段，给一点点奖励让它产生 Strength
+        if epoch < 10:
+            l2_evidence = torch.mean(evidence ** 2) * 0.001
+        else:
+            l2_evidence = 0.0
+
+        # 总损失
+        total_loss = contrastive_loss + 10.0 * recon_loss + annealing_coef * scaled_kl_loss + l2_evidence
         
-        # 7️⃣ 统计信息（用于监控）
+        # 统计信息
         avg_strength = strength.mean().item()
-        high_conf_ratio = (strength.mean(dim=1) > 10.0).float().mean().item()  # 提高阈值
+        high_conf_ratio = (strength.mean(dim=1) > 4.5).float().mean().item()
         
         loss_dict = {
             'total': total_loss,
             'contrastive': contrastive_loss,
             'reconstruction': recon_loss,
-            'kl_divergence': kl_loss,
-            'strength_incentive': strength_incentive_loss,  # 🔥 新增
+            'kl_divergence': kl_loss, # 记录原始值以便观察
             'annealing_coef': annealing_coef
         }
         

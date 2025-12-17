@@ -2,36 +2,67 @@
 """
 Step2: Evidence-Guided Cluster Refinement
 核心：用Step1学到的证据强度来修正簇结构
+✅ 相对不确定性原则：簇内比较，不是全局阈值
 """
 import torch
 import torch.nn.functional as F
 
-def select_high_confidence_reads(strength, tau=None, quantile=0.5):
+def split_confidence_by_percentile(strength, cluster_labels, p=0.2):
     """
-    ✅ Phase A: 证据筛选
-    根据evidence strength区分高/低置信度reads
+    ✅ Phase A: 簇内相对证据筛选（核心修改）
+    每个簇里，取strength最低的p%作为低置信度
     
     Args:
-        strength: (N,) 每条read的evidence strength
-        tau: float or None, 自定义阈值
-        quantile: float, 分位数（当tau=None时使用）
+        strength: (N,) evidence strength
+        cluster_labels: (N,) 簇标签
+        p: float, 低置信度百分比 (0.2 = 20%)
     
     Returns:
-        high_conf_mask: (N,) bool, True表示高置信度
-        tau_used: float, 实际使用的阈值
+        low_conf_mask: (N,) bool, True表示低置信度
+        stats: dict, 统计信息
     """
-    if tau is None:
-        tau = torch.quantile(strength, quantile)
+    low_conf_mask = torch.zeros_like(cluster_labels, dtype=torch.bool)
+    stats = {'processed_clusters': 0, 'skipped_clusters': 0, 'total_low_conf': 0}
     
-    high_conf_mask = strength >= tau
+    unique_labels = torch.unique(cluster_labels)
     
-    print(f"   📊 置信度统计:")
-    print(f"      阈值 τ: {tau:.4f}")
-    print(f"      高置信度: {high_conf_mask.sum()}/{len(strength)} ({high_conf_mask.float().mean()*100:.1f}%)")
-    print(f"      低置信度: {(~high_conf_mask).sum()}/{len(strength)} ({(~high_conf_mask).float().mean()*100:.1f}%)")
+    print(f"   🎯 簇内相对筛选 (p={p:.1%}):")
     
-    return high_conf_mask, tau
-
+    for c in unique_labels:
+        if c < 0:  # 跳过噪声
+            continue
+            
+        mask = cluster_labels == c
+        cluster_size = mask.sum().item()
+        
+        if cluster_size < 5:  # 太小的簇跳过
+            print(f"      簇{c}: {cluster_size} reads (太小，跳过)")
+            stats['skipped_clusters'] += 1
+            continue
+        
+        # 该簇的strength
+        s = strength[mask]
+        tau = torch.quantile(s, p)  # 第p分位数作为阈值
+        
+        # 标记该簇内的低置信度reads
+        cluster_low_conf = s <= tau
+        low_conf_mask[mask] = cluster_low_conf
+        
+        low_count = cluster_low_conf.sum().item()
+        stats['total_low_conf'] += low_count
+        stats['processed_clusters'] += 1
+        
+        print(f"      簇{c}: {cluster_size} reads, τ={tau:.3f}, 低置信度={low_count} ({low_count/cluster_size:.1%})")
+    
+    high_conf_mask = ~low_conf_mask
+    
+    print(f"\n   📊 相对筛选结果:")
+    print(f"      处理簇数: {stats['processed_clusters']}")
+    print(f"      跳过簇数: {stats['skipped_clusters']}")
+    print(f"      高置信度: {high_conf_mask.sum()}/{len(strength)} ({high_conf_mask.float().mean():.1%})")
+    print(f"      低置信度: {low_conf_mask.sum()}/{len(strength)} ({low_conf_mask.float().mean():.1%})")
+    
+    return low_conf_mask, stats
 
 def compute_cluster_centroids(embeddings, labels, high_conf_mask):
     """
@@ -70,21 +101,21 @@ def compute_cluster_centroids(embeddings, labels, high_conf_mask):
     
     print(f"\n   📍 簇中心统计:")
     print(f"      有效簇数: {valid_clusters}/{len(unique_labels)-1}")  # -1排除噪声
-    print(f"      平均簇大小: {sum(cluster_sizes.values())/len(cluster_sizes):.1f}")
+    if cluster_sizes:
+        print(f"      平均簇大小: {sum(cluster_sizes.values())/len(cluster_sizes):.1f}")
     
     return centroids, cluster_sizes
 
-
-def refine_low_confidence_reads(embeddings, labels, high_conf_mask, 
+def refine_low_confidence_reads(embeddings, labels, low_conf_mask, 
                                 centroids, delta):
     """
-    ✅ Phase B: 簇修正
+    ✅ Phase B: 簇修正（只处理低置信度reads）
     低置信度reads重新分配或标记为噪声
     
     Args:
         embeddings: (N, D)
         labels: (N,) 当前标签
-        high_conf_mask: (N,)
+        low_conf_mask: (N,) 低置信度mask
         centroids: dict[label] -> (D,)
         delta: float, 距离阈值
     
@@ -100,9 +131,9 @@ def refine_low_confidence_reads(embeddings, labels, high_conf_mask,
     reassigned = 0
     marked_noise = 0
     
-    low_conf_indices = torch.where(~high_conf_mask)[0]
+    low_conf_indices = torch.where(low_conf_mask)[0]
     
-    print(f"\n   🔄 处理 {len(low_conf_indices)} 个低置信度reads...")
+    print(f"\n   🔄 只处理 {len(low_conf_indices)} 个低置信度reads...")
     
     for idx in low_conf_indices:
         i = idx.item()
@@ -142,7 +173,6 @@ def refine_low_confidence_reads(embeddings, labels, high_conf_mask,
     }
     
     return new_labels, noise_mask, stats
-
 
 def compute_adaptive_delta(embeddings, centroids, percentile=10):
     """

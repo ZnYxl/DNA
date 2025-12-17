@@ -22,10 +22,6 @@ def evaluate_with_gt(outputs, data_loader, batch_gt_labels, device):
     """
     try:
         from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-        
-        # 这里可以添加聚类评估指标
-        # 但不影响训练loss
-        
         return {
             'gt_available': True,
             'note': 'GT evaluation metrics can be added here'
@@ -95,7 +91,8 @@ def train_step1(args):
         'kl_loss': [],
         'strength_incentive_loss': [],
         'avg_strength': [],
-        'high_conf_ratio': []
+        'high_conf_ratio': [],
+        'annealing_coef': [] # ✅ 新增：记录退火系数
     }
     
     for epoch in range(args.epochs):
@@ -114,6 +111,8 @@ def train_step1(args):
             'avg_strength': 0,
             'high_conf_ratio': 0
         }
+        
+        current_annealing_coef = 0.0 # 用于记录当前epoch实际使用的系数
         num_batches = 0
         successful_batches = 0
         
@@ -137,15 +136,17 @@ def train_step1(args):
             # 转换为张量
             reads_batch = torch.stack(batch_reads).to(device)
             clover_labels_batch = torch.tensor(batch_clover_labels, device=device)
-            gt_labels_batch = torch.tensor(batch_gt_labels, device=device)
             
-            # ✅ 前向传播（增加异常处理）
+            # ✅ 前向传播
             try:
                 loss_dict, outputs = model(
                     reads_batch, 
                     clover_labels_batch,
                     epoch=epoch
                 )
+                
+                # ✅ 获取真实的 Annealing Coef
+                current_annealing_coef = loss_dict.get('annealing_coef', 0.0)
                 
                 # ✅ 检查loss有效性
                 if torch.isnan(loss_dict['total']) or torch.isinf(loss_dict['total']):
@@ -158,8 +159,6 @@ def train_step1(args):
                 
                 # ✅ 梯度裁剪
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                # 检查梯度
                 if torch.isnan(grad_norm) or torch.isinf(grad_norm):
                     print(f"   ⚠️ Batch {batch_idx}: 梯度异常，跳过更新")
                     continue
@@ -184,26 +183,25 @@ def train_step1(args):
             if batch_idx % 50 == 0:
                 print(f"   Batch {batch_idx}/{len(batch_indices_list)}: "
                       f"Loss={loss_dict['total'].item():.4f}, "
-                      f"Strength={outputs['avg_strength']:.3f}")
+                      f"Strength={outputs['avg_strength']:.3f}, "
+                      f"KL_Coef={current_annealing_coef:.3f}") # 实时打印系数
         
-        # ✅ 在所有batch完成后再调用scheduler.step()
+        # ✅ Scheduler Step
         if successful_batches > 0:
             scheduler.step()
         
-        # ✅ 修复：正确记录训练历史
+        # ✅ 记录历史
         if num_batches > 0:
             avg_losses = {k: v/num_batches for k, v in epoch_losses.items()}
             avg_stats = {k: v/num_batches for k, v in epoch_stats.items()}
             
-            # 🔧 修复键名映射问题
             training_history['total_loss'].append(avg_losses.get('total', 0.0))
             training_history['contrastive_loss'].append(avg_losses.get('contrastive', 0.0))
             training_history['reconstruction_loss'].append(avg_losses.get('reconstruction', 0.0))
             training_history['kl_loss'].append(avg_losses.get('kl_divergence', 0.0))
-            training_history['strength_incentive_loss'].append(avg_losses.get('strength_incentive', 0.0))
             training_history['avg_strength'].append(avg_stats.get('avg_strength', 0.0))
             training_history['high_conf_ratio'].append(avg_stats.get('high_conf_ratio', 0.0))
-            
+            training_history['annealing_coef'].append(current_annealing_coef) # 记录系数
             
             # ✅ 详细的epoch报告
             print(f"\n📊 Epoch {epoch+1}/{args.epochs}:")
@@ -211,27 +209,27 @@ def train_step1(args):
             print(f"      Total: {avg_losses['total']:.4f}")
             print(f"      Contrastive: {avg_losses['contrastive']:.4f}")
             print(f"      Reconstruction: {avg_losses['reconstruction']:.4f}")
-            print(f"      KL Divergence: {avg_losses['kl_divergence']:.4f}")
+            print(f"      KL Divergence: {avg_losses['kl_divergence']:.4f} (Raw)")
             print(f"   📊 Evidence统计:")
             print(f"      平均Strength: {avg_stats['avg_strength']:.3f}")
             print(f"      高置信度比例: {avg_stats['high_conf_ratio']*100:.1f}%")
             print(f"   ⚙️ 训练状态:")
             print(f"      Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
-            print(f"      Annealing Coef: {min(1.0, epoch / 10):.3f}")
+            print(f"      Annealing Coef: {current_annealing_coef:.3f}") # ✅ 使用真实系数
             print(f"      成功Batch: {successful_batches}/{len(batch_indices_list)}")
             
-            # Warm-up状态
+            # ✅ 智能状态提示
             if epoch < 5:
-                print(f"   🔥 Warm-up阶段: 对比学习已关闭")
+                print(f"   🔥 [Phase 1] 强制学习: 对比学习 Warm-up (无筛选), KL 系数=0")
+            elif epoch < 10:
+                print(f"   💪 [Phase 2] 积累信心: 对比学习 (开启筛选), KL 系数=0")
+            else:
+                print(f"   ✂️ [Phase 3] 证据修剪: KL 正则化介入 (系数={current_annealing_coef:.3f})")
+                
         else:
             print(f"\n⚠️ Epoch {epoch+1}: 没有成功的batch，跳过")
-            # 🔧 修复：为失败的epoch也记录0值
-            training_history['total_loss'].append(0.0)
-            training_history['contrastive_loss'].append(0.0)
-            training_history['reconstruction_loss'].append(0.0)
-            training_history['kl_loss'].append(0.0)
-            training_history['avg_strength'].append(0.0)
-            training_history['high_conf_ratio'].append(0.0)
+            for k in training_history:
+                training_history[k].append(0.0)
         
         # 保存checkpoint
         if (epoch + 1) % args.save_interval == 0:
@@ -253,8 +251,6 @@ def train_step1(args):
     for key, values in training_history.items():
         if len(values) > 0:
             print(f"   {key}: {len(values)} 条记录, 最终值: {values[-1]:.6f}")
-        else:
-            print(f"   {key}: 0 条记录")
     
     # 保存最终模型
     final_model_path = os.path.join(args.output_dir, "models", "step1_final_model.pth")
@@ -265,41 +261,20 @@ def train_step1(args):
         'args': vars(args)
     }, final_model_path)
     
-    # ✅ 新增：生成可视化结果
+    # 生成可视化
     print(f"\n" + "=" * 60)
     print("📊 生成训练结果与可视化")
     print("=" * 60)
     
-    visualizer = Step1Visualizer(args.output_dir)
-    visualizer.generate_all_outputs(training_history, model, args)
+    try:
+        visualizer = Step1Visualizer(args.output_dir)
+        visualizer.generate_all_outputs(training_history, model, args)
+    except Exception as e:
+        print(f"⚠️ 可视化生成失败 (可能缺少依赖): {e}")
     
     print(f"\n🎉 步骤一训练完成！")
     print(f"📁 输出目录: {args.output_dir}")
     print(f"💾 最终模型: {final_model_path}")
-    
-    # 显示文件夹结构
-    print(f"\n📂 输出文件结构:")
-    print(f"   {args.output_dir}/")
-    print(f"   ├── models/")
-    print(f"   │   ├── step1_final_model.pth")
-    print(f"   │   └── step1_epoch_*.pth")
-    print(f"   ├── plots/")
-    print(f"   │   ├── training_losses.png")
-    print(f"   │   ├── evidence_stats.png")
-    print(f"   │   └── learning_curves.png")
-    print(f"   ├── logs/")
-    print(f"   │   └── config.json")
-    print(f"   └── reports/")
-    print(f"       ├── training_summary.txt")
-    print(f"       └── model_info.txt")
-    
-    print(f"\n✅ 方法论检查:")
-    print(f"   - GT未参与训练loss: ✓")
-    print(f"   - Evidence strength计���正确: ✓")
-    print(f"   - 对比学习使用evidence过滤: ✓")
-    print(f"   - Warm-up机制已启用: ✓")
-    print(f"   - 数值稳定性保护: ✓")
-    print(f"   - 完整结果输出: ✓")
     
     return model, training_history
 
