@@ -1,4 +1,4 @@
-# models/step1_model.py - 完整修复版
+# models/step1_model.py - 完整修复版（基于FedDNA + 硬化目标）
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -160,12 +160,11 @@ class Step1EvidentialModel(nn.Module):
             return torch.tensor(0.0, device=self.device, requires_grad=True)
     
     def self_reconstruction_loss(self, evidence, alpha, cluster_labels):
-        """✅ 修复：数值稳定的重建损失"""
-        bayes_risk = CEBayesRiskLoss().to(self.device)
-        kld_loss_fn = KLDivergenceLoss().to(self.device)
-        
-        total_recon_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-        total_kl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        """
+        🔥 修改版：使用硬化One-Hot目标的自重建损失
+        强迫模型输出高Evidence来拟合硬标签
+        """
+        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         fused_consensus = {}
         
         unique_labels = torch.unique(cluster_labels)
@@ -181,7 +180,7 @@ class Step1EvidentialModel(nn.Module):
             if cluster_count < 2:
                 continue
             
-            cluster_evidence = evidence[cluster_mask]
+            cluster_evidence = evidence[cluster_mask]  # (N_cluster, L, 4)
             cluster_alpha = alpha[cluster_mask]
             cluster_strength = torch.sum(cluster_alpha, dim=-1)
             
@@ -191,47 +190,71 @@ class Step1EvidentialModel(nn.Module):
                 continue
             
             # Evidence-weighted融合
-            weights = F.softmax(cluster_strength.mean(dim=1), dim=0)
-            weights = weights.unsqueeze(1).unsqueeze(2)
+            weights = F.softmax(cluster_strength.mean(dim=1), dim=0)  # (N_cluster,)
+            weights = weights.unsqueeze(1).unsqueeze(2)  # (N_cluster, 1, 1)
             
-            fused_evidence = torch.sum(cluster_evidence * weights, dim=0, keepdim=True)
-            fused_consensus[label.item()] = fused_evidence
+            fused_evidence = torch.sum(cluster_evidence * weights, dim=0, keepdim=True)  # (1, L, 4)
+            fused_consensus[label.item()] = fused_evidence.detach()
             
-            # 自重建损失
-            cluster_recon_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-            cluster_kl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            # 🔥 关键修改：硬化目标 (Hard Pseudo-Labeling)
+            # 1. 找到共识中概率最大的碱基 (Break the symmetry)
+            fused_probs = F.softmax(fused_evidence, dim=-1)  # 先转概率
+            target_idx = fused_probs.argmax(dim=-1)  # (1, L)
             
-            for i in range(cluster_count):
-                read_evidence = cluster_evidence[i:i+1]
+            # 2. 转成 One-Hot 硬标签
+            target_onehot = F.one_hot(target_idx, num_classes=4).float()  # (1, L, 4)
+            
+            # 3. 扩展到 Batch 大小
+            target_evidence = target_onehot.expand(cluster_evidence.shape[0], -1, -1)  # (N_cluster, L, 4)
+            
+            # 🎯 强制高Evidence目标：将One-Hot乘以一个大数
+            # 这样模型必须输出高Evidence才能拟合
+            evidence_scale = 15.0  # 可调参数，强制要求高Evidence
+            target_evidence = target_evidence * evidence_scale
+            
+            # 计算重建损失（现在是硬目标）
+            try:
+                cluster_loss = F.mse_loss(cluster_evidence, target_evidence)
                 
-                try:
-                    recon_loss_i = bayes_risk(fused_evidence, read_evidence)
-                    kl_loss_i = kld_loss_fn(fused_evidence, read_evidence)
+                # 检查loss有效性
+                if not (torch.isnan(cluster_loss) or torch.isinf(cluster_loss)):
+                    total_loss = total_loss + cluster_loss
+                    processed_clusters += 1
+                else:
+                    print(f"   ⚠️ 簇{label}的重建loss异常，跳过")
                     
-                    # 检查loss有效性
-                    if not (torch.isnan(recon_loss_i) or torch.isinf(recon_loss_i)):
-                        cluster_recon_loss = cluster_recon_loss + recon_loss_i
-                    if not (torch.isnan(kl_loss_i) or torch.isinf(kl_loss_i)):
-                        cluster_kl_loss = cluster_kl_loss + kl_loss_i
-                        
-                except Exception as e:
-                    print(f"   ⚠️ 簇{label}第{i}个read计算loss失败: {e}")
-                    continue
-            
-            total_recon_loss = total_recon_loss + cluster_recon_loss
-            total_kl_loss = total_kl_loss + cluster_kl_loss
-            processed_clusters += 1
+            except Exception as e:
+                print(f"   ⚠️ 簇{label}计算重建loss失败: {e}")
+                continue
         
         # 归一化
         if processed_clusters > 0:
-            total_recon_loss = total_recon_loss / processed_clusters
-            total_kl_loss = total_kl_loss / processed_clusters
+            total_loss = total_loss / processed_clusters
         
-        return total_recon_loss, total_kl_loss, fused_consensus
+        # 返回重建损失和空的KL损失（保持接口兼容）
+        kl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        
+        return total_loss, kl_loss, fused_consensus
+    
+    def evidence_strength_loss(self, evidence):
+        """
+        🔥 新增：Evidence强度激励损失
+        鼓励模型输出高Evidence值
+        """
+        # 计算平均Evidence强度
+        avg_strength = torch.mean(torch.sum(evidence, dim=-1))
+        
+        # 目标强度（可调参数）
+        target_strength = 20.0
+        
+        # 如果强度太低，给予惩罚
+        strength_loss = F.relu(target_strength - avg_strength)
+        
+        return strength_loss
     
     def forward(self, reads, cluster_labels, epoch=0):
         """
-        ✅ 完整的前向传播
+        ✅ 完整的前向传播（集成硬化目标和强度激励）
         Args:
             reads: (B, L, 4) mini-batch reads
             cluster_labels: (B,) Clover标签（仅用于组织对比学习）
@@ -248,25 +271,34 @@ class Step1EvidentialModel(nn.Module):
             pooled_emb, cluster_labels, strength, epoch=epoch
         )
         
-        # 4️⃣ 自重建损失（不使用GT）
+        # 4️⃣ 硬化目标的自重建损失
         recon_loss, kl_loss, fused_consensus = self.self_reconstruction_loss(
             evidence, alpha, cluster_labels
         )
         
-        # 5️⃣ 总损失（带annealing）
-        annealing_coef = min(1.0, epoch / 10)
-        kl_weight = 0.0
-        total_loss = contrastive_loss + recon_loss + annealing_coef * kl_loss * kl_weight
+        # 🔥 5️⃣ 新增：Evidence强��激励
+        strength_incentive_loss = self.evidence_strength_loss(evidence)
         
-        # 6️⃣ 统计信息（用于监控��
+        # 6️⃣ 总损失（集成所有损失）
+        annealing_coef = min(1.0, epoch / 10)
+        kl_weight = 0.0  # KL权重已禁用
+        strength_weight = 0.2  # 强度激励权重
+        
+        total_loss = (contrastive_loss + 
+                      recon_loss + 
+                      annealing_coef * kl_loss * kl_weight +
+                      strength_weight * strength_incentive_loss)
+        
+        # 7️⃣ 统计信息（用于监控）
         avg_strength = strength.mean().item()
-        high_conf_ratio = (strength.mean(dim=1) > strength.mean()).float().mean().item()
+        high_conf_ratio = (strength.mean(dim=1) > 10.0).float().mean().item()  # 提高阈值
         
         loss_dict = {
             'total': total_loss,
             'contrastive': contrastive_loss,
             'reconstruction': recon_loss,
             'kl_divergence': kl_loss,
+            'strength_incentive': strength_incentive_loss,  # 🔥 新增
             'annealing_coef': annealing_coef
         }
         

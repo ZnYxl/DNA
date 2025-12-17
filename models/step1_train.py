@@ -93,6 +93,7 @@ def train_step1(args):
         'contrastive_loss': [],
         'reconstruction_loss': [],
         'kl_loss': [],
+        'strength_incentive_loss': [],
         'avg_strength': [],
         'high_conf_ratio': []
     }
@@ -199,8 +200,10 @@ def train_step1(args):
             training_history['contrastive_loss'].append(avg_losses.get('contrastive', 0.0))
             training_history['reconstruction_loss'].append(avg_losses.get('reconstruction', 0.0))
             training_history['kl_loss'].append(avg_losses.get('kl_divergence', 0.0))
+            training_history['strength_incentive_loss'].append(avg_losses.get('strength_incentive', 0.0))
             training_history['avg_strength'].append(avg_stats.get('avg_strength', 0.0))
             training_history['high_conf_ratio'].append(avg_stats.get('high_conf_ratio', 0.0))
+            
             
             # ✅ 详细的epoch报告
             print(f"\n📊 Epoch {epoch+1}/{args.epochs}:")
