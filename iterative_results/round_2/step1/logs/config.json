@@ -1,0 +1,24 @@
+{
+  "experiment_info": {
+    "timestamp": "2025-12-18 00:21:23",
+    "experiment_dir": "CC/Step0/Experiments/20251217_015615_Cluster_GT_Test",
+    "output_dir": "./iterative_results/round_2/step1"
+  },
+  "model_config": {
+    "dim": 256,
+    "max_length": 150,
+    "min_clusters": 50,
+    "device": "cuda"
+  },
+  "training_config": {
+    "epochs": 30,
+    "batch_size": 32,
+    "max_clusters_per_batch": 5,
+    "lr": 0.0001,
+    "weight_decay": 1e-05,
+    "save_interval": 100
+  },
+  "data_config": {
+    "feddna_checkpoint": "./iterative_results/round_1/step1/models/step1_final_model.pth"
+  }
+}
