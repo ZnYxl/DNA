@@ -1,15 +1,10 @@
 # 忽略数据集文件夹
 Dataset/
 data/
-Experiments/
-CC/Step0/Experiments/
 
 # 忽略 Python 编译缓存
 __pycache__/
 *.pyc
-
-# 忽略模型权重 (文件太大，一般不传，除非你想备份)
-*.pth
 
 # 忽略日志和临时文件
 *.log
@@ -18,16 +13,9 @@ __pycache__/
 venv/
 
 #忽略真实数据和压缩包
-*.fastq
 *.gz
 
-#忽略生成的图片
-*.png
+
 
 # 忽略真实数据和压缩包
-*.fastq
 *.gz
-
-# 忽略生成的图片
-*.png
-*.txt
