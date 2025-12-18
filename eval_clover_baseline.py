@@ -1,36 +1,20 @@
 import os
 import argparse
 import numpy as np
-import csv
+import glob
 from collections import Counter, defaultdict
 
+# ==========================================
+# 1. 核心计算函数 (与您的 run_loop.py 保持一致)
+# ==========================================
 def calculate_identity(seq1, seq2):
     """
-    计算两条序列的同一性 (Identity)
-    使用简单的编辑距离 (Levenshtein Distance)
+    计算序列一致性 (Hamming 风格，简单匹配率)
     """
-    if not seq1 or not seq2:
-        return 0.0
-    
-    # 简单的 DP 计算编辑距离
-    m, n = len(seq1), len(seq2)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-    
-    for i in range(m + 1):
-        dp[i][0] = i
-    for j in range(n + 1):
-        dp[0][j] = j
-        
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            cost = 0 if seq1[i - 1] == seq2[j - 1] else 1
-            dp[i][j] = min(dp[i - 1][j] + 1,      # Deletion
-                           dp[i][j - 1] + 1,      # Insertion
-                           dp[i - 1][j - 1] + cost) # Substitution
-                           
-    distance = dp[m][n]
-    max_len = max(len(seq1), len(seq2))
-    return (1 - distance / max_len) * 100.0
+    if not seq1 or not seq2: return 0.0
+    L = min(len(seq1), len(seq2))
+    matches = sum(1 for a, b in zip(seq1[:L], seq2[:L]) if a == b)
+    return matches / max(len(seq1), len(seq2))
 
 class CloverEvaluator:
     def __init__(self, experiment_dir):
@@ -38,186 +22,168 @@ class CloverEvaluator:
         self.raw_dir = os.path.join(experiment_dir, "01_RawData")
         self.feddna_dir = os.path.join(experiment_dir, "03_FedDNA_In")
         
-        # 数据容器
-        self.read_to_gt = {}     # Read_ID -> GT_Cluster_ID
-        self.gt_to_seq = {}      # GT_Cluster_ID -> GT_Ref_Seq
-        self.clover_clusters = defaultdict(list) # Clover_ID -> [Read_IDs]
-        self.clover_centers = {} # Clover_ID -> Center_Sequence
-        self.read_sequences = {} # Read_ID -> Sequence (用于反查)
-        self.seq_to_id = {}      # Sequence -> Read_ID
+        self.read_to_gt = {}     
+        self.gt_cluster_seqs = {} # GT ID -> 序列
+        self.clover_clusters = defaultdict(list) 
+        self.clover_centers = {}  # Clover ID -> 序列
+        self.seq_to_ids = defaultdict(list)
 
     def load_ground_truth(self):
-        """加载 GT 信息"""
-        print("📂 1. 加载 Ground Truth...")
-        
-        # 1. Load Read GT
+        print("📂 1. 加载 Ground Truth (GT)...")
+        # 加载 Read GT
         gt_read_path = os.path.join(self.raw_dir, "ground_truth_reads.txt")
-        if not os.path.exists(gt_read_path):
-            print(f"   ⚠️ 找不到 GT 文件: {gt_read_path}，将跳过GT评估")
-            return
-
-        with open(gt_read_path, 'r') as f:
-            header = f.readline()
-            for line in f:
-                parts = line.strip().split('\t')
-                if len(parts) >= 2:
-                    self.read_to_gt[parts[0]] = int(parts[1])
-        print(f"   - 加载了 {len(self.read_to_gt)} 条 Read GT")
-
-        # 2. Load Cluster GT (Ref Seqs)
+        if os.path.exists(gt_read_path):
+            with open(gt_read_path, 'r') as f:
+                f.readline()
+                for line in f:
+                    p = line.strip().split('\t')
+                    if len(p) >= 2: self.read_to_gt[p[0]] = int(p[1])
+        
+        # 加载 Cluster GT 序列
         gt_cluster_path = os.path.join(self.raw_dir, "ground_truth_clusters.txt")
         if os.path.exists(gt_cluster_path):
             with open(gt_cluster_path, 'r') as f:
-                header = f.readline()
+                f.readline()
                 for line in f:
-                    parts = line.strip().split('\t')
-                    if len(parts) >= 2:
-                        try:
-                            self.gt_to_seq[int(parts[0])] = parts[1]
-                        except ValueError:
-                            continue
-            print(f"   - 加载了 {len(self.gt_to_seq)} 条 GT 参考序列")
+                    p = line.strip().split('\t')
+                    if len(p) >= 2: 
+                        try: self.gt_cluster_seqs[int(p[0])] = p[1]
+                        except: continue
+        print(f"   - GT统计: {len(self.read_to_gt)} 条 Reads, {len(self.gt_cluster_seqs)} 个 Clusters")
 
     def load_raw_reads_map(self):
-        """加载原始 Reads 以便通过序列反查 ID"""
-        print("📂 2. 建立序列到ID的映射...")
+        print("📂 2. 建立序列到 ID 的映射...")
         raw_path = os.path.join(self.raw_dir, "raw_reads.txt")
-        if not os.path.exists(raw_path):
-            print(f"   ❌ 错误：找不到 raw_reads.txt: {raw_path}")
-            return
-
-        with open(raw_path, 'r') as f:
-            for line in f:
-                parts = line.strip().split('\t')
-                if len(parts) >= 2:
-                    self.seq_to_id[parts[1]] = parts[0]
-        print(f"   - 加载了 {len(self.seq_to_id)} 条原始序列映射")
+        if os.path.exists(raw_path):
+            with open(raw_path, 'r') as f:
+                for line in f:
+                    p = line.strip().split('\t')
+                    if len(p) >= 2: self.seq_to_ids[p[1]].append(p[0])
 
     def load_clover_results(self):
-        """加载 Clover 的聚类结果和中心序列"""
         print("📂 3. 加载 Clover 结果...")
-        
-        # 1. Load Clusters (read.txt)
+        # 1. 加载 Reads (用于计算纯度，虽然后面没打印，但保留逻辑)
         read_path = os.path.join(self.feddna_dir, "read.txt")
-        if not os.path.exists(read_path):
-            print(f"   ❌ 错误：找不到 Clover 输出文件 read.txt: {read_path}")
+        if os.path.exists(read_path):
+            current_cluster = -1
+            with open(read_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    if line.startswith("====="):
+                        current_cluster += 1
+                    else:
+                        pids = self.seq_to_ids.get(line)
+                        if pids:
+                            mid = next((i for i in pids if i in self.read_to_gt), pids[0])
+                            self.clover_clusters[current_cluster].append(mid)
+
+        # 2. 加载中心序列 (用于计算 Identity) - 增强了解析逻辑
+        center_files = glob.glob(os.path.join(self.feddna_dir, "*ref*.txt")) + \
+                       glob.glob(os.path.join(self.feddna_dir, "*center*.txt"))
+        
+        if center_files:
+            target_file = center_files[0]
+            print(f"   - 发现中心序列文件: {os.path.basename(target_file)}")
+            
+            # 先读取所有非空行
+            with open(target_file, 'r') as f:
+                lines = [line.strip() for line in f if line.strip() and not line.startswith('=')]
+            
+            # 检测是否包含 FASTA 头 (>)
+            has_headers = any(line.startswith('>') for line in lines)
+            
+            if has_headers:
+                # 按照 FASTA 格式解析
+                current_id = 0
+                seq_buffer = []
+                for line in lines:
+                    if line.startswith('>'):
+                        if seq_buffer:
+                            self.clover_centers[current_id] = "".join(seq_buffer)
+                            current_id += 1
+                            seq_buffer = []
+                        # 尝试从 Header 解析 ID (例如 >Cluster_12)
+                        try:
+                            parts = line.split('_')
+                            if len(parts) > 1:
+                                current_id = int(parts[1])
+                        except:
+                            pass
+                    else:
+                        seq_buffer.append(line)
+                # 添加最后一条
+                if seq_buffer:
+                    self.clover_centers[current_id] = "".join(seq_buffer)
+            else:
+                # 按照纯序列解析 (每行一条)
+                print("   - 未检测到 Header，假设每行一条序列 (行号=ID)...")
+                for idx, line in enumerate(lines):
+                    # 过滤过短的噪声
+                    if len(line) > 20: 
+                        self.clover_centers[idx] = line
+
+            print(f"   - 加载了 {len(self.clover_centers)} 条 Clover 生成的序列")
+        else:
+            print("   ⚠️ 未找到中心序列文件")
+
+    def evaluate_identity_smart(self):
+        """
+        评估序列一致性 (以预测为中心)
+        遍历每一个 Clover 预测结果 -> 去 GT 里找最佳匹配 (Best Match)
+        分母 = Clover 预测出的簇数量
+        """
+        print("\n📊 [Metric] Clover 序列一致性 (Pred -> GT Best Match)")
+        
+        if not self.clover_centers or not self.gt_cluster_seqs:
+            print("   ⚠️ 缺少 GT 或 Clover 数据，跳过。")
             return
 
-        current_cluster = -1
+        matches = []
         
-        with open(read_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line: continue
-                
-                if line.startswith("====="):
-                    current_cluster += 1
-                else:
-                    read_id = self.seq_to_id.get(line)
-                    if read_id:
-                        self.clover_clusters[current_cluster].append(read_id)
-        
-        print(f"   - 解析出 {len(self.clover_clusters)} 个 Clover 簇")
+        # 遍历 Clover 的预测结果
+        for cid, c_seq in self.clover_centers.items():
+            best_score = 0.0
+            best_gt_id = -1
+            
+            # 在 GT 中寻找最相似的
+            for gid, g_seq in self.gt_cluster_seqs.items():
+                score = calculate_identity(c_seq, g_seq)
+                if score > best_score:
+                    best_score = score
+                    best_gt_id = gid
+            
+            matches.append({
+                'clover_id': cid,
+                'gt_id': best_gt_id,
+                'identity': best_score
+            })
 
-        # 2. Load Centers
-        center_candidates = ["center.txt", "cluster_center.txt", "centers.txt"]
-        center_path = None
-        for name in center_candidates:
-            p = os.path.join(self.feddna_dir, name)
-            if os.path.exists(p):
-                center_path = p
-                break
+        # 统计结果
+        identities = [m['identity'] for m in matches]
+        avg_identity = np.mean(identities)
+        perfect_matches = sum(1 for x in identities if x > 0.99)
         
-        if center_path:
-            idx = 0
-            with open(center_path, 'r') as f:
-                for line in f:
-                    seq = line.strip()
-                    if seq and not seq.startswith("==="):
-                        self.clover_centers[idx] = seq
-                        idx += 1
-            print(f"   - 加载了 {len(self.clover_centers)} 条中心序列")
-        else:
-            print("   ⚠️ 未找到中心序列文件 (center.txt)，将跳过序列精度评估")
+        # 打印前3名最佳匹配
+        matches_sorted = sorted(matches, key=lambda x: x['identity'], reverse=True)
+        print("\n   🔍 Clover 最佳匹配样例 (Top 3):")
+        for m in matches_sorted[:3]:
+            print(f"   Clover {m['clover_id']} -> GT {m['gt_id']} | 一致性: {m['identity']:.2%}")
 
-    def evaluate(self):
-        print("\n" + "="*80)
-        print("📊 Clover 基准线评估报告")
-        print("="*80)
-        
-        if not self.clover_clusters:
-            print("❌ 没有加载到任何聚类结果，请检查路径。")
-            return [], 0, 0
-            
-        if not self.read_to_gt:
-            print("⚠️ 没有加载到 GT，无法评估纯度。")
-            return [], 0, 0
-        
-        total_purity = 0
-        total_identity = 0
-        valid_centers_count = 0
-        valid_clusters_count = 0
-        results = []
-        
-        print(f"{'Clover_ID':<10} | {'Dom_GT':<8} | {'Size':<6} | {'Purity(%)':<10} | {'Identity(%)':<12} | {'Note'}")
-        print("-" * 80)
-        
-        for cid in sorted(self.clover_clusters.keys()):
-            reads = self.clover_clusters[cid]
-            if not reads: continue
-            valid_clusters_count += 1
-            
-            gt_labels = [self.read_to_gt.get(r, -1) for r in reads]
-            gt_counts = Counter(gt_labels)
-            dominant_gt, dom_count = gt_counts.most_common(1)[0] if gt_counts else (-1, 0)
-            
-            purity = (dom_count / len(reads)) * 100.0
-            total_purity += purity
-            
-            identity = 0.0
-            note = ""
-            
-            if cid in self.clover_centers and dominant_gt in self.gt_to_seq:
-                clover_seq = self.clover_centers[cid]
-                gt_seq = self.gt_to_seq[dominant_gt]
-                identity = calculate_identity(clover_seq, gt_seq)
-                total_identity += identity
-                valid_centers_count += 1
-            elif dominant_gt == -1: note = "Noise Dominant"
-            elif dominant_gt not in self.gt_to_seq: note = "GT Ref Missing"
-            elif cid not in self.clover_centers: note = "No Center Seq"
-            
-            results.append({'Clover_ID': cid, 'Dominant_GT': dominant_gt, 'Size': len(reads), 'Purity': purity, 'Identity': identity, 'Note': note})
-            
-            if cid < 10 or purity < 90 or (identity > 0 and identity < 95):
-                print(f"{cid:<10} | {dominant_gt:<8} | {len(reads):<6} | {purity:<10.1f} | {identity:<12.1f} | {note}")
-
-        avg_purity = total_purity / valid_clusters_count if valid_clusters_count > 0 else 0
-        avg_identity = total_identity / valid_centers_count if valid_centers_count > 0 else 0
-        
-        print("-" * 80)
-        print(f"📈 总体平均纯度 (Avg Purity):   {avg_purity:.2f}% (基于 {valid_clusters_count} 个簇)")
-        print(f"🎯 总体序列一致性 (Avg Identity): {avg_identity:.2f}% (基于 {valid_centers_count} 个匹配簇)")
-        print("=" * 80)
-        return results, avg_purity, avg_identity
-
-    def save_csv(self, results, output_path):
-        if not results: return
-        with open(output_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['Clover_ID', 'Dominant_GT', 'Size', 'Purity', 'Identity', 'Note'])
-            writer.writeheader()
-            writer.writerows(results)
-        print(f"💾 详细报告已保存: {output_path}")
+        print("\n" + "-"*40)
+        print(f"🏆 Clover 真实基准 (Pred={len(matches)} vs GT={len(self.gt_cluster_seqs)})")
+        print(f"✅ 平均一致性: {avg_identity:.2%}")
+        print(f"✅ 完美匹配数: {perfect_matches}/{len(matches)}")
+        print("-" * 40)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--experiment_dir', type=str, required=True)
-    parser.add_argument('--output', type=str, default='clover_baseline.csv')
     args = parser.parse_args()
     
-    evaluator = CloverEvaluator(args.experiment_dir)
-    evaluator.load_ground_truth()
-    evaluator.load_raw_reads_map()
-    evaluator.load_clover_results()
-    results, _, _ = evaluator.evaluate()
-    evaluator.save_csv(results, args.output)
+    eval = CloverEvaluator(args.experiment_dir)
+    eval.load_ground_truth()
+    eval.load_raw_reads_map()
+    eval.load_clover_results()
+    
+    eval.evaluate_identity_smart()

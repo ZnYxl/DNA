@@ -1,7 +1,7 @@
 {
   "experiment_info": {
-    "timestamp": "2025-12-18 00:21:23",
-    "experiment_dir": "CC/Step0/Experiments/20251217_015615_Cluster_GT_Test",
+    "timestamp": "2025-12-19 00:13:37",
+    "experiment_dir": "CC/Step0/Experiments/20251218_231311_Cluster_GT_Test",
     "output_dir": "./iterative_results/round_2/step1"
   },
   "model_config": {
