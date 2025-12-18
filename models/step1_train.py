@@ -1,10 +1,10 @@
-# models/step1_train.py
 import torch
 import torch.optim as optim
 import argparse
 import os
 import sys
 from datetime import datetime
+import numpy as np
 
 # 添加路径，确保能导入 models 包
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -27,7 +27,7 @@ def train_step1(args):
     print("📂 数据加载")
     print("=" * 60)
 
-    # ✅ 修复：安全获取 refined_labels 参数
+    # 安全获取 refined_labels 参数
     labels_path = getattr(args, 'refined_labels', None)
     
     data_loader = CloverDataLoader(args.experiment_dir, labels_path=labels_path)
@@ -71,7 +71,16 @@ def train_step1(args):
     print("=" * 60)
 
     model.train()
-    training_history = {'total_loss': [], 'avg_strength': [], 'high_conf_ratio': []}
+    
+    # ✅ 修复重点：完整初始化所有需要的 Key
+    training_history = {
+        'total_loss': [], 
+        'avg_strength': [], 
+        'high_conf_ratio': [],
+        'contrastive_loss': [],    # 新增
+        'reconstruction_loss': [], # 新增
+        'kl_loss': []              # 新增
+    }
 
     for epoch in range(args.epochs):
         batch_indices_list = create_cluster_balanced_sampler(
@@ -80,7 +89,12 @@ def train_step1(args):
             max_clusters_per_batch=args.max_clusters_per_batch
         )
 
+        # ✅ 初始化本 Epoch 的累加器
         epoch_loss = 0
+        epoch_con_loss = 0  # 新增：对比损失累加
+        epoch_rec_loss = 0  # 新增：重建损失累加
+        epoch_kl_loss = 0   # 新增：KL损失累加
+        
         epoch_strength = 0
         epoch_high_conf = 0
         num_batches = 0
@@ -104,23 +118,42 @@ def train_step1(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            # 记录
+            # ✅ 记录各项子 Loss
+            # 注意：这里从 model 返回的 loss_dict 取值，Key 必须与 Step1EvidentialModel 中一致
             epoch_loss += loss_dict['total'].item()
+            epoch_con_loss += loss_dict['contrastive'].item()
+            epoch_rec_loss += loss_dict['reconstruction'].item()
+            epoch_kl_loss += loss_dict['kl_divergence'].item()
+            
             epoch_strength += outputs['avg_strength']
             epoch_high_conf += outputs['high_conf_ratio']
             num_batches += 1
 
         if num_batches > 0:
             scheduler.step()
+            
+            # 计算平均值
             avg_loss = epoch_loss / num_batches
+            avg_con = epoch_con_loss / num_batches
+            avg_rec = epoch_rec_loss / num_batches
+            avg_kl = epoch_kl_loss / num_batches
+            
             avg_strength = epoch_strength / num_batches
             avg_high_conf = epoch_high_conf / num_batches
 
+            # ✅ 存入 History (Key 必须与 Visualizer 对应)
             training_history['total_loss'].append(avg_loss)
+            training_history['contrastive_loss'].append(avg_con)
+            training_history['reconstruction_loss'].append(avg_rec)
+            training_history['kl_loss'].append(avg_kl)
+            
             training_history['avg_strength'].append(avg_strength)
             training_history['high_conf_ratio'].append(avg_high_conf)
 
-            print(f"   Epoch {epoch + 1}/{args.epochs} | Loss: {avg_loss:.4f} | Strength: {avg_strength:.2f} | HighConf: {avg_high_conf:.1%}")
+            # 打印日志 (包含子 Loss 详情)
+            print(f"   Epoch {epoch + 1}/{args.epochs} | "
+                  f"Tot: {avg_loss:.4f} (Con:{avg_con:.4f} Rec:{avg_rec:.4f}) | "
+                  f"Str: {avg_strength:.1f}")
 
     # 6️⃣ 保存最终模型
     os.makedirs(os.path.join(args.output_dir, "models"), exist_ok=True)
@@ -139,8 +172,10 @@ def train_step1(args):
         visualizer.generate_all_outputs(training_history, model, args)
     except Exception as e:
         print(f"⚠️ 可视化生成跳过: {e}")
+        import traceback
+        traceback.print_exc()
 
-    # ✅ 返回模型路径，供外部调用
+    # 返回模型路径，供外部调用
     return final_model_path
 
 
@@ -152,7 +187,6 @@ if __name__ == "__main__":
     
     # 可选参数
     parser.add_argument('--feddna_checkpoint', type=str, default=None, help='预训练权重')
-    # ✅ 修复：添加 refined_labels 参数定义
     parser.add_argument('--refined_labels', type=str, default=None, help='迭代修正后的标签文件')
     
     # 训练参数

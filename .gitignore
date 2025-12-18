@@ -1,6 +1,7 @@
 # 忽略数据集文件夹
 Dataset/
 data/
+iterative_results/
 
 # 忽略 Python 编译缓存
 __pycache__/
@@ -16,6 +17,3 @@ venv/
 *.gz
 
 
-
-# 忽略真实数据和压缩包
-*.gz

@@ -13,7 +13,7 @@ from models.step1_data import CloverDataLoader
 
 # ================= 配置区域 =================
 CONFIG = {
-    "experiment_dir": "CC/Step0/Experiments/20251217_015615_Cluster_GT_Test",
+    "experiment_dir": "CC/Step0/Experiments/20251218_231311_Cluster_GT_Test",
     "feddna_checkpoint": "result/FLDNA_I/I_1214234233/model/epoch1_I.pth",
     "base_output_dir": "./iterative_results",
     "max_rounds": 3,
