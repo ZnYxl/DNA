@@ -205,12 +205,18 @@ def clover_to_feddna(clover_out_path, raw_reads_path, output_dir):
     with open(out_read, 'w') as fr, open(out_ref, 'w') as ff:
         for cid, mems in clusters.items():
             if cid in raw_reads:
-                # 注意：这里的 Ref 还是 Clover 选出来的中心，不是 GT
-                # 我们需要在神经网络训练时，用 Output 处的 GT 来算 Loss，而不是 Input 处的
+                # 1. 写入 ref.txt (作为 Target 或者 Initial Guess)
                 ff.write(raw_reads[cid] + "\n") 
+                
+                # 2. 写入 read.txt (作为 Input Batch)
+                # 【修正点】: 先把中心(cid)自己写进去！中心也是簇的一员！
+                fr.write(raw_reads[cid] + "\n") 
+                
                 for m in mems:
                     if m in raw_reads:
                         fr.write(raw_reads[m] + "\n")
+                
+                # 分隔符
                 fr.write("===============================\n")
                 valid_count += 1
                 
