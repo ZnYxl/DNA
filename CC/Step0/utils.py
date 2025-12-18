@@ -68,7 +68,6 @@ def create_motif_based_references(num_clusters, seq_len):
                 sequence.append(random.choice(['A', 'C', 'G', 'T']))
                 pos += 1
         ref_seq = "".join(sequence[:seq_len])
-        # 补齐
         while len(ref_seq) < seq_len:
             ref_seq += random.choice(['A', 'C', 'G', 'T'])
         references.append(ref_seq)
@@ -80,45 +79,52 @@ def mutate_sequence_realistic(sequence, sub_rate=0.01, del_rate=0.005, ins_rate=
     result = list(sequence)
     i = 0
     while i < len(result):
-        # 1. 替换 (Substitution)
+        # 1. 替换
         if random.random() < sub_rate:
             original = result[i]
-            # 简单的转换偏好模拟
-            if original in ['A', 'G']: # 嘌呤倾向
+            if original in ['A', 'G']: 
                 target = 'G' if original == 'A' else 'A'
                 result[i] = target if random.random() < 0.7 else random.choice(['C', 'T'])
-            else: # 嘧啶倾向
+            else:
                 target = 'T' if original == 'C' else 'C'
                 result[i] = target if random.random() < 0.7 else random.choice(['A', 'G'])
         
-        # 2. 删除 (Deletion)
+        # 2. 删除
         if random.random() < del_rate:
             result.pop(i)
-            continue # 删除后索引不变，但对应原序列下一位
+            continue 
             
-        # 3. 插入 (Insertion)
+        # 3. 插入
         if random.random() < ins_rate:
             result.insert(i, random.choice(bases))
-            i += 1 # 跳过刚插入的碱基
+            i += 1 
             
         i += 1
     return "".join(result)
 
-# 【重点修改在这里！】注意函数定义里多了 reference_type 参数
 def generate_data(output_dir, num_clusters=100, reads_per_cluster=20, seq_len=150, reference_type="diverse"):
     """
-    主生成函数 (兼容 run_experiment.py 的调用接口)
+    主生成函数：现在会输出 Cluster-Level GT 和 Read-Level GT 两个文件
     """
     raw_path = os.path.join(output_dir, "raw_reads.txt")
-    gt_path = os.path.join(output_dir, "ground_truth.txt")
+    read_gt_path = os.path.join(output_dir, "ground_truth_reads.txt")      # 详细版：用于算聚类指标
+    cluster_gt_path = os.path.join(output_dir, "ground_truth_clusters.txt") # 核心版：Cluster ID -> Ref Seq
     
-    print(f"🔧 [Advanced Generator] 生成配置: {num_clusters}簇, {reads_per_cluster}reads/簇, 模式={reference_type}")
+    print(f"🔧 [Generator] 生成配置: {num_clusters}簇, {reads_per_cluster}reads/簇, 模式={reference_type}")
     
-    # 1. 生成参考序列
+    # 1. 生成参考序列 (Ground Truth References)
     if reference_type == "motif":
         ground_truths = create_motif_based_references(num_clusters, seq_len)
     else:
         ground_truths = generate_diverse_references(num_clusters, seq_len, min_distance=0.3)
+        
+    # --- 【关键修改】立即保存 Cluster 级别的 GT ---
+    with open(cluster_gt_path, 'w') as f:
+        f.write("Cluster_ID\tRef_Seq\n")
+        for cid, seq in enumerate(ground_truths):
+            # 这里 Cluster ID 直接用 0, 1, 2... 作为真正的 GT ID
+            f.write(f"{cid}\t{seq}\n")
+    # -------------------------------------------
         
     # 2. 生成 Reads
     all_reads_data = []
@@ -129,7 +135,7 @@ def generate_data(output_dir, num_clusters=100, reads_per_cluster=20, seq_len=15
             counter += 1
             read_id = str(counter)
             
-            # 80% 概率高质量，20% 低质量
+            # 模拟噪音
             if random.random() < 0.8:
                 noisy_seq = mutate_sequence_realistic(ref_seq, sub_rate=0.005, del_rate=0.002, ins_rate=0.002)
                 quality = "high"
@@ -144,19 +150,21 @@ def generate_data(output_dir, num_clusters=100, reads_per_cluster=20, seq_len=15
     # 3. 写入文件
     with open(raw_path, 'w') as f:
         for item in all_reads_data:
-            # 格式: ID [TAB] Sequence
             f.write(f"{item[0]}\t{item[1]}\n")
             
-    with open(gt_path, 'w') as f:
+    with open(read_gt_path, 'w') as f:
         f.write("Read_ID\tCluster_ID\tRef_Seq\tQuality\n")
         for item in all_reads_data:
             f.write(f"{item[0]}\t{item[2]}\t{item[3]}\t{item[4]}\n")
             
     print(f"✅ 数据生成完毕: {len(all_reads_data)} 条 Reads")
-    return raw_path, gt_path
+    print(f"📝 Cluster GT (簇级): {cluster_gt_path}")
+    print(f"📝 Read GT (Read级): {read_gt_path}")
+    
+    return raw_path, read_gt_path, cluster_gt_path
 
 # ==============================================================================
-# 模块2: 格式转换 (Bridge Logic - 保持不变)
+# 模块2: 格式转换 (保持不变，用于喂给后续神经网络)
 # ==============================================================================
 
 def load_raw_reads(file_path):
@@ -172,18 +180,15 @@ def clover_to_feddna(clover_out_path, raw_reads_path, output_dir):
     raw_reads = load_raw_reads(raw_reads_path)
     clusters = collections.defaultdict(list)
     
-    # 智能解析 Clover 输出
     try:
         with open(clover_out_path, 'r') as f:
             content = f.read().strip()
             if content.startswith("[") and content.endswith("]"):
-                # 列表格式解析
                 pairs = ast.literal_eval(content)
                 for item in pairs:
                     if str(item[1]) not in ['-1', -1]:
                         clusters[str(item[1])].append(str(item[0]))
             else:
-                # 逐行格式解析
                 f.seek(0)
                 for line in f:
                     p = line.replace(',', ' ').split()
@@ -193,15 +198,15 @@ def clover_to_feddna(clover_out_path, raw_reads_path, output_dir):
         print(f"❌ 解析 Clover 输出失败: {e}")
         return 0, ""
 
-    # 写入结果
     out_read = os.path.join(output_dir, "read.txt")
-    out_ref = os.path.join(output_dir, "ref.txt") # 统一叫 ref.txt
+    out_ref = os.path.join(output_dir, "ref.txt")
     
     valid_count = 0
     with open(out_read, 'w') as fr, open(out_ref, 'w') as ff:
         for cid, mems in clusters.items():
             if cid in raw_reads:
-                # Center 作为伪 Reference
+                # 注意：这里的 Ref 还是 Clover 选出来的中心，不是 GT
+                # 我们需要在神经网络训练时，用 Output 处的 GT 来算 Loss，而不是 Input 处的
                 ff.write(raw_reads[cid] + "\n") 
                 for m in mems:
                     if m in raw_reads:
