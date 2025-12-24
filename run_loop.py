@@ -12,7 +12,7 @@ from models.step1_data import CloverDataLoader
 
 # ================= 配置区域 =================
 # 1. 只需要修改这里的输入路径，输出路径会自动跟随
-INPUT_EXP_DIR = "CC/Step0/Experiments/20251218_231311_Cluster_GT_Test"
+INPUT_EXP_DIR = "CC/Step0/Experiments/20251224_155232_Cluster_GT_Test"
 
 # 自动提取文件夹名称 (e.g., "20251218_231311_Cluster_GT_Test")
 EXP_NAME = os.path.basename(os.path.normpath(INPUT_EXP_DIR))
