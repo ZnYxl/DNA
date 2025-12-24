@@ -9,7 +9,7 @@ EXP_NAME = "Cluster_GT_Test"
 SEQ_LENGTH = 150
 NUM_CLUSTERS = 10000      
 READS_PER_CLUSTER = 100 
-CLOVER_PROCESSES = 60
+CLOVER_PROCESSES = 0
 REF_TYPE = "diverse" 
 # ===========================================
 

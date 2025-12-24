@@ -3,27 +3,27 @@
 Step2 主入口：Evidence-Guided Refinement & Decoding
 关键：不训练，只推理+决策
 ✅ 相对不确定性原则：簇内比较，偏向确定性
-✅ 修复版 v2：
-   1. 包含 length_adapter 权重预加载修复
-   2. 包含 迭代接口 (next_round_files)
-   3. 🔥 新增：强制 Padding 到 max_length，避开未训练的 adapter
+✅ 修复版 v3 (最终版)：
+   1. 🌟 数据对齐修复：输出标签数量严格等于原始 Reads 数量 (解决 Mismatch 报错)
+   2. 包含 length_adapter 权重预加载修复
+   3. 包含 强制 Padding 逻辑
+   4. 包含 DataLoader 多进程批量推理加速
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # ✅ 需要用到 F.pad
+import torch.nn.functional as F
 import os
 import sys
 import argparse
 import numpy as np
 from datetime import datetime
 
-# ✅ 添加路径处理（与step1_train.py相同）
+# ✅ 添加路径处理
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-# 现在可以正常导入
-from models.step1_model import Step1EvidentialModel, load_pretrained_feddna
+from models.step1_model import Step1EvidentialModel
 from models.step1_data import CloverDataLoader, Step1Dataset
 from models.step2_refine import (
     split_confidence_by_percentile,
@@ -33,21 +33,14 @@ from models.step2_refine import (
 )
 from models.step2_decode import (
     decode_cluster_consensus,
-    save_consensus_sequences,
-    compute_consensus_quality_metrics
+    save_consensus_sequences
 )
 
 
 @torch.no_grad()
 def run_step2(args):
     """
-    Step2主流程：
-    1. 加载Step1模型（freeze）
-    2. 推理得到embeddings + evidence
-    3. 相对证据筛选（簇内比较）
-    4. 簇修正（只修正低置信度）
-    5. 偏向确定性的consensus解码
-    6. 准备下一轮迭代数据
+    Step2主流程：推理 -> 修正 -> 解码 -> 对齐保存
     """
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"🖥️ 使用设备: {device}")
@@ -64,31 +57,26 @@ def run_step2(args):
         print(f"   ❌ checkpoint加载失败: {e}")
         return None
 
-    # ✅ 使用Step1训练时保存的参数
+    # ✅ 获取模型参数
     if 'args' in checkpoint:
         step1_args = checkpoint['args']
-        print(f"   📋 Step1训练参数:")
-        print(f"      dim: {step1_args.get('dim', args.dim)}")
-        print(f"      max_length: {step1_args.get('max_length', args.max_length)}")
-
-        # 使用Step1的参数
         model_dim = step1_args.get('dim', args.dim)
         model_max_length = step1_args.get('max_length', args.max_length)
     else:
-        print(f"   ⚠️ checkpoint中没有保存args，使用当前参数")
         model_dim = args.dim
         model_max_length = args.max_length
 
-    # 重建数据加载器
+    # ✅ 重建数据加载器 & 获取总数 (关键修复)
     try:
         data_loader = CloverDataLoader(args.experiment_dir)
+        TOTAL_READS_COUNT = len(data_loader.reads)  # 🌟 必须获取原始总数
         num_clusters = len(set(data_loader.clover_labels))
-        print(f"   📊 数据统计: {len(data_loader.reads)} reads, {num_clusters} 簇")
+        print(f"   📊 数据统计: {TOTAL_READS_COUNT} 总Reads, {num_clusters} 簇")
     except Exception as e:
         print(f"   ❌ 数据加载失败: {e}")
         return None
 
-    # ✅ 使用Step1相同的参数重建模型
+    # ✅ 重建模型
     try:
         model = Step1EvidentialModel(
             dim=model_dim,
@@ -96,54 +84,38 @@ def run_step2(args):
             num_clusters=num_clusters,
             device=device
         ).to(device)
-        print(f"   ✅ 模型结构创建成功")
     except Exception as e:
         print(f"   ❌ 模型创建失败: {e}")
         return None
 
-    # ================= 🔴 核心修复 1: 权重预加载 🔴 =================
-    # 手动检查并初始化 length_adapter，防止权重加载被跳过
+    # ✅ 修复: 权重预加载 (length_adapter)
     try:
         state_dict = checkpoint['model_state_dict']
         if 'length_adapter.weight' in state_dict:
-            print(f"   🔧 检测到 checkpoint 包含 length_adapter，正在预初始化...")
             weight_shape = state_dict['length_adapter.weight'].shape
-            in_features = weight_shape[1]
-            out_features = weight_shape[0]
-            
-            # 手动初始化层
-            model.length_adapter = nn.Linear(in_features, out_features).to(device)
-            print(f"      已初始化: Linear({in_features} -> {out_features})")
-    except Exception as e:
-        print(f"   ⚠️ 预初始化 length_adapter 时出错 (非致命): {e}")
+            model.length_adapter = nn.Linear(weight_shape[1], weight_shape[0]).to(device)
+            print(f"   🔧 预初始化 length_adapter: {weight_shape}")
+    except Exception:
+        pass
 
-    # ✅ 尝试加载
-    try:
-        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
-        print(f"   ✅ 模型完全匹配加载")
-    except RuntimeError as e:
-        print(f"   ⚠️ 模型结构不完全匹配: {e}")
-        # ... (省略之前的过滤加载代码，保持简洁，逻辑一样) ...
-        # 如果需要完整的过滤代码，可以保留之前的写法，这里简化展示核心逻辑
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        print(f"   ✅ 尝试强制加载 (strict=False)")
-
+    # 加载权重
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.eval()
-    print(f"   📊 模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
 
-    # ========== 2️⃣ 推理全部数据 (批量优化版) ==========
+    # ========== 2️⃣ 批量推理 (带索引记录) ==========
     print("\n" + "=" * 60)
-    print("🔮 Step1模型推理（提取embeddings + evidence）")
+    print("🔮 Step1模型批量推理")
     print("=" * 60)
 
     try:
+        # 注意：Step1Dataset 可能会过滤掉 -1 的数据，所以 len(dataset) <= TOTAL_READS_COUNT
         dataset = Step1Dataset(data_loader, max_len=model_max_length)
-        # ✅ 使用 DataLoader 进行批量推理
-        # num_workers=4 可以利用你的多核CPU加速数据加载
+        
+        # 使用 DataLoader 加速
         inference_loader = torch.utils.data.DataLoader(
             dataset, batch_size=1024, shuffle=False, num_workers=4, pin_memory=True
         )
-        print(f"   📊 数据集大小: {len(dataset)} | Batch Size: 1024")
+        print(f"   📊 有效推理数据: {len(dataset)} (Batch Size: 1024)")
     except Exception as e:
         print(f"   ❌ 数据集创建失败: {e}")
         return None
@@ -153,203 +125,172 @@ def run_step2(args):
     all_alpha = []
     all_evidence = []
     all_labels = []
-    
-    # 只需要存 read_idx 用于后续对齐，或者直接按顺序
-    print(f"   🔄 开始批量推理...")
+    all_real_indices = []  # 🌟 记录真实索引
 
-    model.eval()
-    with torch.no_grad():
-        for batch_idx, batch_data in enumerate(inference_loader):
-            # 获取数据
-            reads = batch_data['encoding'].to(device) # (B, L, 4)
-            labels = batch_data['clover_label']       # list or tensor
-            
-            # ================= 强制 Padding (你的核心修复) =================
-            curr_len = reads.shape[1]
-            target_len = model_max_length
-            if curr_len > target_len:
-                reads = reads[:, :target_len, :]
-            elif curr_len < target_len:
-                pad_len = target_len - curr_len
-                reads = F.pad(reads, (0, 0, 0, pad_len), "constant", 0)
-            # ================================================================
+    print(f"   🔄 开始推理...")
 
-            # 批量推理
+    for batch_idx, batch_data in enumerate(inference_loader):
+        reads = batch_data['encoding'].to(device) # (B, L, 4)
+        labels = batch_data['clover_label']
+        read_indices = batch_data['read_idx']     # (B,) 获取原始索引
+
+        # 🌟 强制 Padding 逻辑
+        curr_len = reads.shape[1]
+        target_len = model_max_length
+        if curr_len > target_len:
+            reads = reads[:, :target_len, :]
+        elif curr_len < target_len:
+            pad_len = target_len - curr_len
+            reads = F.pad(reads, (0, 0, 0, pad_len), "constant", 0)
+
+        # 推理
+        with torch.no_grad():
             embeddings, pooled_emb = model.encode_reads(reads)
             evidence, strength, alpha = model.decode_to_evidence(embeddings)
 
-            # 收集结果 (转到CPU以节省显存)
-            all_embeddings.append(pooled_emb.cpu())
-            all_strength.append(strength.mean(dim=1).cpu())
-            all_alpha.append(alpha.cpu())
-            all_evidence.append(evidence.cpu())
-            
-            # 处理 labels (如果是tensor转list，或者直接extend)
-            if isinstance(labels, torch.Tensor):
-                all_labels.extend(labels.tolist())
-            else:
-                all_labels.extend(labels)
+        # 收集结果
+        all_embeddings.append(pooled_emb.cpu())
+        all_strength.append(strength.mean(dim=1).cpu())
+        all_alpha.append(alpha.cpu())
+        all_evidence.append(evidence.cpu())
+        all_real_indices.append(read_indices) # 记录索引
 
-            if (batch_idx + 1) % 100 == 0:
-                print(f"      已处理 Batch: {batch_idx + 1}/{len(inference_loader)}")
+        if isinstance(labels, torch.Tensor):
+            all_labels.extend(labels.tolist())
+        else:
+            all_labels.extend(labels)
+
+        if (batch_idx + 1) % 50 == 0:
+            print(f"      已处理 Batch: {batch_idx + 1}/{len(inference_loader)}", end='\r')
 
     if len(all_embeddings) == 0:
-        print(f"   ❌ 没有成功推理的reads！")
+        print(f"\n   ❌ 没有成功推理的reads！")
         return None
 
-    # 拼接结果
-    try:
-        embeddings = torch.cat(all_embeddings, dim=0).to(device)
-        strength = torch.cat(all_strength, dim=0).to(device)
-        alpha = torch.cat(all_alpha, dim=0).to(device)
-        evidence = torch.cat(all_evidence, dim=0).to(device)
-        labels = torch.tensor(all_labels, device=device)
+    # 拼接张量
+    embeddings = torch.cat(all_embeddings, dim=0).to(device)
+    strength = torch.cat(all_strength, dim=0).to(device)
+    alpha = torch.cat(all_alpha, dim=0).to(device)
+    evidence = torch.cat(all_evidence, dim=0).to(device)
+    labels = torch.tensor(all_labels, device=device)
+    
+    # 🌟 拼接所有索引
+    flat_real_indices = torch.cat(all_real_indices).numpy()
 
-        print(f"   ✅ 推理完成:")
-        print(f"      Total: {len(labels)} reads")
-        print(f"      Embeddings: {embeddings.shape}")
-    except Exception as e:
-        print(f"   ❌ 拼接张量失败 (可能显存不足): {e}")
-        return None
+    print(f"\n   ✅ 推理完成. 张量形状: {embeddings.shape}")
+
     # ========== 3️⃣ Phase A: 相对证据筛选 ==========
     print("\n" + "=" * 60)
-    print("🔍 Phase A: 相对证据筛选（簇内比较）")
+    print("🔍 Phase A: 相对证据筛选")
     print("=" * 60)
 
-    try:
-        low_conf_mask, conf_stats = split_confidence_by_percentile(
-            strength, labels, p=args.uncertainty_percentile
-        )
-        high_conf_mask = ~low_conf_mask
-
-    except Exception as e:
-        print(f"   ❌ 相对证据筛选失败: {e}")
-        return None
+    low_conf_mask, conf_stats = split_confidence_by_percentile(
+        strength, labels, p=args.uncertainty_percentile
+    )
+    high_conf_mask = ~low_conf_mask
 
     # ========== 4️⃣ Phase B: 簇修正 ==========
     print("\n" + "=" * 60)
-    print("🔄 Phase B: 簇修正（只修正低置信度reads）")
+    print("🔄 Phase B: 簇修正")
     print("=" * 60)
 
-    try:
-        centroids, cluster_sizes = compute_cluster_centroids(
-            embeddings, labels, high_conf_mask
+    centroids, cluster_sizes = compute_cluster_centroids(
+        embeddings, labels, high_conf_mask
+    )
+
+    if args.delta is None:
+        delta = compute_adaptive_delta(
+            embeddings, centroids, percentile=args.delta_percentile
         )
-
-        if args.delta is None:
-            delta = compute_adaptive_delta(
-                embeddings, centroids, percentile=args.delta_percentile
-            )
-        else:
-            delta = args.delta
-            print(f"   🎯 使用固定delta: {delta:.4f}")
-
-        new_labels, noise_mask, refine_stats = refine_low_confidence_reads(
-            embeddings, labels, low_conf_mask, centroids, delta
-        )
-
-    except Exception as e:
-        print(f"   ❌ 簇修正失败: {e}")
-        return None
-
-    # ========== 5️⃣ Phase C: 偏向确定性的Consensus解码 ==========
-    print("\n" + "=" * 60)
-    print("🧬 Phase C: 偏向确定性的Consensus解码")
-    print("=" * 60)
-
-    try:
-        consensus_dict = decode_cluster_consensus(
-            evidence, alpha, new_labels, strength, high_conf_mask
-        )
-
-        os.makedirs(args.output_dir, exist_ok=True)
-        consensus_path = os.path.join(args.output_dir, "consensus_sequences.fasta")
-        save_consensus_sequences(consensus_dict, consensus_path)
-
-    except Exception as e:
-        print(f"   ❌ Consensus解码失败: {e}")
-        return None
-
-    # ========== 6️⃣ 生成报告 ==========
-    print("\n" + "=" * 60)
-    print("📊 Step2 最终统计")
-    print("=" * 60)
-
-    print(f"\n   📈 簇修正效果:")
-    print(f"      原始簇数: {len(torch.unique(labels))}")
-    print(f"      修正后簇数: {len(consensus_dict)}")
-    print(f"      总噪声reads: {noise_mask.sum()}/{len(labels)} ({noise_mask.float().mean() * 100:.1f}%)")
-    print(f"      重新分配: {refine_stats['reassigned']}")
-    print(f"      新增噪声: {refine_stats['marked_noise']}")
-
-    print(f"\n   🧬 Consensus质量:")
-    for label in sorted(list(consensus_dict.keys())[:5]):
-        info = consensus_dict[label]
-        print(f"      簇{label}: {info['num_reads']} reads ({info['num_high_conf']} 高置信度), "
-              f"strength={info['avg_strength']:.3f}, "
-              f"len={len(info['consensus_seq'])}")
-
-    # ========== 7️⃣ 准备下一轮迭代的数据 (缝合接口) ==========
-    print("\n" + "=" * 60)
-    print("🔄 准备下一轮 (Next Round) 数据")
-    print("=" * 60)
+    else:
+        delta = args.delta
     
-    # 1. 保存新的伪标签 (Refined Labels)
+    # new_labels 的长度 = len(dataset) (即有效reads的数量)
+    new_labels, noise_mask, refine_stats = refine_low_confidence_reads(
+        embeddings, labels, low_conf_mask, centroids, delta
+    )
+
+    # ========== 5️⃣ Phase C: Consensus ==========
+    print("\n" + "=" * 60)
+    print("🧬 Phase C: Consensus解码")
+    print("=" * 60)
+
+    consensus_dict = decode_cluster_consensus(
+        evidence, alpha, new_labels, strength, high_conf_mask
+    )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    consensus_path = os.path.join(args.output_dir, "consensus_sequences.fasta")
+    save_consensus_sequences(consensus_dict, consensus_path)
+
+    # ========== 6️⃣ 准备下一轮迭代的数据 (🌟核心修复) ==========
+    print("\n" + "=" * 60)
+    print("🔄 准备下一轮 (Next Round) 数据 - 对齐修复")
+    print("=" * 60)
+
     next_round_dir = os.path.join(args.experiment_dir, "04_Iterative_Labels")
     os.makedirs(next_round_dir, exist_ok=True)
-    
     timestamp_id = datetime.now().strftime("%H%M%S")
     label_save_path = os.path.join(next_round_dir, f"refined_labels_{timestamp_id}.txt")
-    
-    np.savetxt(label_save_path, new_labels.cpu().numpy(), fmt='%d')
-    print(f"   📝 修正标签已保存: {label_save_path}")
 
-    # 保存完整结果
+    # 🌟 关键逻辑：还原到全长数组
+    # 1. 创建全长数组，默认填 -1 (噪声)
+    full_refined_labels = np.full(TOTAL_READS_COUNT, -1, dtype=int)
+    
+    # 2. 将修正后的 new_labels 填入对应的原始位置
+    # new_labels 是 Tensor (N_valid,), flat_real_indices 是 numpy (N_valid,)
+    current_refined_labels = new_labels.cpu().numpy()
+    
+    # 安全检查
+    if len(flat_real_indices) != len(current_refined_labels):
+        print(f"   ❌ 严重错误: 索引数量与标签数量不一致!")
+        return None
+        
+    full_refined_labels[flat_real_indices] = current_refined_labels
+    
+    # 3. 保存全长文件
+    np.savetxt(label_save_path, full_refined_labels, fmt='%d')
+    
+    print(f"   📝 修正标签已保存: {label_save_path}")
+    print(f"      - 原始Reads总数: {TOTAL_READS_COUNT}")
+    print(f"      - 保存标签总数: {len(full_refined_labels)} (必须一致)")
+    print(f"      - 有效修正数: {len(current_refined_labels)}")
+    print(f"      - 自动标记噪声(-1): {TOTAL_READS_COUNT - len(current_refined_labels)}")
+
+    # 保存结果 dict
     try:
         results = {
             'new_labels': new_labels.cpu(),
             'noise_mask': noise_mask.cpu(),
-            'high_conf_mask': high_conf_mask.cpu(),
-            'low_conf_mask': low_conf_mask.cpu(),
             'strength': strength.cpu(),
             'consensus_dict': consensus_dict,
-            'refine_stats': refine_stats,
-            'conf_stats': conf_stats,
             'next_round_files': {
                 'labels': label_save_path,
                 'reference': consensus_path
             },
             'args': vars(args)
         }
-
         results_path = os.path.join(args.output_dir, "step2_results.pth")
         torch.save(results, results_path)
         print(f"\n   💾 完整结果已保存: {results_path}")
-
     except Exception as e:
         print(f"   ⚠️ 结果保存失败: {e}")
         results = None
-
-    print(f"\n🎉 Step2完成！相对不确定性原则生效！")
-    print(f"📁 输出目录: {args.output_dir}")
 
     return results
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Step2: Evidence-Guided Refinement & Decoding')
-
-    parser.add_argument('--experiment_dir', type=str, required=True, help='实验目录')
-    parser.add_argument('--step1_checkpoint', type=str, required=True, help='Step1 checkpoint')
+    parser.add_argument('--experiment_dir', type=str, required=True)
+    parser.add_argument('--step1_checkpoint', type=str, required=True)
     parser.add_argument('--dim', type=int, default=256)
     parser.add_argument('--max_length', type=int, default=150)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--uncertainty_percentile', type=float, default=0.2, help='低置信度百分比')
-    parser.add_argument('--delta', type=float, default=None, help='距离阈值')
-    parser.add_argument('--delta_percentile', type=int, default=10, help='delta百分位数')
-    parser.add_argument('--output_dir', type=str,
-                        default=f'./step2_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
-                        help='输出目录')
+    parser.add_argument('--uncertainty_percentile', type=float, default=0.2)
+    parser.add_argument('--delta', type=float, default=None)
+    parser.add_argument('--delta_percentile', type=int, default=10)
+    parser.add_argument('--output_dir', type=str, default=f'./step2_results_{datetime.now().strftime("%H%M%S")}')
 
     args = parser.parse_args()
 

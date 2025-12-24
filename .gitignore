@@ -8,6 +8,8 @@ result/
 *.pth
 *.ckpt
 *.csv
+*.fasta
+*csv
 
 # 忽略 Python 编译缓存
 __pycache__/
