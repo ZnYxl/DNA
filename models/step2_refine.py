@@ -66,44 +66,72 @@ def split_confidence_by_percentile(strength, cluster_labels, p=0.2):
 
 def compute_cluster_centroids(embeddings, labels, high_conf_mask):
     """
-    ✅ 只用高置信度reads计算簇中心
-    
-    Args:
-        embeddings: (N, D) Step1的embedding
-        labels: (N,) 当前簇标签
-        high_conf_mask: (N,) bool, 高置信度mask
-    
-    Returns:
-        centroids: dict[label] -> (D,) 簇中心
-        cluster_sizes: dict[label] -> int 簇大小
+    ✅ [性能优化版] 快速计算簇中心
+    复杂度降低为 O(N)，适配 100万+ 数据量
     """
+    print(f"\n   🧮 正在快速计算簇中心 (Total Reads: {len(labels)})...")
+    
+    device = embeddings.device
+    
+    # 1. 过滤：只保留高置信度且非噪声的reads
+    # label >= 0 且 high_conf_mask 为 True
+    valid_mask = (labels >= 0) & high_conf_mask
+    
+    valid_embeddings = embeddings[valid_mask] # (M, D)
+    valid_labels = labels[valid_mask]         # (M,)
+    
+    if len(valid_labels) == 0:
+        print("   ⚠️ 没有有效的高置信度Reads用于计算中心")
+        return {}, {}
+
+    # 2. 获取所有出现的簇ID
+    unique_cluster_ids = torch.unique(valid_labels)
+    max_id = int(valid_labels.max().item())
+    
+    # 3. 初始化累加器 (使用 max_id + 1 大小的张量作为散列表)
+    # sum_embeddings[k] 存储簇 k 的向量和
+    sum_embeddings = torch.zeros(max_id + 1, embeddings.shape[1], device=device)
+    # count_reads[k] 存储簇 k 的数量
+    count_reads = torch.zeros(max_id + 1, device=device)
+    
+    # 4. 核心优化：使用 scatter_add 或 index_add_ (这里用 index_add_ 更通用)
+    # 将 valid_embeddings 加到对应的 sum_embeddings 行中
+    sum_embeddings.index_add_(0, valid_labels, valid_embeddings)
+    
+    # 计算计数 (加1.0)
+    ones = torch.ones_like(valid_labels, dtype=torch.float)
+    count_reads.index_add_(0, valid_labels, ones)
+    
+    # 5. 转换为字典输出 (保持原有接口兼容性)
     centroids = {}
     cluster_sizes = {}
     
-    unique_labels = torch.unique(labels)
-    valid_clusters = 0
+    valid_clusters_count = 0
     
-    for k in unique_labels:
-        if k < 0:  # 跳过噪声
-            continue
-        
-        # ✅ 只用高置信度reads
-        mask = (labels == k) & high_conf_mask
-        count = mask.sum().item()
-        
-        if count < 2:  # 至少2个高置信度reads
-            print(f"   ⚠️ 簇 {k}: 只有 {count} 个高置信度reads，跳过")
-            continue
-        
-        centroids[int(k.item())] = embeddings[mask].mean(dim=0)
-        cluster_sizes[int(k.item())] = count
-        valid_clusters += 1
+    # 将 Tensor 转回 CPU 处理字典 (因为此时 K 只有 10000，循环很快)
+    # 避免在 GPU 上做大规模字典操作
+    sum_emb_cpu = sum_embeddings.cpu()
+    counts_cpu = count_reads.cpu()
+    unique_ids_cpu = unique_cluster_ids.cpu().numpy()
     
-    print(f"\n   📍 簇中心统计:")
-    print(f"      有效簇数: {valid_clusters}/{len(unique_labels)-1}")  # -1排除噪声
+    for k in unique_ids_cpu:
+        count = counts_cpu[k].item()
+        if count < 2: # 保持你之前的逻辑：至少2个reads
+            continue
+            
+        # 计算平均值
+        centroid = sum_emb_cpu[k] / count
+        
+        centroids[int(k)] = centroid
+        cluster_sizes[int(k)] = int(count)
+        valid_clusters_count += 1
+        
+    print(f"   📍 簇中心计算完成:")
+    print(f"      有效簇数: {valid_clusters_count}")
     if cluster_sizes:
-        print(f"      平均簇大小: {sum(cluster_sizes.values())/len(cluster_sizes):.1f}")
-    
+        avg_size = sum(cluster_sizes.values()) / len(cluster_sizes)
+        print(f"      平均有效簇大小: {avg_size:.1f}")
+        
     return centroids, cluster_sizes
 
 def refine_low_confidence_reads(embeddings, labels, low_conf_mask, 

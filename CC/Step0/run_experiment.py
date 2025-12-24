@@ -7,9 +7,9 @@ import utils
 # ================= 实验配置 =================
 EXP_NAME = "Cluster_GT_Test"
 SEQ_LENGTH = 150
-NUM_CLUSTERS = 50       
-READS_PER_CLUSTER = 50  
-CLOVER_PROCESSES = 0    
+NUM_CLUSTERS = 10000      
+READS_PER_CLUSTER = 100 
+CLOVER_PROCESSES = 60
 REF_TYPE = "diverse" 
 # ===========================================
 
