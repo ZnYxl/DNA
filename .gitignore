@@ -2,10 +2,16 @@
 Dataset/
 data/
 iterative_results/
+CC/Step0/Experiments/
+result/
+*.txt
+*.pth
+*.ckpt
 
 # 忽略 Python 编译缓存
 __pycache__/
 *.pyc
+
 
 # 忽略日志和临时文件
 *.log

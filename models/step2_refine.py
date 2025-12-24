@@ -134,72 +134,87 @@ def compute_cluster_centroids(embeddings, labels, high_conf_mask):
         
     return centroids, cluster_sizes
 
-def refine_low_confidence_reads(embeddings, labels, low_conf_mask, 
-                                centroids, delta):
+def refine_low_confidence_reads(embeddings, labels, low_conf_mask, centroids, delta):
     """
-    ✅ Phase B: 簇修正（只处理低置信度reads）
-    低置信度reads重新分配或标记为噪声
-    
-    Args:
-        embeddings: (N, D)
-        labels: (N,) 当前标签
-        low_conf_mask: (N,) 低置信度mask
-        centroids: dict[label] -> (D,)
-        delta: float, 距离阈值
-    
-    Returns:
-        new_labels: (N,) 修正后的标签
-        noise_mask: (N,) bool, 新增噪声mask
-        stats: dict, 统计信息
+    ✅ [向量化优化版] 
+    使用矩阵运算替代双重循环，秒级完成 20万 x 1万 的匹配
     """
     new_labels = labels.clone()
     noise_mask = torch.zeros_like(labels, dtype=torch.bool)
     
-    # 统计信息
+    # 提取低置信度的 embeddings
+    low_conf_indices = torch.where(low_conf_mask)[0]
+    num_low_conf = len(low_conf_indices)
+    
+    if num_low_conf == 0:
+        return new_labels, noise_mask, {'reassigned': 0, 'marked_noise': 0, 'kept_unchanged': 0}
+
+    print(f"\n   🔄 正在批量修正 {num_low_conf} 个低置信度reads...")
+    
+    # 1. 准备簇中心矩阵
+    # 将字典转换为 tensor: (K, D)
+    sorted_cluster_ids = sorted(centroids.keys())
+    cluster_matrix = torch.stack([centroids[k] for k in sorted_cluster_ids]) # (K, D)
+    cluster_ids_tensor = torch.tensor(sorted_cluster_ids, device=embeddings.device) # (K,)
+    
+    # 2. 准备查询向量
+    query_embeddings = embeddings[low_conf_indices] # (M, D)
+    
+    # 3. 计算距离矩阵 (M, K)
+    # 为了防止显存爆炸 (如果 M*K 很大)，我们可以分块计算
+    # 20万 * 1万 * 4 bytes ≈ 8GB，如果你显存有24G，可以直接算。保险起见分块。
+    
+    batch_size = 5000 # 每次处理 5000 个 reads
     reassigned = 0
     marked_noise = 0
     
-    low_conf_indices = torch.where(low_conf_mask)[0]
-    
-    print(f"\n   🔄 只处理 {len(low_conf_indices)} 个低置信度reads...")
-    
-    for idx in low_conf_indices:
-        i = idx.item()
-        zi = embeddings[i]
+    for i in range(0, num_low_conf, batch_size):
+        end = min(i + batch_size, num_low_conf)
+        batch_queries = query_embeddings[i:end] # (B, D)
         
-        # 找最近的簇中心
-        best_k = None
-        best_dist = float('inf')
+        # 计算该批次到所有簇中心的距离 (B, K)
+        dists = torch.cdist(batch_queries, cluster_matrix)
         
-        for k, ck in centroids.items():
-            dist = torch.norm(zi - ck).item()
-            if dist < best_dist:
-                best_dist = dist
-                best_k = k
+        # 找到最近的簇
+        min_dists, min_indices = torch.min(dists, dim=1) # (B,)
         
-        # 决策规则
-        if best_k is not None and best_dist < delta:
-            # ✅ 重新分配到最近簇
-            if new_labels[i] != best_k:
-                reassigned += 1
-            new_labels[i] = best_k
-        else:
-            # ❌ 标记为噪声
-            new_labels[i] = -1
-            noise_mask[i] = True
-            marked_noise += 1
-    
+        # 获取对应的 Cluster ID
+        best_cluster_ids = cluster_ids_tensor[min_indices]
+        
+        # 决策
+        # 满足 delta 阈值
+        valid_mask = min_dists < delta
+        
+        # 当前批次在全局的索引
+        global_indices = low_conf_indices[i:end]
+        
+        # 1. 重新分配 (valid_mask 为 True 的部分)
+        valid_indices = global_indices[valid_mask]
+        new_assignments = best_cluster_ids[valid_mask]
+        
+        # 统计重新分配的数量 (标签发生变化的)
+        original_labels = labels[valid_indices]
+        reassigned += (original_labels != new_assignments).sum().item()
+        
+        new_labels[valid_indices] = new_assignments
+        
+        # 2. 标记噪声 (valid_mask 为 False 的部分)
+        noise_indices = global_indices[~valid_mask]
+        new_labels[noise_indices] = -1
+        noise_mask[noise_indices] = True
+        marked_noise += len(noise_indices)
+
     print(f"   ✅ 修正完成:")
     print(f"      重新分配: {reassigned}")
     print(f"      标记噪声: {marked_noise}")
-    print(f"      保持不变: {len(low_conf_indices) - reassigned - marked_noise}")
-    
+    print(f"      保持不变: {num_low_conf - reassigned - marked_noise}")
+
     stats = {
         'reassigned': reassigned,
         'marked_noise': marked_noise,
-        'kept_unchanged': len(low_conf_indices) - reassigned - marked_noise
+        'kept_unchanged': num_low_conf - reassigned - marked_noise
     }
-    
+
     return new_labels, noise_mask, stats
 
 def compute_adaptive_delta(embeddings, centroids, percentile=10):

@@ -288,61 +288,85 @@ class Step1Dataset(Dataset):
         }
 
 
-def create_cluster_balanced_sampler(dataset: Step1Dataset,
-                                    batch_size: int = 32,
+def create_cluster_balanced_sampler(dataset: Step1Dataset, 
+                                    batch_size: int = 32, 
                                     max_clusters_per_batch: int = 5) -> List[List[int]]:
     """
-    创建簇平衡的batch采样器
-    确保每个batch包含多个簇，但不会太多（避免内存爆炸）
+    ✅ 高性能版采样器：修复了百万级数据卡死的问题
     """
-    # 按Clover标签分组
+    print("   🔨 正在构建采样器 (快速版)...")
+    
+    # --- 优化点 1: 直接读取标签，不调用 dataset[idx] ---
+    # 我们直接访问 dataset 内部的 valid_indices 和 data_loader 的 labels
+    # 避免了 100万次 seq_to_onehot 的计算
+    
+    valid_indices = dataset.valid_indices
+    all_labels = dataset.data_loader.clover_labels
+    
     cluster_to_indices = defaultdict(list)
-    for idx in range(len(dataset)):
-        item = dataset[idx]
-        cluster_label = item['clover_label']
-        cluster_to_indices[cluster_label].append(idx)
+    
+    # 只需要遍历一次整数列表，非常快
+    for idx, real_idx in enumerate(valid_indices):
+        label = all_labels[real_idx]
+        cluster_to_indices[label].append(idx)
 
-    print(f"📊 簇分布 (Top 10):")
+    # --- 优化点 2: 预先打乱，避免 list.remove() ---
+    for cid in cluster_to_indices:
+        np.random.shuffle(cluster_to_indices[cid])
+    
+    # 使用指针记录每个簇取到了哪里
+    cluster_ptrs = {cid: 0 for cid in cluster_to_indices}
+    
+    # 统计信息
+    print(f"   📊 簇分布 (Top 5):")
     cluster_sizes = [(cid, len(indices)) for cid, indices in cluster_to_indices.items()]
     cluster_sizes.sort(key=lambda x: x[1], reverse=True)
+    for i, (cid, size) in enumerate(cluster_sizes[:5]):
+        print(f"      簇{cid}: {size}")
 
-    for i, (cid, size) in enumerate(cluster_sizes[:10]):  # 显示前10个最大的簇
-        print(f"   簇{cid}: {size} reads")
-    if len(cluster_sizes) > 10:
-        print(f"   ... 还有 {len(cluster_sizes) - 10} 个簇")
-
-    # 生成batch
+    # 生成 Batch
     batches = []
     cluster_ids = list(cluster_to_indices.keys())
     np.random.shuffle(cluster_ids)
-
-    while cluster_ids:
-        # 随机选择几个簇
-        num_clusters = min(max_clusters_per_batch, len(cluster_ids))
-        selected_clusters = np.random.choice(cluster_ids, size=num_clusters, replace=False)
-
-        # 从选中的簇中采样reads
+    
+    active_clusters = set(cluster_ids)
+    
+    while len(active_clusters) >= 1:
+        # 选取簇
+        current_candidates = list(active_clusters)
+        if not current_candidates: break
+        
+        num_to_select = min(max_clusters_per_batch, len(current_candidates))
+        selected_clusters = np.random.choice(current_candidates, size=num_to_select, replace=False)
+        
         batch_indices = []
+        reads_per_cluster = max(1, batch_size // num_to_select)
+        
         for cluster_id in selected_clusters:
-            cluster_indices = cluster_to_indices[cluster_id]
-
-            # 每个簇贡献的reads数量
-            reads_per_cluster = batch_size // num_clusters
-            sample_size = min(reads_per_cluster, len(cluster_indices))
-
-            if sample_size > 0:
-                sampled = np.random.choice(cluster_indices, size=sample_size, replace=False)
+            indices = cluster_to_indices[cluster_id]
+            ptr = cluster_ptrs[cluster_id]
+            
+            # 剩余可取数量
+            remaining = len(indices) - ptr
+            take = min(reads_per_cluster, remaining)
+            
+            if take > 0:
+                # 切片取数
+                sampled = indices[ptr : ptr + take]
                 batch_indices.extend(sampled)
-
-                # 移除已使用的indices
-                for idx in sampled:
-                    cluster_to_indices[cluster_id].remove(idx)
-
-        # 移除空簇
-        cluster_ids = [cid for cid in cluster_ids if len(cluster_to_indices[cid]) > 0]
-
+                
+                # 移动指针
+                cluster_ptrs[cluster_id] += take
+                
+                # 如果取完了，移除出活跃集合
+                if cluster_ptrs[cluster_id] >= len(indices):
+                    active_clusters.remove(cluster_id)
+            else:
+                if cluster_id in active_clusters:
+                    active_clusters.remove(cluster_id)
+        
         if batch_indices:
             batches.append(batch_indices)
-
-    print(f"📦 生成 {len(batches)} 个batch")
+            
+    print(f"   📦 生成 {len(batches)} 个Batch，准备就绪！")
     return batches

@@ -131,14 +131,19 @@ def run_step2(args):
     model.eval()
     print(f"   📊 模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
 
-    # ========== 2️⃣ 推理全部数据 ==========
+    # ========== 2️⃣ 推理全部数据 (批量优化版) ==========
     print("\n" + "=" * 60)
     print("🔮 Step1模型推理（提取embeddings + evidence）")
     print("=" * 60)
 
     try:
         dataset = Step1Dataset(data_loader, max_len=model_max_length)
-        print(f"   📊 数据集大小: {len(dataset)}")
+        # ✅ 使用 DataLoader 进行批量推理
+        # num_workers=4 可以利用你的多核CPU加速数据加载
+        inference_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=1024, shuffle=False, num_workers=4, pin_memory=True
+        )
+        print(f"   📊 数据集大小: {len(dataset)} | Batch Size: 1024")
     except Exception as e:
         print(f"   ❌ 数据集创建失败: {e}")
         return None
@@ -148,81 +153,64 @@ def run_step2(args):
     all_alpha = []
     all_evidence = []
     all_labels = []
-    all_read_ids = []
+    
+    # 只需要存 read_idx 用于后续对齐，或者直接按顺序
+    print(f"   🔄 开始批量推理...")
 
-    print(f"   🔄 开始推理 {len(dataset)} 条reads (强制 Padding 到 {model_max_length})...")
-
-    failed_count = 0
-    for idx in range(len(dataset)):
-        try:
-            item = dataset[idx]
-            reads = item['encoding'].unsqueeze(0).to(device)  # (1, L, 4)
-
-            # ================= 🔴 核心修复 2: 强制 Padding 🔴 =================
-            # 目标：确保 L == model_max_length，从而避开 length_adapter
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, batch_data in enumerate(inference_loader):
+            # 获取数据
+            reads = batch_data['encoding'].to(device) # (B, L, 4)
+            labels = batch_data['clover_label']       # list or tensor
+            
+            # ================= 强制 Padding (你的核心修复) =================
             curr_len = reads.shape[1]
             target_len = model_max_length
-
             if curr_len > target_len:
-                # 截断
                 reads = reads[:, :target_len, :]
             elif curr_len < target_len:
-                # 填充 (Pad)
-                # F.pad 参数格式 (最后维左, 最后维右, 倒数第二维左, 倒数第二维右...)
-                # 我们要填充的是第2维 (Length)，第3维 (Channel/4) 保持不变
                 pad_len = target_len - curr_len
-                # (0, 0) -> Channel 维度不填充
-                # (0, pad_len) -> Length 维度右侧填充
                 reads = F.pad(reads, (0, 0, 0, pad_len), "constant", 0)
-            
-            # 此时 reads.shape 必然是 (1, 150, 4)
             # ================================================================
 
-            # Step1推理
+            # 批量推理
             embeddings, pooled_emb = model.encode_reads(reads)
             evidence, strength, alpha = model.decode_to_evidence(embeddings)
 
-            # 检查输出形状
-            if torch.isnan(evidence).any() or torch.isnan(strength).any():
-                failed_count += 1
-                continue
+            # 收集结果 (转到CPU以节省显存)
+            all_embeddings.append(pooled_emb.cpu())
+            all_strength.append(strength.mean(dim=1).cpu())
+            all_alpha.append(alpha.cpu())
+            all_evidence.append(evidence.cpu())
+            
+            # 处理 labels (如果是tensor转list，或者直接extend)
+            if isinstance(labels, torch.Tensor):
+                all_labels.extend(labels.tolist())
+            else:
+                all_labels.extend(labels)
 
-            all_embeddings.append(pooled_emb.squeeze(0).cpu())
-            all_strength.append(strength.mean().cpu())
-            all_alpha.append(alpha.squeeze(0).cpu())
-            all_evidence.append(evidence.squeeze(0).cpu())
-            all_labels.append(item['clover_label'])
-            all_read_ids.append(idx)
-
-            if (idx + 1) % 1000 == 0:
-                print(f"      已处理: {idx + 1}/{len(dataset)} (失败: {failed_count})")
-
-        except Exception as e:
-            failed_count += 1
-            continue
+            if (batch_idx + 1) % 100 == 0:
+                print(f"      已处理 Batch: {batch_idx + 1}/{len(inference_loader)}")
 
     if len(all_embeddings) == 0:
         print(f"   ❌ 没有成功推理的reads！")
         return None
 
-    # 转换为张量
+    # 拼接结果
     try:
-        embeddings = torch.stack(all_embeddings).to(device)
-        strength = torch.stack(all_strength).to(device)
-        alpha = torch.stack(all_alpha).to(device)
-        evidence = torch.stack(all_evidence).to(device)
+        embeddings = torch.cat(all_embeddings, dim=0).to(device)
+        strength = torch.cat(all_strength, dim=0).to(device)
+        alpha = torch.cat(all_alpha, dim=0).to(device)
+        evidence = torch.cat(all_evidence, dim=0).to(device)
         labels = torch.tensor(all_labels, device=device)
 
         print(f"   ✅ 推理完成:")
-        print(f"      成功处理: {len(all_embeddings)}/{len(dataset)} reads")
+        print(f"      Total: {len(labels)} reads")
         print(f"      Embeddings: {embeddings.shape}")
-        print(f"      Evidence: {evidence.shape}")
-        print(f"      平均strength: {strength.mean():.4f}")
-
     except Exception as e:
-        print(f"   ❌ 张量转换失败: {e}")
+        print(f"   ❌ 拼接张量失败 (可能显存不足): {e}")
         return None
-
     # ========== 3️⃣ Phase A: 相对证据筛选 ==========
     print("\n" + "=" * 60)
     print("🔍 Phase A: 相对证据筛选（簇内比较）")
