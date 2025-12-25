@@ -1,12 +1,18 @@
 import os
-import argparse
 import numpy as np
 import glob
 from collections import Counter, defaultdict
+import multiprocessing
+from functools import partial
+import time
 
 # ==========================================
-# 1. 核心计算函数 (与您的 run_loop.py 保持一致)
+# 📝 【配置区域】修改这里即可！
 # ==========================================
+# 你的实验路径
+EXPERIMENT_DIR = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/20251224_155232_Cluster_GT_Test"
+# ==========================================
+
 def calculate_identity(seq1, seq2):
     """
     计算序列一致性 (Hamming 风格，简单匹配率)
@@ -15,6 +21,38 @@ def calculate_identity(seq1, seq2):
     L = min(len(seq1), len(seq2))
     matches = sum(1 for a, b in zip(seq1[:L], seq2[:L]) if a == b)
     return matches / max(len(seq1), len(seq2))
+
+def find_best_match_chunk(chunk_data, gt_seqs):
+    """
+    多进程子任务：为一批 Clover 序列找最佳 GT
+    chunk_data: list of (cid, c_seq)
+    gt_seqs: dict {gid: g_seq}
+    """
+    results = []
+    gt_items = list(gt_seqs.items())
+    
+    for cid, c_seq in chunk_data:
+        best_score = 0.0
+        best_gt_id = -1
+        
+        # 优化：先尝试直接对齐 (假设 ID 相同)
+        if cid in gt_seqs:
+            direct_score = calculate_identity(c_seq, gt_seqs[cid])
+            if direct_score > 0.8: # 剪枝
+                results.append({'clover_id': cid, 'gt_id': cid, 'identity': direct_score})
+                continue
+
+        # 全量搜索
+        for gid, g_seq in gt_items:
+            score = calculate_identity(c_seq, g_seq)
+            if score > best_score:
+                best_score = score
+                best_gt_id = gid
+            if score == 1.0: break
+        
+        results.append({'clover_id': cid, 'gt_id': best_gt_id, 'identity': best_score})
+    
+    return results
 
 class CloverEvaluator:
     def __init__(self, experiment_dir):
@@ -62,7 +100,7 @@ class CloverEvaluator:
 
     def load_clover_results(self):
         print("📂 3. 加载 Clover 结果...")
-        # 1. 加载 Reads (用于计算纯度，虽然后面没打印，但保留逻辑)
+        # 1. 加载 Reads
         read_path = os.path.join(self.feddna_dir, "read.txt")
         if os.path.exists(read_path):
             current_cluster = -1
@@ -78,7 +116,7 @@ class CloverEvaluator:
                             mid = next((i for i in pids if i in self.read_to_gt), pids[0])
                             self.clover_clusters[current_cluster].append(mid)
 
-        # 2. 加载中心序列 (用于计算 Identity) - 增强了解析逻辑
+        # 2. 加载中心序列
         center_files = glob.glob(os.path.join(self.feddna_dir, "*ref*.txt")) + \
                        glob.glob(os.path.join(self.feddna_dir, "*center*.txt"))
         
@@ -86,15 +124,12 @@ class CloverEvaluator:
             target_file = center_files[0]
             print(f"   - 发现中心序列文件: {os.path.basename(target_file)}")
             
-            # 先读取所有非空行
             with open(target_file, 'r') as f:
                 lines = [line.strip() for line in f if line.strip() and not line.startswith('=')]
             
-            # 检测是否包含 FASTA 头 (>)
             has_headers = any(line.startswith('>') for line in lines)
             
             if has_headers:
-                # 按照 FASTA 格式解析
                 current_id = 0
                 seq_buffer = []
                 for line in lines:
@@ -103,7 +138,6 @@ class CloverEvaluator:
                             self.clover_centers[current_id] = "".join(seq_buffer)
                             current_id += 1
                             seq_buffer = []
-                        # 尝试从 Header 解析 ID (例如 >Cluster_12)
                         try:
                             parts = line.split('_')
                             if len(parts) > 1:
@@ -112,14 +146,11 @@ class CloverEvaluator:
                             pass
                     else:
                         seq_buffer.append(line)
-                # 添加最后一条
                 if seq_buffer:
                     self.clover_centers[current_id] = "".join(seq_buffer)
             else:
-                # 按照纯序列解析 (每行一条)
                 print("   - 未检测到 Header，假设每行一条序列 (行号=ID)...")
                 for idx, line in enumerate(lines):
-                    # 过滤过短的噪声
                     if len(line) > 20: 
                         self.clover_centers[idx] = line
 
@@ -129,9 +160,7 @@ class CloverEvaluator:
 
     def evaluate_identity_smart(self):
         """
-        评估序列一致性 (以预测为中心)
-        遍历每一个 Clover 预测结果 -> 去 GT 里找最佳匹配 (Best Match)
-        分母 = Clover 预测出的簇数量
+        评估序列一致性 (多进程加速版)
         """
         print("\n📊 [Metric] Clover 序列一致性 (Pred -> GT Best Match)")
         
@@ -139,32 +168,33 @@ class CloverEvaluator:
             print("   ⚠️ 缺少 GT 或 Clover 数据，跳过。")
             return
 
-        matches = []
+        print(f"⚡ 启动多进程匹配 (CPU核心数: {multiprocessing.cpu_count()})...")
+        start_time = time.time()
+
+        # 准备数据分块
+        clover_items = list(self.clover_centers.items())
+        num_processes = min(64, multiprocessing.cpu_count())
+        chunk_size = len(clover_items) // num_processes + 1
+        chunks = [clover_items[i:i + chunk_size] for i in range(0, len(clover_items), chunk_size)]
+
+        # 并行计算
+        pool = multiprocessing.Pool(processes=num_processes)
+        func = partial(find_best_match_chunk, gt_seqs=self.gt_cluster_seqs)
         
-        # 遍历 Clover 的预测结果
-        for cid, c_seq in self.clover_centers.items():
-            best_score = 0.0
-            best_gt_id = -1
-            
-            # 在 GT 中寻找最相似的
-            for gid, g_seq in self.gt_cluster_seqs.items():
-                score = calculate_identity(c_seq, g_seq)
-                if score > best_score:
-                    best_score = score
-                    best_gt_id = gid
-            
-            matches.append({
-                'clover_id': cid,
-                'gt_id': best_gt_id,
-                'identity': best_score
-            })
+        matches = []
+        for res in pool.map(func, chunks):
+            matches.extend(res)
+        
+        pool.close()
+        pool.join()
+
+        print(f"✅ 匹配完成! 耗时: {time.time() - start_time:.1f}秒")
 
         # 统计结果
         identities = [m['identity'] for m in matches]
         avg_identity = np.mean(identities)
         perfect_matches = sum(1 for x in identities if x > 0.99)
         
-        # 打印前3名最佳匹配
         matches_sorted = sorted(matches, key=lambda x: x['identity'], reverse=True)
         print("\n   🔍 Clover 最佳匹配样例 (Top 3):")
         for m in matches_sorted[:3]:
@@ -177,11 +207,9 @@ class CloverEvaluator:
         print("-" * 40)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--experiment_dir', type=str, required=True)
-    args = parser.parse_args()
-    
-    eval = CloverEvaluator(args.experiment_dir)
+    # 直接实例化，无需 argparse
+    print(f"🚀 开始评估实验: {EXPERIMENT_DIR}")
+    eval = CloverEvaluator(EXPERIMENT_DIR)
     eval.load_ground_truth()
     eval.load_raw_reads_map()
     eval.load_clover_results()

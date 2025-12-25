@@ -2,12 +2,11 @@
 """
 Step2: Evidence-Guided Cluster Refinement
 核心：用Step1学到的证据强度来修正簇结构
-✅ 修复版：解决了 GPU/CPU 设备不匹配报错
-✅ 加速版：包含矩阵化修正算法
+✅ 修复版 v2：解决 "bitwise_and_cuda not implemented for Float" 报错
 """
 import torch
 import torch.nn.functional as F
-
+import random
 
 def split_confidence_by_percentile(strength, cluster_labels, p=0.2):
     """
@@ -17,14 +16,9 @@ def split_confidence_by_percentile(strength, cluster_labels, p=0.2):
     stats = {'processed_clusters': 0, 'skipped_clusters': 0, 'total_low_conf': 0}
 
     unique_labels = torch.unique(cluster_labels)
-    # 确保在CPU上打印进度，防止同步阻塞
-    unique_labels_cpu = unique_labels.cpu().numpy()
 
     print(f"   🎯 簇内相对筛选 (p={p:.1%}):")
 
-    # 简单统计一下，减少打印频率
-    processed_count = 0
-    
     for c in unique_labels:
         if c < 0: continue # 跳过噪声
 
@@ -43,7 +37,6 @@ def split_confidence_by_percentile(strength, cluster_labels, p=0.2):
 
         stats['total_low_conf'] += cluster_low_conf.sum().item()
         stats['processed_clusters'] += 1
-        processed_count += 1
         
     print(f"\n   📊 相对筛选结果:")
     print(f"      处理簇数: {stats['processed_clusters']}")
@@ -116,7 +109,6 @@ def refine_low_confidence_reads(embeddings, labels, low_conf_mask, centroids, de
     print(f"\n   🔄 正在批量修正 {num_low_conf} 个低置信度reads (Matrix Mode)...")
     
     # 1. 准备簇中心矩阵 (并移动到 GPU!)
-    # ⚠️ 修复点：.to(embeddings.device)
     sorted_cluster_ids = sorted(centroids.keys())
     if not sorted_cluster_ids:
         print("   ⚠️ 没有有效的簇中心，跳过修正")
@@ -130,7 +122,6 @@ def refine_low_confidence_reads(embeddings, labels, low_conf_mask, centroids, de
     query_embeddings = embeddings[low_conf_indices] # (M, D)
     
     # 3. 分块计算距离矩阵 (防止显存爆炸)
-    # 20万 * 1万 的矩阵如果一次算可能爆显存，分批算比较稳
     batch_size = 5000 
     reassigned = 0
     marked_noise = 0
@@ -140,7 +131,6 @@ def refine_low_confidence_reads(embeddings, labels, low_conf_mask, centroids, de
         batch_queries = query_embeddings[i:end] # (B, D)
         
         # 计算距离 (B, K)
-        # 此时 batch_queries 和 cluster_matrix 都在 GPU 上，不会报错了
         dists = torch.cdist(batch_queries, cluster_matrix)
         
         # 找最近
@@ -187,53 +177,16 @@ def compute_adaptive_delta(embeddings, centroids, percentile=10):
     """
     ✅ [修复版] 自适应计算 Delta
     """
-    all_distances = []
     device = embeddings.device
-    
-    # 抽样计算以节省时间 (可选)
-    # 如果簇太多，可以只算一部分，这里先全算
-    
     print(f"   🎯 计算自适应 Delta (Percentile={percentile})...")
     
-    # ⚠️ 修复点：循环中把 ck 移到 GPU
-    for k, ck in centroids.items():
-        ck_gpu = ck.to(device) # CPU -> GPU
-        
-        # 这里为了省显存，可以只算该簇内部的距离，或者简单的采样
-        # 既然是计算 delta 阈值，我们计算 "Embedding 到其所属簇中心" 的距离分布
-        # 但这里为了简单，我们计算所有 Embeddings 到所有 Centroids 的距离太慢了
-        # 通常做法：只计算 Embeddings 到其 **当前所属簇** 的距离分布
-        pass 
-    
-    # ⚠️ 优化逻辑：
-    # 上面的循环逻辑在 100万数据下太慢了。
-    # 我们改用更高效的方法：只计算 "High Confidence Reads" 到 "自己簇中心" 的距离
-    # 作为基准分布。
-    
-    # 由于函数接口限制，我们这里用一种简化的鲁棒方法：
-    # 直接取 refine_low_confidence_reads 里的那种分块矩阵计算太重了。
-    # 我们假设：Delta 应该由 "高置信度样本的内聚程度" 决定。
-    
-    # 这里为了不改动太多逻辑，我们用一个固定值或者简单的启发式值
-    # 如果你之前没有特别调这个，返回一个经验值可能更稳
-    # 但为了修复报错，我们还是写一个能跑通的逻辑：
-    
-    # 【临时方案】为了不卡死，我们返回一个基于维度的经验值，
-    # 或者你需要确保 embeddings 和 ck 在同一设备。
-    
-    # 正确做法：
-    # 既然我们要算“距离阈值”，不如直接取 0.5 (归一化后的常见值) 
-    # 或者如果你坚持要算，请确保 .to(device)
-    
-    # 这里我给一个能够快速运行的近似实现：
+    # 优化逻辑：只采样 100 个簇来计算阈值，避免 100 万次计算卡死
     sample_dists = []
-    import random
     sampled_keys = random.sample(list(centroids.keys()), min(100, len(centroids)))
     
     for k in sampled_keys:
         ck_gpu = centroids[k].to(device)
-        # 随机采 100 个 embedding 算一下距离分布（作为背景噪声参考）
-        # 这是一个粗略估计
+        # 随机采 100 个 embedding 算一下距离分布
         indices = torch.randint(0, len(embeddings), (100,), device=device)
         dists = torch.norm(embeddings[indices] - ck_gpu.unsqueeze(0), dim=1)
         sample_dists.append(dists)
@@ -243,3 +196,80 @@ def compute_adaptive_delta(embeddings, centroids, percentile=10):
 
     print(f"   🎯 自适应delta: {delta:.4f}")
     return delta
+
+
+def merge_similar_clusters(embeddings, labels, centroids, merge_threshold=0.1):
+    """
+    ✅ [修复版] 强力合并
+    修复了 'bitwise_and_cuda' not implemented for 'Float' 报错
+    """
+    print(f"\n   🧲 开始执行簇合并 (阈值={merge_threshold})...")
+    device = embeddings.device
+    
+    # 1. 准备数据
+    sorted_ids = sorted(list(centroids.keys()))
+    if len(sorted_ids) < 2: return labels, {}
+    
+    # 转为 Tensor 矩阵
+    center_matrix = torch.stack([centroids[k] for k in sorted_ids]).to(device) # (K, D)
+    
+    # 2. 计算两两距离 (K, K)
+    dists = torch.cdist(center_matrix, center_matrix)
+    
+    # 排除自身 (设为无穷大)
+    eye_mask = torch.eye(len(sorted_ids), device=device).bool()
+    dists.masked_fill_(eye_mask, float('inf'))
+    
+    # 3. 贪婪合并策略
+    merge_map = {} # old_id -> new_id
+    
+    # 🔴 关键修复：强制将上三角掩码转为 bool 类型
+    # 原代码: torch.triu(torch.ones_like(dists), diagonal=1) -> Float
+    # 新代码: torch.triu(torch.ones_like(dists, dtype=torch.bool), diagonal=1) -> Bool
+    
+    upper_tri_mask = torch.triu(torch.ones_like(dists, dtype=torch.bool), diagonal=1)
+    
+    # 获取满足条件的索引
+    pairs = torch.nonzero((dists < merge_threshold) & upper_tri_mask)
+    
+    # 按距离从小到大排序，优先合并最近的
+    if len(pairs) > 0:
+        pair_dists = dists[pairs[:, 0], pairs[:, 1]]
+        sorted_idx = torch.argsort(pair_dists)
+        pairs = pairs[sorted_idx]
+    
+    merge_count = 0
+    
+    for idx in range(len(pairs)):
+        i, j = pairs[idx].tolist()
+        id_a, id_b = sorted_ids[i], sorted_ids[j]
+        
+        # 检查是否已经被合并过
+        root_a = id_a
+        while root_a in merge_map: root_a = merge_map[root_a]
+        
+        root_b = id_b
+        while root_b in merge_map: root_b = merge_map[root_b]
+        
+        if root_a != root_b:
+            # 总是把大的 ID 合并到小的 ID (保持稳定)
+            target = min(root_a, root_b)
+            source = max(root_a, root_b)
+            merge_map[source] = target
+            merge_count += 1
+            
+    print(f"      发现 {merge_count} 对相似簇需要合并")
+    
+    if merge_count == 0:
+        return labels, {}
+
+    # 4. 执行合并 (更新 Labels)
+    new_labels = labels.clone()
+    
+    # 批量更新
+    for src, dst in merge_map.items():
+        mask = (labels == src)
+        new_labels[mask] = dst
+        
+    print(f"   ✅ 合并完成！簇数量: {len(sorted_ids)} -> {len(sorted_ids) - merge_count}")
+    return new_labels, merge_map
