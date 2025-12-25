@@ -3,10 +3,11 @@
 Step2 主入口：Evidence-Guided Refinement & Decoding
 关键：不训练，只推理+决策
 ✅ 相对不确定性原则：簇内比较，偏向确定性
-✅ 修复版 v4 (Import Fix)：
-   1. 修复 NameError: 增加了 merge_similar_clusters 的导入
-   2. 包含 强力簇合并 (Phase B+)
-   3. 包含 数据对齐修复
+✅ 修复版 v3 (最终版)：
+   1. 🌟 数据对齐修复：输出标签数量严格等于原始 Reads 数量 (解决 Mismatch 报错)
+   2. 包含 length_adapter 权重预加载修复
+   3. 包含 强制 Padding 逻辑
+   4. 包含 DataLoader 多进程批量推理加速
 """
 import torch
 import torch.nn as nn
@@ -28,8 +29,7 @@ from models.step2_refine import (
     split_confidence_by_percentile,
     compute_cluster_centroids,
     refine_low_confidence_reads,
-    compute_adaptive_delta,
-    merge_similar_clusters  # ✅ 关键修复：补上了这个导入！
+    compute_adaptive_delta
 )
 from models.step2_decode import (
     decode_cluster_consensus,
@@ -40,7 +40,7 @@ from models.step2_decode import (
 @torch.no_grad()
 def run_step2(args):
     """
-    Step2主流程：推理 -> 修正 -> 合并 -> 解码 -> 对齐保存
+    Step2主流程：推理 -> 修正 -> 解码 -> 对齐保存
     """
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"🖥️ 使用设备: {device}")
@@ -66,10 +66,10 @@ def run_step2(args):
         model_dim = args.dim
         model_max_length = args.max_length
 
-    # ✅ 重建数据加载器 & 获取总数
+    # ✅ 重建数据加载器 & 获取总数 (关键修复)
     try:
         data_loader = CloverDataLoader(args.experiment_dir)
-        TOTAL_READS_COUNT = len(data_loader.reads)
+        TOTAL_READS_COUNT = len(data_loader.reads)  # 🌟 必须获取原始总数
         num_clusters = len(set(data_loader.clover_labels))
         print(f"   📊 数据统计: {TOTAL_READS_COUNT} 总Reads, {num_clusters} 簇")
     except Exception as e:
@@ -88,7 +88,7 @@ def run_step2(args):
         print(f"   ❌ 模型创建失败: {e}")
         return None
 
-    # ✅ 预加载 length_adapter
+    # ✅ 修复: 权重预加载 (length_adapter)
     try:
         state_dict = checkpoint['model_state_dict']
         if 'length_adapter.weight' in state_dict:
@@ -108,7 +108,9 @@ def run_step2(args):
     print("=" * 60)
 
     try:
+        # 注意：Step1Dataset 可能会过滤掉 -1 的数据，所以 len(dataset) <= TOTAL_READS_COUNT
         dataset = Step1Dataset(data_loader, max_len=model_max_length)
+        
         # 使用 DataLoader 加速
         inference_loader = torch.utils.data.DataLoader(
             dataset, batch_size=1024, shuffle=False, num_workers=4, pin_memory=True
@@ -123,16 +125,16 @@ def run_step2(args):
     all_alpha = []
     all_evidence = []
     all_labels = []
-    all_real_indices = []
+    all_real_indices = []  # 🌟 记录真实索引
 
     print(f"   🔄 开始推理...")
 
     for batch_idx, batch_data in enumerate(inference_loader):
-        reads = batch_data['encoding'].to(device)
+        reads = batch_data['encoding'].to(device) # (B, L, 4)
         labels = batch_data['clover_label']
-        read_indices = batch_data['read_idx']
+        read_indices = batch_data['read_idx']     # (B,) 获取原始索引
 
-        # 强制 Padding
+        # 🌟 强制 Padding 逻辑
         curr_len = reads.shape[1]
         target_len = model_max_length
         if curr_len > target_len:
@@ -141,15 +143,17 @@ def run_step2(args):
             pad_len = target_len - curr_len
             reads = F.pad(reads, (0, 0, 0, pad_len), "constant", 0)
 
+        # 推理
         with torch.no_grad():
             embeddings, pooled_emb = model.encode_reads(reads)
             evidence, strength, alpha = model.decode_to_evidence(embeddings)
 
+        # 收集结果
         all_embeddings.append(pooled_emb.cpu())
         all_strength.append(strength.mean(dim=1).cpu())
         all_alpha.append(alpha.cpu())
         all_evidence.append(evidence.cpu())
-        all_real_indices.append(read_indices)
+        all_real_indices.append(read_indices) # 记录索引
 
         if isinstance(labels, torch.Tensor):
             all_labels.extend(labels.tolist())
@@ -169,6 +173,8 @@ def run_step2(args):
     alpha = torch.cat(all_alpha, dim=0).to(device)
     evidence = torch.cat(all_evidence, dim=0).to(device)
     labels = torch.tensor(all_labels, device=device)
+    
+    # 🌟 拼接所有索引
     flat_real_indices = torch.cat(all_real_indices).numpy()
 
     print(f"\n   ✅ 推理完成. 张量形状: {embeddings.shape}")
@@ -199,29 +205,10 @@ def run_step2(args):
     else:
         delta = args.delta
     
+    # new_labels 的长度 = len(dataset) (即有效reads的数量)
     new_labels, noise_mask, refine_stats = refine_low_confidence_reads(
         embeddings, labels, low_conf_mask, centroids, delta
     )
-
-    # ============================================================
-    # 🆕 Phase B+: 强力簇合并 (Merge Similar Clusters)
-    # ============================================================
-    print("\n" + "=" * 60)
-    print("🧲 Phase B+: 簇合并 (Merge Similar Clusters)")
-    print("=" * 60)
-    
-    # 1. 基于修正后的 labels 重新计算中心
-    centroids_for_merge, _ = compute_cluster_centroids(
-        embeddings, new_labels, high_conf_mask
-    )
-    
-    # 2. 执行合并
-    merge_thresh = delta * 0.8 if delta else 0.5
-    
-    new_labels, merge_info = merge_similar_clusters(
-        embeddings, new_labels, centroids_for_merge, merge_threshold=merge_thresh
-    )
-    # ============================================================
 
     # ========== 5️⃣ Phase C: Consensus ==========
     print("\n" + "=" * 60)
@@ -236,7 +223,7 @@ def run_step2(args):
     consensus_path = os.path.join(args.output_dir, "consensus_sequences.fasta")
     save_consensus_sequences(consensus_dict, consensus_path)
 
-    # ========== 6️⃣ 准备下一轮迭代的数据 ==========
+    # ========== 6️⃣ 准备下一轮迭代的数据 (🌟核心修复) ==========
     print("\n" + "=" * 60)
     print("🔄 准备下一轮 (Next Round) 数据 - 对齐修复")
     print("=" * 60)
@@ -246,21 +233,27 @@ def run_step2(args):
     timestamp_id = datetime.now().strftime("%H%M%S")
     label_save_path = os.path.join(next_round_dir, f"refined_labels_{timestamp_id}.txt")
 
-    # 还原到全长数组
+    # 🌟 关键逻辑：还原到全长数组
+    # 1. 创建全长数组，默认填 -1 (噪声)
     full_refined_labels = np.full(TOTAL_READS_COUNT, -1, dtype=int)
+    
+    # 2. 将修正后的 new_labels 填入对应的原始位置
+    # new_labels 是 Tensor (N_valid,), flat_real_indices 是 numpy (N_valid,)
     current_refined_labels = new_labels.cpu().numpy()
     
+    # 安全检查
     if len(flat_real_indices) != len(current_refined_labels):
         print(f"   ❌ 严重错误: 索引数量与标签数量不一致!")
         return None
         
     full_refined_labels[flat_real_indices] = current_refined_labels
     
+    # 3. 保存全长文件
     np.savetxt(label_save_path, full_refined_labels, fmt='%d')
     
     print(f"   📝 修正标签已保存: {label_save_path}")
     print(f"      - 原始Reads总数: {TOTAL_READS_COUNT}")
-    print(f"      - 保存标签总数: {len(full_refined_labels)}")
+    print(f"      - 保存标签总数: {len(full_refined_labels)} (必须一致)")
     print(f"      - 有效修正数: {len(current_refined_labels)}")
     print(f"      - 自动标记噪声(-1): {TOTAL_READS_COUNT - len(current_refined_labels)}")
 

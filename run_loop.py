@@ -9,6 +9,7 @@ import numpy as np
 from models.step1_train import train_step1
 from models.step2_runner import run_step2
 from models.step1_data import CloverDataLoader
+from utils.deduplicate import run_deduplication
 
 # ================= 配置区域 =================
 # 1. 只需要修改这里的输入路径，输出路径会自动跟随
@@ -178,6 +179,29 @@ def run_loop():
         else: 
             print("❌ 未找到新生成的标签文件，迭代停止。")
             break
+
+    # ==========================================
+    # 🏁 循环结束，执行最终后处理 (Post-Processing)
+    # ==========================================
+    print(f"\n{'='*60}")
+    print(f"🎉 所有迭代训练完成! 开始最终后处理 (Deduplication)")
+    print(f"{'='*60}")
+    
+    # 1. 找到最后一轮的输出文件
+    final_round_dir = os.path.join(CONFIG['base_output_dir'], f"round_{CONFIG['max_rounds']}")
+    raw_consensus = os.path.join(final_round_dir, "step2", "consensus_sequences.fasta")
+    
+    # 2. 定义去重后的文件路径
+    merged_consensus = os.path.join(final_round_dir, "step2", "consensus_deduplicated.fasta")
+    
+    # 3. 执行去重
+    if os.path.exists(raw_consensus):
+        run_deduplication(raw_consensus, merged_consensus)
+        
+        print(f"\n💡 提示: 请使用新的文件进行 verify_final 验证:")
+        print(f"   python verify_final.py --pred {merged_consensus}")
+    else:
+        print("❌ 未找到最终轮次的 consensus 文件，跳过去重。")
 
 if __name__ == "__main__":
     run_loop()
