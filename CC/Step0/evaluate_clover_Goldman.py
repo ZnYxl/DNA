@@ -6,11 +6,11 @@ from collections import defaultdict, Counter
 # ================= 配置区域 =================
 # 1. 原始带标签的数据文件 (Ground Truth)
 # Goldman 数据集的真实标签文件
-GT_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/给师妹的clover数据集/now_goldman_tags_reads.txt"
+GT_FILE = "给师妹的clover数据集/now_goldman_tags_reads.txt"
 
 # 2. Clover 聚类输出文件 (Prediction)
 # 对应 run_real_data_Goldman.py 生成的输出位置
-CLOVER_OUT_FILE = "./Experiments/Goldman_Real/02_CloverOut/clover_result.txt"
+CLOVER_OUT_FILE = "/hy-tmp/code/CC/Step0/Experiments/Goldman_Real/02_CloverOut/clover_result_merged.txt"
 
 # ===========================================
 

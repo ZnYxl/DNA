@@ -7,7 +7,7 @@ from collections import defaultdict
 
 # ================= 实验配置 =================
 DATASET_NAME = "Goldman"
-SOURCE_DIR = "/mnt/st_data/liangxinyi/code/CC/Step0/给师妹的clover数据集"
+SOURCE_DIR = "给师妹的clover数据集"
 SEQ_LENGTH = 117
 CHUNK_SIZE = 5000000  
 CLOVER_PROCESSES = 0  

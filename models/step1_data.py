@@ -194,13 +194,29 @@ def seq_to_onehot(seq: str, max_len: int = 150) -> torch.Tensor:
 
 
 class Step1Dataset(Dataset):
-    def __init__(self, data_loader: CloverDataLoader, max_len: int = 150):
+    def __init__(self, data_loader: CloverDataLoader, max_len: int = 150, training_cap: int = 200000):
+        """
+        training_cap: 限制参与训练的最大样本数 (默认 20万，足够了)
+        """
         self.data_loader = data_loader
         self.max_len = max_len
-        self.valid_indices = [i for i, label in enumerate(data_loader.clover_labels) if label >= 0]
-
+        
+        # 1. 获取所有有效索引
+        full_valid_indices = [i for i, label in enumerate(data_loader.clover_labels) if label >= 0]
+        
+        # 2. 随机降采样 (Downsampling) —— 救命的关键！
+        # 如果数据量太大，我们只随机取一部分来训练 Step 1
+        if len(full_valid_indices) > training_cap:
+            print(f"   ⚠️ 数据量巨大 ({len(full_valid_indices)}), 启用降采样训练...")
+            # 固定随机种子以便复现
+            np.random.seed(42) 
+            self.valid_indices = np.random.choice(full_valid_indices, training_cap, replace=False).tolist()
+            print(f"   📉 降采样后训练样本数: {len(self.valid_indices)} (Step 1 足够了)")
+        else:
+            self.valid_indices = full_valid_indices
+            
         print(f"📊 Dataset统计:")
-        print(f"   - 有效reads (Label != -1): {len(self.valid_indices)}/{len(data_loader.reads)}")
+        print(f"   - 实际参与训练: {len(self.valid_indices)}/{len(data_loader.reads)}")
 
     def __len__(self):
         return len(self.valid_indices)

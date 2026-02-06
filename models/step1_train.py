@@ -35,7 +35,7 @@ from models.step1_visualizer import Step1Visualizer
 # ---------------------------------------------------------------------------
 # Hot Start 超参
 # ---------------------------------------------------------------------------
-ROUND1_EPOCHS = 20
+ROUND1_EPOCHS = 5
 ROUND1_LR     = 1e-4
 ROUND2_EPOCHS = 10
 ROUND2_LR     = 1e-5
@@ -172,7 +172,7 @@ def train_step1(args):
         train_loader  = torch.utils.data.DataLoader(
             dataset,
             batch_sampler=batch_sampler,
-            num_workers=8,
+            num_workers=4,
             pin_memory=True
         )
 
