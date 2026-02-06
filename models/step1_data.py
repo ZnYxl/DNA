@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List, Tuple, Optional
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, deque  # ✅ 新增 deque
 
 
 class CloverDataLoader:
@@ -14,30 +14,26 @@ class CloverDataLoader:
     """
 
     def __init__(self, experiment_dir: str, labels_path: str = None):
-        """
-        Args:
-            experiment_dir: 实验目录
-            labels_path: (可选) 上一轮生成的 refined_labels.txt 路径
-                         如果不传，默认加载 03_FedDNA_In/read.txt 里的原始标签
-        """
         self.experiment_dir = experiment_dir
         self.raw_dir = os.path.join(experiment_dir, "01_RawData")
-        self.feddna_dir = os.path.join(experiment_dir, "03_FedDNA_In")
-        self.labels_path = labels_path  # ✅ 保存外部标签路径
 
-        # 数据存储
+        feddna_subdir = os.path.join(experiment_dir, "03_FedDNA_In")
+        if os.path.exists(feddna_subdir):
+            self.feddna_dir = feddna_subdir
+        else:
+            self.feddna_dir = experiment_dir
+            print(f"   ℹ️ 使用非标准目录结构 (read.txt 直接在根目录)")
+
+        self.labels_path = labels_path
+
         self.reads: List[str] = []
-        self.clover_labels: List[int] = []  # Clover聚类结果 (会被 refined labels 覆盖)
-        self.gt_labels: List[int] = []  # Ground Truth标签
-        self.gt_cluster_seqs: Dict[int, str] = {}  # GT簇的参考序列
+        self.clover_labels: List[int] = []
+        self.gt_labels: List[int] = []
+        self.gt_cluster_seqs: Dict[int, str] = {}
 
         self._load_all_data()
 
     def _load_feddna_format(self) -> Tuple[List[str], List[int]]:
-        """
-        加载FedDNA格式数据 (read.txt)
-        格式：按簇分组，用=======分隔
-        """
         read_path = os.path.join(self.feddna_dir, "read.txt")
 
         if not os.path.exists(read_path):
@@ -45,7 +41,7 @@ class CloverDataLoader:
 
         reads = []
         labels = []
-        current_cluster = -1  # 从-1开始，第一个分隔符后变成0
+        current_cluster = -1
 
         print(f"📂 加载FedDNA格式数据: {read_path}")
 
@@ -54,12 +50,9 @@ class CloverDataLoader:
                 line = line.strip()
                 if not line:
                     continue
-
-                # 检测分隔符
                 if line.startswith("====="):
                     current_cluster += 1
                 else:
-                    # 这是一个read序列
                     reads.append(line)
                     labels.append(current_cluster)
 
@@ -67,12 +60,7 @@ class CloverDataLoader:
         return reads, labels
 
     def _load_raw_reads(self) -> Dict[str, str]:
-        """
-        加载原始reads: raw_reads.txt
-        格式: Read_ID \t Sequence
-        """
         raw_path = os.path.join(self.raw_dir, "raw_reads.txt")
-
         if not os.path.exists(raw_path):
             print(f"   ⚠️ raw_reads.txt 不存在")
             return {}
@@ -88,52 +76,36 @@ class CloverDataLoader:
         return reads_dict
 
     def _load_read_gt(self) -> Dict[str, Tuple[int, str, str]]:
-        """
-        加载Read级别GT: ground_truth_reads.txt
-        格式: Read_ID \t Cluster_ID \t Ref_Seq \t Quality
-        """
         gt_path = os.path.join(self.raw_dir, "ground_truth_reads.txt")
-
         if not os.path.exists(gt_path):
             print(f"   ⚠️ ground_truth_reads.txt 不存在")
             return {}
 
         gt_dict = {}
         with open(gt_path, 'r') as f:
-            header = f.readline()  # 跳过表头
+            header = f.readline()
             for line in f:
                 parts = line.strip().split('\t')
                 if len(parts) >= 4:
-                    read_id = parts[0]
-                    cluster_id = int(parts[1])
-                    ref_seq = parts[2]
-                    quality = parts[3]
-                    gt_dict[read_id] = (cluster_id, ref_seq, quality)
+                    gt_dict[parts[0]] = (int(parts[1]), parts[2], parts[3])
 
         print(f"   ✅ 加载 {len(gt_dict)} 条Read-Level GT")
         return gt_dict
 
     def _load_cluster_gt(self) -> Dict[int, str]:
-        """
-        加载Cluster级别GT: ground_truth_clusters.txt
-        格式: Cluster_ID \t Ref_Seq
-        """
         gt_path = os.path.join(self.raw_dir, "ground_truth_clusters.txt")
-
         if not os.path.exists(gt_path):
             print(f"   ⚠️ ground_truth_clusters.txt 不存在")
             return {}
 
         gt_dict = {}
         with open(gt_path, 'r') as f:
-            header = f.readline()  # 跳过表头
+            header = f.readline()
             for line in f:
                 parts = line.strip().split('\t')
                 if len(parts) >= 2:
                     try:
-                        cluster_id = int(parts[0])
-                        ref_seq = parts[1]
-                        gt_dict[cluster_id] = ref_seq
+                        gt_dict[int(parts[0])] = parts[1]
                     except ValueError:
                         continue
 
@@ -143,11 +115,6 @@ class CloverDataLoader:
     def _build_gt_mapping(self, feddna_reads: List[str],
                           raw_reads: Dict[str, str],
                           read_gt: Dict[str, Tuple[int, str, str]]) -> List[int]:
-        """
-        建立FedDNA reads到GT标签的映射
-        通过序列匹配找到每个read对应的GT簇ID
-        """
-        # 反向映射：sequence -> read_id
         seq_to_id = {seq: rid for rid, seq in raw_reads.items()}
 
         gt_labels = []
@@ -157,8 +124,7 @@ class CloverDataLoader:
             if seq in seq_to_id:
                 read_id = seq_to_id[seq]
                 if read_id in read_gt:
-                    gt_cluster_id = read_gt[read_id][0]
-                    gt_labels.append(gt_cluster_id)
+                    gt_labels.append(read_gt[read_id][0])
                     matched += 1
                 else:
                     gt_labels.append(-1)
@@ -169,35 +135,26 @@ class CloverDataLoader:
         return gt_labels
 
     def _load_all_data(self):
-        """加载所有数据"""
         print("\n" + "=" * 60)
         print("📂 加载实验数据")
         print("=" * 60)
 
-        # 1. 加载FedDNA格式的reads和Clover标签 (作为基础)
         self.reads, initial_labels = self._load_feddna_format()
 
-        # =========================================================
-        # ✅ 核心修改：尝试加载 Refined Labels (用于迭代训练)
-        # =========================================================
         if self.labels_path and os.path.exists(self.labels_path):
             print(f"\n🔄 [Iterative] 正在加载 Refined Labels: {self.labels_path}")
             try:
-                # 假设 refined_labels.txt 是纯数字，每行一个 label
-                # 使用 numpy 读取，因为它是最稳健的
                 refined_labels = np.loadtxt(self.labels_path, dtype=int).tolist()
 
                 if len(refined_labels) == len(self.reads):
                     self.clover_labels = refined_labels
                     print(f"   ✅ 成功覆盖标签: {len(self.clover_labels)} 条")
 
-                    # 统计一下变化 (监控迭代效果)
                     changes = sum(1 for x, y in zip(initial_labels, refined_labels) if x != y)
-                    print(f"   📉 与初始Clover相比变化数: {changes} ({(changes/len(initial_labels))*100:.1f}%)")
-                    
-                    # 统计噪声比例
+                    print(f"   📉 与初始Clover相比变化数: {changes} ({changes / len(initial_labels) * 100:.1f}%)")
+
                     noise_count = sum(1 for l in refined_labels if l == -1)
-                    print(f"   🗑️ 当前噪声Reads数: {noise_count} ({(noise_count/len(refined_labels))*100:.1f}%)")
+                    print(f"   🗑️ 当前噪声Reads数: {noise_count} ({noise_count / len(refined_labels) * 100:.1f}%)")
                 else:
                     print(f"   ❌ 标签数量不匹配! Reads: {len(self.reads)}, Labels: {len(refined_labels)}")
                     print("   ⚠️ 回退使用初始 Clover 标签")
@@ -207,17 +164,14 @@ class CloverDataLoader:
                 print("   ⚠️ 回退使用初始 Clover 标签")
                 self.clover_labels = initial_labels
         else:
-            # 默认情况：使用原始 Clover 标签
             self.clover_labels = initial_labels
             if self.labels_path:
                 print(f"   ⚠️ 指定的标签文件不存在: {self.labels_path}，已回退到默认")
 
-        # 2. 加载原始数据和GT
         raw_reads = self._load_raw_reads()
         read_gt = self._load_read_gt()
         self.gt_cluster_seqs = self._load_cluster_gt()
 
-        # 3. 建立GT映射
         if raw_reads and read_gt:
             self.gt_labels = self._build_gt_mapping(self.reads, raw_reads, read_gt)
         else:
@@ -227,146 +181,234 @@ class CloverDataLoader:
         print(f"\n📊 数据摘要:")
         print(f"   - 总reads: {len(self.reads)}")
         print(f"   - 当前使用簇数: {len(set(self.clover_labels))}")
-        print(f"   - GT簇数: {len(self.gt_cluster_seqs)}")
-        print(f"   - 序列长度范围: {min(len(r) for r in self.reads)} - {max(len(r) for r in self.reads)}")
 
 
 def seq_to_onehot(seq: str, max_len: int = 150) -> torch.Tensor:
-    """DNA序列转one-hot编码"""
-    base_to_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 0}  # N当作A处理
-
-    # 填充或截断到最大长度
+    base_to_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 0}
     seq_padded = seq.ljust(max_len, 'N')[:max_len]
-
-    # 转换为索引
     indices = [base_to_idx.get(base.upper(), 0) for base in seq_padded]
-
-    # 转one-hot
     onehot = torch.zeros(max_len, 4)
     for i, idx in enumerate(indices):
         onehot[i, idx] = 1.0
-
     return onehot
 
 
 class Step1Dataset(Dataset):
-    """
-    步骤一的数据集
-    """
-
     def __init__(self, data_loader: CloverDataLoader, max_len: int = 150):
         self.data_loader = data_loader
         self.max_len = max_len
-
-        # 过滤掉噪声reads (Clover标签为-1的)
-        # 注意：这里的 self.data_loader.clover_labels 可能已经是 refined 过的标签了
         self.valid_indices = [i for i, label in enumerate(data_loader.clover_labels) if label >= 0]
 
         print(f"📊 Dataset统计:")
         print(f"   - 有效reads (Label != -1): {len(self.valid_indices)}/{len(data_loader.reads)}")
-        print(f"   - 噪声reads (被过滤): {len(data_loader.reads) - len(self.valid_indices)}")
 
     def __len__(self):
         return len(self.valid_indices)
 
     def __getitem__(self, idx):
         real_idx = self.valid_indices[idx]
-
         seq = self.data_loader.reads[real_idx]
         clover_label = self.data_loader.clover_labels[real_idx]
         gt_label = self.data_loader.gt_labels[real_idx]
-
-        # 序列编码
         encoding = seq_to_onehot(seq, self.max_len)
 
         return {
-            'encoding': encoding,  # (L, 4)
-            'clover_label': clover_label,  # Clover聚类标签 (可能是 refined 的)
-            'gt_label': gt_label,  # Ground Truth标签
-            'read_idx': real_idx,  # 原始索引
-            'sequence': seq  # 原始序列
+            'encoding': encoding,
+            'clover_label': clover_label,
+            'gt_label': gt_label,
+            'read_idx': real_idx,
+            'sequence': seq
         }
 
 
-def create_cluster_balanced_sampler(dataset: Step1Dataset, 
-                                    batch_size: int = 32, 
+# ===========================================================================
+# 🚀 性能修复版采样器
+# ===========================================================================
+def create_cluster_balanced_sampler(dataset: Step1Dataset,
+                                    batch_size: int = 32,
                                     max_clusters_per_batch: int = 5) -> List[List[int]]:
     """
-    ✅ 高性能版采样器：修复了百万级数据卡死的问题
+    性能修复版：使用 deque 替代 list(set)
+    解决大规模簇数量下死循环/卡死问题
     """
-    print("   🔨 正在构建采样器 (快速版)...")
-    
-    # --- 优化点 1: 直接读取标签，不调用 dataset[idx] ---
-    # 我们直接访问 dataset 内部的 valid_indices 和 data_loader 的 labels
-    # 避免了 100万次 seq_to_onehot 的计算
-    
+    print("   🔨 正在构建采样器 (Queue优化版)...")
+
     valid_indices = dataset.valid_indices
     all_labels = dataset.data_loader.clover_labels
-    
+
     cluster_to_indices = defaultdict(list)
-    
-    # 只需要遍历一次整数列表，非常快
     for idx, real_idx in enumerate(valid_indices):
         label = all_labels[real_idx]
         cluster_to_indices[label].append(idx)
 
-    # --- 优化点 2: 预先打乱，避免 list.remove() ---
     for cid in cluster_to_indices:
         np.random.shuffle(cluster_to_indices[cid])
-    
-    # 使用指针记录每个簇取到了哪里
+
     cluster_ptrs = {cid: 0 for cid in cluster_to_indices}
-    
-    # 统计信息
+
     print(f"   📊 簇分布 (Top 5):")
     cluster_sizes = [(cid, len(indices)) for cid, indices in cluster_to_indices.items()]
     cluster_sizes.sort(key=lambda x: x[1], reverse=True)
     for i, (cid, size) in enumerate(cluster_sizes[:5]):
         print(f"      簇{cid}: {size}")
 
-    # 生成 Batch
     batches = []
+
+    # ✅ 优化点 1: 初始化一次列表并打乱
     cluster_ids = list(cluster_to_indices.keys())
     np.random.shuffle(cluster_ids)
-    
-    active_clusters = set(cluster_ids)
-    
-    while len(active_clusters) >= 1:
-        # 选取簇
-        current_candidates = list(active_clusters)
-        if not current_candidates: break
-        
-        num_to_select = min(max_clusters_per_batch, len(current_candidates))
-        selected_clusters = np.random.choice(current_candidates, size=num_to_select, replace=False)
-        
+
+    # ✅ 优化点 2: 使用双端队列 (Deque)
+    active_queue = deque(cluster_ids)
+
+    while active_queue:
+        # 每次从队列头取 max_clusters_per_batch 个
+        num_to_select = min(max_clusters_per_batch, len(active_queue))
+        selected_clusters = []
+        for _ in range(num_to_select):
+            selected_clusters.append(active_queue.popleft())
+
         batch_indices = []
         reads_per_cluster = max(1, batch_size // num_to_select)
-        
+
+        # 记录还有剩余数据的簇，稍后放回队列尾部
+        clusters_to_keep = []
+
         for cluster_id in selected_clusters:
             indices = cluster_to_indices[cluster_id]
             ptr = cluster_ptrs[cluster_id]
-            
-            # 剩余可取数量
             remaining = len(indices) - ptr
             take = min(reads_per_cluster, remaining)
-            
+
             if take > 0:
-                # 切片取数
-                sampled = indices[ptr : ptr + take]
-                batch_indices.extend(sampled)
-                
-                # 移动指针
+                batch_indices.extend(indices[ptr: ptr + take])
                 cluster_ptrs[cluster_id] += take
-                
-                # 如果取完了，移除出活跃集合
-                if cluster_ptrs[cluster_id] >= len(indices):
-                    active_clusters.remove(cluster_id)
+                # 如果还有剩余，加入保留列表
+                if cluster_ptrs[cluster_id] < len(indices):
+                    clusters_to_keep.append(cluster_id)
             else:
-                if cluster_id in active_clusters:
-                    active_clusters.remove(cluster_id)
-        
+                # 理论上不应进入这里，但为了保险
+                pass
+
+        # ✅ 将未消耗完的簇放回队列尾部 (Round Robin)
+        for cid in clusters_to_keep:
+            active_queue.append(cid)
+
         if batch_indices:
             batches.append(batch_indices)
-            
+
     print(f"   📦 生成 {len(batches)} 个Batch，准备就绪！")
+    return batches
+
+
+def create_dynamic_sampler(dataset: Step1Dataset,
+                           batch_size: int = 32,
+                           max_clusters_per_batch: int = 5,
+                           state_path: str = None,
+                           round_idx: int = 1) -> List[List[int]]:
+    """
+    动态采样器（同样应用 Queue 优化）
+    """
+    # Round 1: 无 state，直接全量
+    if round_idx <= 1 or state_path is None or not os.path.exists(state_path):
+        print("   📦 Round 1 / 无 state，使用全量采样")
+        return create_cluster_balanced_sampler(
+            dataset, batch_size=batch_size,
+            max_clusters_per_batch=max_clusters_per_batch
+        )
+
+    # ---- Round 2+: 读 state，按三区制过滤 ----
+    print(f"   📦 Round {round_idx}: 读取 read_state.pt，按三区制采样...")
+    state = torch.load(state_path, map_location='cpu')
+    zone_ids_full = state['zone_ids']
+
+    valid_indices = dataset.valid_indices
+    all_labels = dataset.data_loader.clover_labels
+
+    kept_indices = []
+
+    # 参数：Zone I 抽样率
+    ZONE1_SAMPLE_RATE = 0.20
+
+    n_z1, n_z2, n_z3_dropped, n_z1_dropped = 0, 0, 0, 0
+
+    for ds_idx, real_idx in enumerate(valid_indices):
+        zone = int(zone_ids_full[real_idx])
+
+        if zone == 3:
+            n_z3_dropped += 1
+            continue
+        elif zone == 1:
+            if np.random.random() < ZONE1_SAMPLE_RATE:
+                kept_indices.append(ds_idx)
+                n_z1 += 1
+            else:
+                n_z1_dropped += 1
+        elif zone == 2:
+            kept_indices.append(ds_idx)
+            n_z2 += 1
+        else:
+            continue
+
+    print(f"   📊 动态采样统计:")
+    print(f"      Zone I  保留: {n_z1:>7d}  (丢弃 {n_z1_dropped})")
+    print(f"      Zone II 保留: {n_z2:>7d}")
+    print(f"      Zone III 丢弃:{n_z3_dropped:>7d}")
+    print(f"      总保留:       {len(kept_indices)}")
+
+    if len(kept_indices) == 0:
+        print("   ⚠️ 动态采样后无数据，回退到全量采样")
+        return create_cluster_balanced_sampler(
+            dataset, batch_size=batch_size,
+            max_clusters_per_batch=max_clusters_per_batch
+        )
+
+    # ---- 用保留的 idx 构建 cluster-balanced batches (Queue 优化版) ----
+    cluster_to_indices = defaultdict(list)
+    for ds_idx in kept_indices:
+        real_idx = valid_indices[ds_idx]
+        label = all_labels[real_idx]
+        cluster_to_indices[label].append(ds_idx)
+
+    for cid in cluster_to_indices:
+        np.random.shuffle(cluster_to_indices[cid])
+
+    cluster_ptrs = {cid: 0 for cid in cluster_to_indices}
+
+    # ✅ 初始化队列
+    cluster_ids = list(cluster_to_indices.keys())
+    np.random.shuffle(cluster_ids)
+    active_queue = deque(cluster_ids)
+
+    batches = []
+    while active_queue:
+        num_sel = min(max_clusters_per_batch, len(active_queue))
+        selected = []
+        for _ in range(num_sel):
+            selected.append(active_queue.popleft())
+
+        batch = []
+        per_cluster = max(1, batch_size // num_sel)
+
+        clusters_to_keep = []
+
+        for cid in selected:
+            indices = cluster_to_indices[cid]
+            ptr = cluster_ptrs[cid]
+            rem = len(indices) - ptr
+            take = min(per_cluster, rem)
+
+            if take > 0:
+                batch.extend(indices[ptr: ptr + take])
+                cluster_ptrs[cid] += take
+                if cluster_ptrs[cid] < len(indices):
+                    clusters_to_keep.append(cid)
+
+        for cid in clusters_to_keep:
+            active_queue.append(cid)
+
+        if batch:
+            batches.append(batch)
+
+    print(f"   📦 生成 {len(batches)} 个Batch（动态采样版）")
     return batches
