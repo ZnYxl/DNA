@@ -1,26 +1,22 @@
 # models/main_loop.py
 """
-SSI-EC 闭环迭代总控
+SSI-EC 闭环迭代总控 (Universal Edition)
 
-状态传递机制:
-  每轮维护三个路径:
-    current_checkpoint  — 上一轮 Step1 的模型权重
-    current_labels      — 上一轮 Step2 输出的 refined_labels.txt
-    current_state       — 上一轮 Step2 输出的 read_state.pt (含 u_epi/u_ale/zone_ids)
+修复清单:
+  [FIX] 预训练权重路径修正
+  [NEW] --gt_tags_file 支持 GT 评估
+  [NEW] training_cap 可配置
+  通用设计：通过命令行参数切换 Goldman / id20 / ERR036
 
-  Round 1:
-    Step1: FedDNA 预训练权重 → 20 epoch, lr=1e-4
-    Step2: 无 prev_state, round_idx=1 (delta 宽松 x1.5)
-
-  Round 2+:
-    Step1: 上一轮 checkpoint → 10 epoch, lr=1e-5
-           动态采样器读 read_state.pt 做三区制采样
-    Step2: 传入 prev_state 做动量更新, round_idx=N (delta 严格 x1.0)
+用法:
+  # id20
+  python main_loop.py --experiment_dir .../id20_Real --max_length 150 --gt_tags_file .../id20_tags_reads.txt
+  # Goldman
+  python main_loop.py --experiment_dir .../Goldman_Real --max_length 117 --gt_tags_file None
 """
 import os
 import argparse
 import sys
-import numpy as np
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir  = os.path.dirname(current_dir)
@@ -31,114 +27,101 @@ from models.step2_runner import run_step2
 
 
 def main_loop():
-    parser = argparse.ArgumentParser(description="SSI-EC Iterative Clustering Master Loop")
-    parser.add_argument('--experiment_dir',    type=str,  
-                        default='code/CC/Step0/Experiments/ERR036',
-                        help="实验根目录")
-    parser.add_argument('--max_iterations',    type=int,  default=3,      help="最大迭代轮数")
-    parser.add_argument('--device',            type=str,  default='cuda')
+    parser = argparse.ArgumentParser(description="SSI-EC Master Loop")
+
+    # ===== 数据集配置 =====
+    parser.add_argument('--experiment_dir', type=str,
+                        default='/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/id20_Real',
+                        help="实验根目录 (包含 03_FedDNA_In/read.txt)")
+    parser.add_argument('--max_length', type=int, default=150,
+                        help="id20=150, Goldman=117, ERR036=152")
+
+    # ===== GT 评估 (可选) =====
+    parser.add_argument('--gt_tags_file', type=str,
+                        default='/mnt/st_data/liangxinyi/code/CC/Step0/给师妹的clover数据集/id20/id20_tags_reads.txt',
+                        help="GT 标签文件, 无GT时设为 None")
+    parser.add_argument('--gt_refs_file', type=str, default=None,
+                        help="GT 参考序列 FASTA (可选)")
+
+    # ===== 迭代配置 =====
+    parser.add_argument('--max_iterations', type=int, default=3)
+    parser.add_argument('--device', type=str, default='cuda')
+
+    # ===== [FIX] 预训练权重 =====
     parser.add_argument('--feddna_checkpoint', type=str,
-                        default='result/FLDNA_I/I_1214234233/model/epoch1_I.pth',
-                        help="FedDNA 预训练权重路径（Round 1 使用）")
+                        default='/mnt/st_data/liangxinyi/code/result/FLDNA_I/I_1214234233/model/epoch1_I.pth')
+
+    # ===== 训练超参 =====
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--max_clusters_per_batch', type=int, default=8)
+    parser.add_argument('--training_cap', type=int, default=2000000)
+    parser.add_argument('--dim', type=int, default=256)
+    parser.add_argument('--min_clusters', type=int, default=50)
+    parser.add_argument('--weight_decay', type=float, default=1e-5)
 
     args = parser.parse_args()
+    if args.gt_tags_file and args.gt_tags_file.lower() == 'none':
+        args.gt_tags_file = None
 
-    # =====================================================================
-    # 状态变量
-    # =====================================================================
-    current_labels_path     = None   # Round 1 为 None → 用 Clover 原始标签
-    current_checkpoint_path = None   # Round 1 为 None → 用 FedDNA 预训练
-    current_state_path      = None   # Round 1 为 None → 无动量 / 无三区制采样
+    current_labels_path     = None
+    current_checkpoint_path = None
+    current_state_path      = None
 
-    print(f"🚀 开始 SSI-EC 闭环迭代训练")
+    print(f"🚀 SSI-EC 闭环迭代启动")
     print(f"📂 实验目录: {args.experiment_dir}")
-    print(f"🔁 最大轮数: {args.max_iterations}")
+    print(f"📏 序列长度: {args.max_length} bp")
+    print(f"🔁 迭代轮数: {args.max_iterations}")
+    print(f"🔋 预训练:   {os.path.basename(args.feddna_checkpoint)}")
+    if args.gt_tags_file:
+        print(f"📋 GT 评估:  {os.path.basename(args.gt_tags_file)}")
 
     for iteration in range(1, args.max_iterations + 1):
         print(f"\n{'=' * 80}")
-        print(f"🔄 Iteration {iteration} / {args.max_iterations}")
-        print(f"{'=' * 80}")
+        print(f"🔄 Round {iteration} / {args.max_iterations}")
+        print(f"{'=' * 80}\n")
 
-        # ==================================================================
-        # Step 1: 训练
-        # ==================================================================
-        print(f"\n[Step 1] Training (Round {iteration})...")
-
-        step1_out_dir = os.path.join(
-            args.experiment_dir, "results", f"iter_{iteration}_step1"
-        )
+        # ============== Step 1 ==============
+        print(f"[Step 1] Evidence Learning...")
+        step1_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step1")
 
         step1_args = argparse.Namespace(
-            experiment_dir          = args.experiment_dir,
-            output_dir              = step1_out_dir,
-            batch_size              = 32,                   # 红线
-            max_clusters_per_batch  = 5,
-            weight_decay            = 1e-5,
-            dim                     = 256,
-            max_length              = 152,
-            min_clusters            = 50,
-            device                  = args.device,
-
-            # Hot Start 参数
-            round_idx               = iteration,
-            feddna_checkpoint       = args.feddna_checkpoint,   # Round 1 用
-            prev_checkpoint         = current_checkpoint_path,  # Round 2+ 用
-            refined_labels          = current_labels_path,      # Round 2+ 用
-            prev_state              = current_state_path,       # Round 2+ 用（动态采样）
+            experiment_dir=args.experiment_dir, output_dir=step1_out,
+            batch_size=args.batch_size, max_clusters_per_batch=args.max_clusters_per_batch,
+            weight_decay=args.weight_decay, dim=args.dim, max_length=args.max_length,
+            min_clusters=args.min_clusters, device=args.device, round_idx=iteration,
+            feddna_checkpoint=args.feddna_checkpoint,
+            prev_checkpoint=current_checkpoint_path,
+            refined_labels=current_labels_path, prev_state=current_state_path,
+            training_cap=args.training_cap,
         )
-
-        # train_step1 返回 final_model_path (str)
         step1_checkpoint = train_step1(step1_args)
-
         if step1_checkpoint is None:
-            print("❌ Step 1 未返回有效 checkpoint，停止迭代。")
-            break
+            print("❌ Step 1 失败"); break
 
-        # ==================================================================
-        # Step 2: 修正与重建
-        # ==================================================================
-        print(f"\n[Step 2] Refining & Decoding (Round {iteration})...")
-
-        step2_out_dir = os.path.join(
-            args.experiment_dir, "results", f"iter_{iteration}_step2"
-        )
+        # ============== Step 2 ==============
+        print(f"\n[Step 2] Refine & Decode...")
+        step2_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step2")
 
         step2_args = argparse.Namespace(
-            experiment_dir      = args.experiment_dir,
-            step1_checkpoint    = step1_checkpoint,
-            output_dir          = step2_out_dir,
-            dim                 = 256,
-            max_length          = 150,
-            device              = args.device,
-
-            # 三区制 + 噪声复活参数
-            round_idx           = iteration,
-            refined_labels      = current_labels_path,     # 上一轮的 labels（复活用）
-            prev_state          = current_state_path,      # 上一轮的 state（动量用）
+            experiment_dir=args.experiment_dir, step1_checkpoint=step1_checkpoint,
+            output_dir=step2_out, dim=args.dim, max_length=args.max_length,
+            device=args.device, round_idx=iteration,
+            refined_labels=current_labels_path, prev_state=current_state_path,
+            gt_tags_file=args.gt_tags_file, gt_refs_file=args.gt_refs_file,
         )
-
         results = run_step2(step2_args)
 
-        # ==================================================================
-        # 状态更新
-        # ==================================================================
+        # ============== 状态更新 ==============
         if results and 'next_round_files' in results:
             nrf = results['next_round_files']
-
             current_labels_path     = nrf['labels']
-            current_state_path      = nrf.get('state', None)
+            current_state_path      = nrf.get('state')
             current_checkpoint_path = step1_checkpoint
-
-            print(f"\n✅ Iteration {iteration} 完成!")
-            print(f"   📝 新标签:      {current_labels_path}")
-            print(f"   💾 新状态:      {current_state_path}")
-            print(f"   🧬 新序列:      {nrf.get('reference', 'N/A')}")
-            print(f"   🔋 下一轮权重:  {current_checkpoint_path}")
+            print(f"\n✅ Round {iteration} 完成. 标签: {os.path.basename(current_labels_path)}")
         else:
-            print("❌ Step 2 未返回有效结果，停止迭代。")
-            break
+            print("❌ Step 2 失败"); break
 
-    print("\n🎉 所有迭代完成！")
+    print(f"\n🎉 实验完成！结果: {args.experiment_dir}/results/")
 
 
 if __name__ == "__main__":
