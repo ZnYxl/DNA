@@ -12,7 +12,7 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset
 from typing import Dict, List, Optional
-from collections import defaultdict, deque
+from collections import defaultdict
 
 # ============================================================
 # 高性能 One-Hot 编码 (numpy 向量化)
@@ -183,12 +183,22 @@ class Step1Dataset(Dataset):
 
 
 # ============================================================
-# 采样器 (通用)
+# 采样器 (通用, 贪心填充版)
+#
+# [OPT] id20 有 756K 簇平均仅 2.6 reads/簇
+#       旧版固定 max_clusters_per_batch=8 → batch≈21 → 79K batches → 极慢
+#       新版贪心填充: 不断取簇直到填满 batch_size，大幅减少 batch 数
 # ============================================================
 def create_cluster_balanced_sampler(dataset: Step1Dataset,
-                                    batch_size: int = 64,
-                                    max_clusters_per_batch: int = 8):
-    print("   🔨 构建采样器...")
+                                    batch_size: int = 256,
+                                    max_clusters_per_batch: int = 64):
+    """
+    贪心填充策略:
+      1. 打乱簇顺序
+      2. 逐个簇倒入当前 batch，直到 batch_size 满或达到 max_clusters 上限
+      3. 大簇(>batch_size)单独切片
+    """
+    print("   🔨 构建采样器 (贪心填充)...")
     valid_indices = dataset.valid_indices
     all_labels = dataset.data_loader.clover_labels
 
@@ -197,40 +207,67 @@ def create_cluster_balanced_sampler(dataset: Step1Dataset,
         label = all_labels[real_idx]
         cluster_to_indices[label].append(idx)
 
-    cluster_ids = list(cluster_to_indices.keys())
+    # 过滤空簇和单条簇 (对比学习至少需要2条)
+    valid_clusters = {cid: idxs for cid, idxs in cluster_to_indices.items()
+                      if len(idxs) >= 2}
+    singleton_indices = [idxs[0] for idxs in cluster_to_indices.values()
+                         if len(idxs) == 1]
+
+    cluster_ids = list(valid_clusters.keys())
     np.random.shuffle(cluster_ids)
-    active_queue = deque(cluster_ids)
 
     batches = []
-    cluster_ptrs = {cid: 0 for cid in cluster_to_indices}
+    current_batch = []
+    current_n_clusters = 0
 
-    while active_queue:
-        num_sel = min(max_clusters_per_batch, len(active_queue))
-        selected = [active_queue.popleft() for _ in range(num_sel)]
+    for cid in cluster_ids:
+        idxs = valid_clusters[cid]
 
-        batch = []
-        per_cluster = max(1, batch_size // num_sel)
-        keep = []
+        # 大簇: 切片处理
+        if len(idxs) > batch_size:
+            # 先 flush 当前 batch
+            if current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_n_clusters = 0
+            # 切片
+            for i in range(0, len(idxs), batch_size):
+                batches.append(idxs[i:i + batch_size])
+            continue
 
-        for cid in selected:
-            idxs = cluster_to_indices[cid]
-            ptr = cluster_ptrs[cid]
-            take = min(per_cluster, len(idxs) - ptr)
-            if take > 0:
-                batch.extend(idxs[ptr:ptr + take])
-                cluster_ptrs[cid] += take
-                if cluster_ptrs[cid] < len(idxs):
-                    keep.append(cid)
+        # 能放进当前 batch 吗？
+        if (len(current_batch) + len(idxs) > batch_size or
+                current_n_clusters >= max_clusters_per_batch):
+            # flush
+            if current_batch:
+                batches.append(current_batch)
+            current_batch = list(idxs)
+            current_n_clusters = 1
+        else:
+            current_batch.extend(idxs)
+            current_n_clusters += 1
 
-        for cid in keep:
-            active_queue.append(cid)
-        if batch:
-            batches.append(batch)
+    # flush 最后一个 batch
+    if current_batch:
+        batches.append(current_batch)
 
-    print(f"   📦 Generated {len(batches)} batches.")
+    # 单条 reads: 合并成大 batch (它们不参与对比但参与重建损失)
+    if singleton_indices:
+        for i in range(0, len(singleton_indices), batch_size):
+            batches.append(singleton_indices[i:i + batch_size])
+
+    # 统计
+    sizes = [len(b) for b in batches]
+    avg_size = sum(sizes) / max(len(sizes), 1)
+    n_valid_c = len(valid_clusters)
+    n_single  = len(singleton_indices)
+
+    print(f"   📦 Batches: {len(batches)} (avg {avg_size:.0f} samples/batch)")
+    print(f"      有效簇(≥2): {n_valid_c}, 单条簇: {n_single}")
+
     return batches
 
 
-def create_dynamic_sampler(dataset, batch_size=64, max_clusters_per_batch=8,
+def create_dynamic_sampler(dataset, batch_size=256, max_clusters_per_batch=64,
                            state_path=None, round_idx=1):
     return create_cluster_balanced_sampler(dataset, batch_size, max_clusters_per_batch)
