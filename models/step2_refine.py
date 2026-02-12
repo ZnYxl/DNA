@@ -1,14 +1,18 @@
 # models/step2_refine.py
 """
-Step2: Evidence-Guided Cluster Refinement — 三区制版本
+Step2: Evidence-Guided Cluster Refinement (防 OOM + 高速版)
 
-修复清单:
-  [FIX-#3]  Zone II 距离判决改用 cosine distance (与对比学习一致)
-            embeddings 先 L2 normalize，再用 L2 距离 ≡ cosine distance 的单调变换
+基于学生版本的 index_add_ 向量化思路，修复以下问题:
+  [FIX-1] refine_reads 返回 3 个值 (new_labels, noise_mask, stats)
+  [FIX-2] refine_reads 接受 round_idx 参数，内部做 delta scaling
+  [FIX-3] compute_global_delta 签名与 runner 一致: (embeddings, labels, zone_ids, centroids)
+  [FIX-4] refine 距离计算: CPU 双轴分块 matmul，避免 cdist(5K, 444K) OOM
+  [FIX-5] compute_global_delta 只返回原始 delta，scaling 留给 refine_reads
 """
 import torch
 import torch.nn.functional as F
-
+import numpy as np
+import time
 
 # ---------------------------------------------------------------------------
 # 超参常量
@@ -25,8 +29,8 @@ ROUND1_DELTA_SCALE = 1.5
 # 1. 三区制划分
 # ===========================================================================
 def split_confidence_by_zone(u_epi, u_ale, labels):
-    N       = len(labels)
-    device  = labels.device
+    N      = len(labels)
+    device = labels.device
     zone_ids = torch.zeros(N, dtype=torch.long, device=device)
 
     valid   = (labels >= 0)
@@ -35,207 +39,275 @@ def split_confidence_by_zone(u_epi, u_ale, labels):
         return zone_ids, {'zone1': 0, 'zone2': 0, 'zone3': 0, 'noise': N}
 
     # 第一刀: U_ale Top 10% → Zone III
-    u_ale_valid   = u_ale[valid]
-    ale_threshold = torch.quantile(u_ale_valid, 1.0 - DIRTY_PERCENTILE)
-    dirty_global  = torch.zeros(N, dtype=torch.bool, device=device)
-    dirty_global[valid] = (u_ale_valid >= ale_threshold)
-    zone_ids[dirty_global] = 3
+    ale_threshold = torch.quantile(u_ale[valid], 1.0 - DIRTY_PERCENTILE)
+    is_dirty = valid & (u_ale >= ale_threshold)
+    zone_ids[is_dirty] = 3
 
     # 第二刀: 剩余中 U_epi Bottom 70% → Zone I
-    remaining = valid & (~dirty_global)
-    n_rem     = remaining.sum().item()
-
-    if n_rem > 0:
-        u_epi_rem     = u_epi[remaining]
-        epi_threshold = torch.quantile(u_epi_rem, SAFE_PERCENTILE)
-        safe_local  = (u_epi_rem <= epi_threshold)
-        hard_local  = ~safe_local
-        rem_indices = torch.where(remaining)[0]
-        zone_ids[rem_indices[safe_local]] = 1
-        zone_ids[rem_indices[hard_local]] = 2
+    remaining = valid & (~is_dirty)
+    if remaining.any():
+        epi_threshold = torch.quantile(u_epi[remaining], SAFE_PERCENTILE)
+        zone_ids[remaining & (u_epi <= epi_threshold)] = 1
+        zone_ids[remaining & (u_epi >  epi_threshold)] = 2
 
     z1 = int((zone_ids == 1).sum().item())
     z2 = int((zone_ids == 2).sum().item())
     z3 = int((zone_ids == 3).sum().item())
     zn = int((zone_ids == 0).sum().item())
 
-    print(f"   📊 三区制划分结果:")
-    print(f"      Zone I  (Safe):   {z1:>7d}  ({z1/max(n_valid,1)*100:5.1f}%)")
-    print(f"      Zone II (Hard):   {z2:>7d}  ({z2/max(n_valid,1)*100:5.1f}%)")
-    print(f"      Zone III(Dirty):  {z3:>7d}  ({z3/max(n_valid,1)*100:5.1f}%)")
-    print(f"      Noise   (skip):   {zn:>7d}")
+    print(f"   📊 三区制划分:")
+    print(f"      Zone I  (Safe):   {z1:>8d}  ({z1/max(n_valid,1)*100:5.1f}%)")
+    print(f"      Zone II (Hard):   {z2:>8d}  ({z2/max(n_valid,1)*100:5.1f}%)")
+    print(f"      Zone III(Dirty):  {z3:>8d}  ({z3/max(n_valid,1)*100:5.1f}%)")
+    print(f"      Noise   (skip):   {zn:>8d}")
 
     return zone_ids, {'zone1': z1, 'zone2': z2, 'zone3': z3, 'noise': zn}
 
 
 # ===========================================================================
-# 2. 证据加权质心 + 安全阀
-#    [FIX-#3] 质心在 normalized 空间计算
+# 2. 证据加权质心 (CPU index_add_ 向量化)
+#
+#    签名: compute_centroids_weighted(embeddings, labels, strength, zone_ids)
+#    返回: (centroids_dict, cluster_sizes_dict)
 # ===========================================================================
 def compute_centroids_weighted(embeddings, labels, strength, zone_ids):
-    print(f"\n   🧮 计算证据加权质心 (Zone I+II, cosine 空间)...")
-    device = embeddings.device
+    t0 = time.time()
 
-    # [FIX-#3] normalize embeddings
-    embeddings_norm = F.normalize(embeddings, dim=-1)
+    # ---- 全部搬到 CPU，解决 GPU OOM ----
+    emb_cpu  = F.normalize(embeddings.detach().cpu(), dim=-1)
+    lbl_cpu  = labels.detach().cpu()
+    str_cpu  = strength.detach().cpu()
+    zone_cpu = zone_ids.detach().cpu()
 
-    participate = ((zone_ids == 1) | (zone_ids == 2)) & (labels >= 0)
-    p_emb    = embeddings_norm[participate]
-    p_labels = labels[participate]
-    p_str    = strength[participate]
-    p_zones  = zone_ids[participate]
+    # 筛选 Zone I + Zone II
+    valid = (lbl_cpu >= 0) & ((zone_cpu == 1) | (zone_cpu == 2))
+    sub_emb = emb_cpu[valid]
+    sub_lbl = lbl_cpu[valid]
+    sub_str = str_cpu[valid]
+    sub_zon = zone_cpu[valid]
 
-    if p_emb.shape[0] == 0:
+    if len(sub_lbl) == 0:
         return {}, {}
 
-    centroids     = {}
-    cluster_sizes = {}
-    safety_count  = 0
+    max_label = int(sub_lbl.max().item()) + 1
+    D = sub_emb.shape[1]
 
-    for k in torch.unique(p_labels):
-        k_int = int(k.item())
-        mask  = (p_labels == k)
-        n_k   = int(mask.sum().item())
-        if n_k < 2:
-            continue
+    # ---- 安全阀: 向量化统计 Zone I 数量 ----
+    z1_mask = (sub_zon == 1)
+    z1_counts = torch.zeros(max_label, dtype=torch.long)
+    if z1_mask.any():
+        z1_counts.index_add_(0, sub_lbl[z1_mask],
+                             torch.ones(int(z1_mask.sum()), dtype=torch.long))
 
-        z1_count = int((p_zones[mask] == 1).sum().item())
-        s_k      = p_str[mask].clone()
+    unsafe = (z1_counts < MIN_ZONE1_SAFETY)
+    is_unsafe_read = unsafe[sub_lbl]
 
-        if z1_count < MIN_ZONE1_SAFETY:
-            z2_local = (p_zones[mask] == 2)
-            if z2_local.any():
-                s_k[z2_local] = s_k[z2_local].clamp(max=ZONE2_WEIGHT_CAP)
-            safety_count += 1
+    weights = sub_str.clone()
+    clamp_mask = is_unsafe_read & (sub_zon == 2)
+    if clamp_mask.any():
+        weights[clamp_mask] = weights[clamp_mask].clamp(max=ZONE2_WEIGHT_CAP)
 
-        w        = s_k / s_k.sum()
-        centroid = (w.unsqueeze(1) * p_emb[mask]).sum(dim=0)
-        # Re-normalize centroid to stay on unit sphere
-        centroid = F.normalize(centroid, dim=0)
+    # ---- index_add_ 加权求和 (核心加速) ----
+    centroid_sum = torch.zeros(max_label, D)
+    weight_sum   = torch.zeros(max_label)
+    centroid_sum.index_add_(0, sub_lbl, sub_emb * weights.unsqueeze(1))
+    weight_sum.index_add_(0, sub_lbl, weights)
 
-        centroids[k_int]     = centroid.cpu()
-        cluster_sizes[k_int] = n_k
+    valid_mask = (weight_sum > 1e-6)
+    final = torch.zeros(max_label, D)
+    final[valid_mask] = centroid_sum[valid_mask] / weight_sum[valid_mask].unsqueeze(1)
+    final = F.normalize(final, dim=-1)
 
-    print(f"   📍 质心计算完成: {len(centroids)} 簇, 安全阀触发 {safety_count} 次")
+    # 转 dict
+    present = torch.nonzero(valid_mask).squeeze(1)
+    centroids = {int(k): final[k] for k in present}
+
+    # cluster_sizes (保持接口兼容)
+    size_count = torch.zeros(max_label, dtype=torch.long)
+    size_count.index_add_(0, sub_lbl, torch.ones(len(sub_lbl), dtype=torch.long))
+    cluster_sizes = {int(k): int(size_count[k]) for k in present}
+
+    n_safety = int(unsafe[present].sum().item()) if len(present) > 0 else 0
+    t1 = time.time()
+    print(f"\n   📍 质心 (CPU vectorized): {len(centroids)} 簇, "
+          f"安全阀 {n_safety}, 耗时 {t1-t0:.1f}s")
+
     return centroids, cluster_sizes
 
 
 # ===========================================================================
-# 3. 全局自适应 Delta (cosine 空间)
+# 3. 全局自适应 Delta (CPU 采样 10 万估算)
+#
+#    签名: compute_global_delta(embeddings, labels, zone_ids, centroids)
+#                               ↑ 注意顺序! 与 runner 调用一致
+#    返回: delta (原始 P95 值, 不乘 ROUND1_DELTA_SCALE)
 # ===========================================================================
 def compute_global_delta(embeddings, labels, zone_ids, centroids):
-    print(f"   🎯 计算 Global Delta (cosine 空间, P{DELTA_P})...")
-    device = embeddings.device
+    print(f"   🎯 计算 Global Delta (P{DELTA_P})...")
 
-    # [FIX-#3] normalize
-    embeddings_norm = F.normalize(embeddings, dim=-1)
+    emb_cpu  = F.normalize(embeddings.detach().cpu(), dim=-1)
+    lbl_cpu  = labels.detach().cpu()
+    zone_cpu = zone_ids.detach().cpu()
 
-    safe_mask   = (zone_ids == 1) & (labels >= 0)
-    safe_emb    = embeddings_norm[safe_mask]
-    safe_labels = labels[safe_mask]
+    mask = (lbl_cpu >= 0) & (zone_cpu == 1)
+    z1_indices = torch.nonzero(mask).squeeze(1)
 
-    if safe_emb.shape[0] == 0:
-        print(f"   ⚠️ 无 Safe 样本，返回经验值 0.5")
+    if len(z1_indices) == 0:
+        print(f"   ⚠️ 无 Zone I 样本, 返回 0.5")
         return 0.5
 
-    sorted_ids  = sorted(centroids.keys())
-    if len(sorted_ids) == 0:
+    # 采样 10 万 (足够准确, 避免慢)
+    if len(z1_indices) > 100000:
+        z1_indices = z1_indices[torch.randperm(len(z1_indices))[:100000]]
+
+    sample_emb = emb_cpu[z1_indices]
+    sample_lbl = lbl_cpu[z1_indices]
+
+    # 匹配质心
+    target_list = []
+    keep = []
+    for i in range(len(sample_lbl)):
+        lid = int(sample_lbl[i].item())
+        if lid in centroids:
+            target_list.append(centroids[lid])
+            keep.append(i)
+
+    if not target_list:
+        print(f"   ⚠️ 无法匹配质心, 返回 0.5")
         return 0.5
 
-    id_to_row       = {kid: i for i, kid in enumerate(sorted_ids)}
-    centroid_matrix = torch.stack([centroids[k] for k in sorted_ids]).to(device)
+    target_mat = torch.stack(target_list)
+    sample_emb = sample_emb[keep]
 
-    safe_labels_list   = safe_labels.cpu().tolist()
-    valid_sample_idx   = []
-    valid_centroid_idx = []
+    # L2 distance (normalized vectors): ||a-b|| = sqrt(2 - 2*<a,b>)
+    sim = (sample_emb * target_mat).sum(dim=1)
+    dists = torch.sqrt((2.0 - 2.0 * sim).clamp(min=0.0))
 
-    for i, lbl in enumerate(safe_labels_list):
-        if lbl in id_to_row:
-            valid_sample_idx.append(i)
-            valid_centroid_idx.append(id_to_row[lbl])
-
-    if len(valid_sample_idx) == 0:
-        print(f"   ⚠️ Safe 样本无法匹配到质心，返回经验值 0.5")
-        return 0.5
-
-    valid_sample_idx   = torch.tensor(valid_sample_idx,  device=device)
-    valid_centroid_idx = torch.tensor(valid_centroid_idx, device=device)
-
-    chunk  = 10000
-    dists  = []
-    for i in range(0, len(valid_sample_idx), chunk):
-        end = min(i + chunk, len(valid_sample_idx))
-        emb = safe_emb[valid_sample_idx[i:end]]
-        cen = centroid_matrix[valid_centroid_idx[i:end]]
-        dists.append(torch.norm(emb - cen, dim=1))
-
-    all_dists = torch.cat(dists)
-    delta     = torch.quantile(all_dists, DELTA_P / 100.0).item()
-
-    print(f"   🎯 Global Delta = {delta:.4f}  ({len(all_dists)} Safe 样本)")
+    delta = float(np.percentile(dists.numpy(), DELTA_P))
+    print(f"   🎯 Global Delta = {delta:.4f} (基于 {len(keep)} 个 Zone I 样本)")
     return delta
 
 
 # ===========================================================================
-# 4. Zone-aware 修正 (cosine 空间)
+# 辅助: 双轴分块最近邻 (CPU, 防 OOM)
+#
+# 为什么不能用 cdist?
+#   query=5000, centroids=444K → output (5000, 444000) × 4B = 8.8GB → 必爆
+#
+# 解法: 对 centroid 轴也分块
+#   query_chunk × centroid_chunk × 4B = 3000 × 80000 × 4 = 960MB → CPU 安全
+# ===========================================================================
+def _chunked_nearest_centroid(query, centroid_matrix, centroid_ids,
+                              query_chunk=3000, centroid_chunk=80000):
+    """
+    在 normalized 空间用分块 matmul 找最近质心。
+    返回: (min_dist, best_centroid_id) 都是 (N,) tensor
+    """
+    N = query.shape[0]
+    K = centroid_matrix.shape[0]
+
+    best_dist = torch.full((N,), float('inf'))
+    best_idx  = torch.zeros(N, dtype=torch.long)
+
+    for qi in range(0, N, query_chunk):
+        qe = min(qi + query_chunk, N)
+        q_batch = query[qi:qe]
+
+        batch_best_dist = torch.full((qe - qi,), float('inf'))
+        batch_best_idx  = torch.zeros(qe - qi, dtype=torch.long)
+
+        for ci in range(0, K, centroid_chunk):
+            ce = min(ci + centroid_chunk, K)
+            c_batch = centroid_matrix[ci:ce]
+
+            # cosine sim → L2 for normalized vectors
+            sim = q_batch @ c_batch.T                              # (q, c)
+            dist = torch.sqrt((2.0 - 2.0 * sim).clamp(min=0.0))   # (q, c)
+
+            chunk_min_d, chunk_min_i = dist.min(dim=1)
+
+            improved = (chunk_min_d < batch_best_dist)
+            batch_best_dist[improved] = chunk_min_d[improved]
+            batch_best_idx[improved]  = chunk_min_i[improved] + ci  # 偏移量!
+
+        best_dist[qi:qe] = batch_best_dist
+        best_idx[qi:qe]  = batch_best_idx
+
+        if qi > 0 and (qi // query_chunk) % 20 == 0:
+            print(f"      refine 进度: {qe}/{N}", flush=True)
+
+    best_cid = centroid_ids[best_idx]
+    return best_dist, best_cid
+
+
+# ===========================================================================
+# 4. Zone-aware 修正
+#
+#    签名: refine_reads(embeddings, labels, zone_ids, centroids, delta, round_idx=1)
+#    返回: (new_labels, noise_mask, stats)  ← 3 个值!
 # ===========================================================================
 def refine_reads(embeddings, labels, zone_ids, centroids, delta, round_idx=1):
+    device = embeddings.device
     new_labels = labels.clone()
     noise_mask = torch.zeros_like(labels, dtype=torch.bool)
-    device     = embeddings.device
 
-    # [FIX-#3] normalize
-    embeddings_norm = F.normalize(embeddings, dim=-1)
-
+    # ---- ROUND1_DELTA_SCALE 在这里应用 (不在 compute_global_delta 里) ----
     eff_delta = delta * ROUND1_DELTA_SCALE if round_idx == 1 else delta
-    print(f"\n   🔄 Zone-aware 修正 (Round {round_idx}, eff_delta={eff_delta:.4f}, cosine 空间)")
+    print(f"\n   🔄 Zone-aware 修正 (Round {round_idx}, "
+          f"delta={delta:.4f}, scale={'1.5' if round_idx==1 else '1.0'}, "
+          f"eff_delta={eff_delta:.4f})")
 
     # Zone III → 噪声
-    dirty      = (zone_ids == 3)
+    dirty = (zone_ids == 3)
     new_labels[dirty] = -1
     noise_mask[dirty] = True
-    n_dirty    = int(dirty.sum().item())
+    n_dirty = int(dirty.sum().item())
 
     # Zone I → 不动
-    n_safe     = int((zone_ids == 1).sum().item())
+    n_safe = int((zone_ids == 1).sum().item())
 
-    # Zone II → 距离判决
-    hard_mask    = (zone_ids == 2)
-    hard_indices = torch.where(hard_mask)[0]
-    n_hard       = len(hard_indices)
-
-    reassigned   = 0
+    # Zone II → 距离判决 (CPU 双轴分块)
+    hard_indices = torch.nonzero(zone_ids == 2).squeeze(1)
+    n_hard = len(hard_indices)
+    reassigned = 0
     marked_noise = 0
 
     if n_hard > 0 and len(centroids) > 0:
-        sorted_ids     = sorted(centroids.keys())
-        cluster_matrix = torch.stack([centroids[k] for k in sorted_ids]).to(device)
-        cluster_ids_t  = torch.tensor(sorted_ids, device=device)
+        t0 = time.time()
+        print(f"   ⚖️ 修正 {n_hard} 条 Zone II (CPU 双轴分块, "
+              f"{len(centroids)} 质心)...")
 
-        query = embeddings_norm[hard_indices]
+        # ---- 全部在 CPU, normalized ----
+        emb_norm = F.normalize(embeddings.detach().cpu(), dim=-1)
+        query = emb_norm[hard_indices.cpu()]
 
-        chunk = 5000
-        for i in range(0, n_hard, chunk):
-            end   = min(i + chunk, n_hard)
-            batch = query[i:end]
+        sorted_ids = sorted(centroids.keys())
+        centroid_matrix = torch.stack([centroids[k] for k in sorted_ids])
+        centroid_ids = torch.tensor(sorted_ids, dtype=torch.long)
 
-            dists          = torch.cdist(batch, cluster_matrix)
-            min_d, min_idx = torch.min(dists, dim=1)
-            best_ids       = cluster_ids_t[min_idx]
+        # 双轴分块最近邻
+        min_dist, best_cid = _chunked_nearest_centroid(
+            query, centroid_matrix, centroid_ids
+        )
 
-            within     = (min_d < eff_delta)
-            global_idx = hard_indices[i:end]
+        # 判决
+        within = (min_dist < eff_delta)
 
-            gi_in  = global_idx[within]
-            bi_in  = best_ids[within]
-            orig   = labels[gi_in]
-            reassigned += int((orig != bi_in).sum().item())
-            new_labels[gi_in] = bi_in
+        # 归队
+        gi_in = hard_indices[within]
+        bi_in = best_cid[within].to(device)
+        orig  = labels[gi_in]
+        reassigned = int((orig != bi_in).sum().item())
+        new_labels[gi_in] = bi_in
 
-            gi_out = global_idx[~within]
-            new_labels[gi_out] = -1
-            noise_mask[gi_out] = True
-            marked_noise += int((~within).sum().item())
+        # 噪声
+        gi_out = hard_indices[~within]
+        new_labels[gi_out] = -1
+        noise_mask[gi_out] = True
+        marked_noise = int((~within).sum().item())
+
+        t1 = time.time()
+        print(f"      完成, 耗时 {t1-t0:.1f}s")
 
     stats = {
         'zone1_kept':       n_safe,
@@ -245,7 +317,7 @@ def refine_reads(embeddings, labels, zone_ids, centroids, delta, round_idx=1):
         'zone3_dirty':      n_dirty,
     }
 
-    print(f"   ✅ 修正完成:")
+    print(f"   ✅ 修正结果:")
     print(f"      Zone I  保持:    {stats['zone1_kept']}")
     print(f"      Zone II 重分配:  {stats['zone2_reassigned']}")
     print(f"      Zone II 噪声:    {stats['zone2_noise']}")

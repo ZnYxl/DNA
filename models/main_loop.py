@@ -108,6 +108,7 @@ def main_loop():
             device=args.device, round_idx=iteration,
             refined_labels=current_labels_path, prev_state=current_state_path,
             gt_tags_file=args.gt_tags_file, gt_refs_file=args.gt_refs_file,
+            training_cap=args.training_cap,
         )
         results = run_step2(step2_args)
 

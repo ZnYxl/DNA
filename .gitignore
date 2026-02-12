@@ -24,6 +24,7 @@ __pycache__/
 .DS_Store
 .ipynb_checkpoints/
 venv/
+CC/Step0/给师妹的clover数据集
 
 #忽略真实数据和压缩包
 *.gz
