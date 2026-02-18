@@ -80,27 +80,58 @@ def main_loop():
         print(f"🔄 Round {iteration} / {args.max_iterations}")
         print(f"{'=' * 80}\n")
 
-        # ============== Step 1 ==============
-        print(f"[Step 1] Evidence Learning...")
         step1_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step1")
+        step2_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step2")
+        step1_model_path = os.path.join(step1_out, "models", "step1_final_model.pth")
+        step2_label_dir  = os.path.join(args.experiment_dir, "04_Iterative_Labels")
 
-        step1_args = argparse.Namespace(
-            experiment_dir=args.experiment_dir, output_dir=step1_out,
-            batch_size=args.batch_size, max_clusters_per_batch=args.max_clusters_per_batch,
-            weight_decay=args.weight_decay, dim=args.dim, max_length=args.max_length,
-            min_clusters=args.min_clusters, device=args.device, round_idx=iteration,
-            feddna_checkpoint=args.feddna_checkpoint,
-            prev_checkpoint=current_checkpoint_path,
-            refined_labels=current_labels_path, prev_state=current_state_path,
-            training_cap=args.training_cap,
-        )
-        step1_checkpoint = train_step1(step1_args)
-        if step1_checkpoint is None:
-            print("❌ Step 1 失败"); break
+        # ============== 断点恢复检测 ==============
+        # 检查 Step1 是否已完成 (模型文件存在)
+        step1_done = os.path.exists(step1_model_path)
+        # 检查 Step2 是否已完成 (consensus fasta 存在)
+        step2_fasta = os.path.join(step2_out, "consensus_sequences.fasta")
+        step2_done = os.path.exists(step2_fasta)
+
+        if step1_done and step2_done:
+            # 两步都完成 → 恢复状态, 跳过整轮
+            print(f"   ⏩ Round {iteration} 已完成, 恢复状态跳过...")
+            current_checkpoint_path = step1_model_path
+            # 找最新的 refined_labels 和 read_state
+            if os.path.isdir(step2_label_dir):
+                label_files = sorted([f for f in os.listdir(step2_label_dir)
+                                      if f.startswith("refined_labels_")])
+                state_files = sorted([f for f in os.listdir(step2_label_dir)
+                                      if f.startswith("read_state_")])
+                if label_files:
+                    current_labels_path = os.path.join(step2_label_dir, label_files[-1])
+                if state_files:
+                    current_state_path = os.path.join(step2_label_dir, state_files[-1])
+            print(f"      checkpoint: {os.path.basename(step1_model_path)}")
+            print(f"      labels:     {os.path.basename(current_labels_path) if current_labels_path else 'None'}")
+            continue
+
+        # ============== Step 1 ==============
+        if step1_done:
+            print(f"[Step 1] ⏩ 模型已存在, 跳过训练")
+            step1_checkpoint = step1_model_path
+        else:
+            print(f"[Step 1] Evidence Learning...")
+            step1_args = argparse.Namespace(
+                experiment_dir=args.experiment_dir, output_dir=step1_out,
+                batch_size=args.batch_size, max_clusters_per_batch=args.max_clusters_per_batch,
+                weight_decay=args.weight_decay, dim=args.dim, max_length=args.max_length,
+                min_clusters=args.min_clusters, device=args.device, round_idx=iteration,
+                feddna_checkpoint=args.feddna_checkpoint,
+                prev_checkpoint=current_checkpoint_path,
+                refined_labels=current_labels_path, prev_state=current_state_path,
+                training_cap=args.training_cap,
+            )
+            step1_checkpoint = train_step1(step1_args)
+            if step1_checkpoint is None:
+                print("❌ Step 1 失败"); break
 
         # ============== Step 2 ==============
         print(f"\n[Step 2] Refine & Decode...")
-        step2_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step2")
 
         step2_args = argparse.Namespace(
             experiment_dir=args.experiment_dir, step1_checkpoint=step1_checkpoint,

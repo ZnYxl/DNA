@@ -74,10 +74,11 @@ def compute_centroids_weighted(embeddings, labels, strength, zone_ids):
     t0 = time.time()
 
     # ---- 全部搬到 CPU，解决 GPU OOM ----
-    emb_cpu  = F.normalize(embeddings.detach().cpu(), dim=-1)
-    lbl_cpu  = labels.detach().cpu()
-    str_cpu  = strength.detach().cpu()
-    zone_cpu = zone_ids.detach().cpu()
+    # ★ embeddings 已在 runner 中 in-place 归一化, 不再拷贝
+    emb_cpu  = embeddings.detach() if embeddings.device.type == 'cpu' else embeddings.detach().cpu()
+    lbl_cpu  = labels.detach() if labels.device.type == 'cpu' else labels.detach().cpu()
+    str_cpu  = strength.detach() if strength.device.type == 'cpu' else strength.detach().cpu()
+    zone_cpu = zone_ids.detach() if zone_ids.device.type == 'cpu' else zone_ids.detach().cpu()
 
     # 筛选 Zone I + Zone II
     valid = (lbl_cpu >= 0) & ((zone_cpu == 1) | (zone_cpu == 2))
@@ -145,9 +146,10 @@ def compute_centroids_weighted(embeddings, labels, strength, zone_ids):
 def compute_global_delta(embeddings, labels, zone_ids, centroids):
     print(f"   🎯 计算 Global Delta (P{DELTA_P})...")
 
-    emb_cpu  = F.normalize(embeddings.detach().cpu(), dim=-1)
-    lbl_cpu  = labels.detach().cpu()
-    zone_cpu = zone_ids.detach().cpu()
+    # ★ embeddings 已归一化, 不再拷贝
+    emb_cpu  = embeddings.detach() if embeddings.device.type == 'cpu' else embeddings.detach().cpu()
+    lbl_cpu  = labels.detach() if labels.device.type == 'cpu' else labels.detach().cpu()
+    zone_cpu = zone_ids.detach() if zone_ids.device.type == 'cpu' else zone_ids.detach().cpu()
 
     mask = (lbl_cpu >= 0) & (zone_cpu == 1)
     z1_indices = torch.nonzero(mask).squeeze(1)
@@ -277,9 +279,9 @@ def refine_reads(embeddings, labels, zone_ids, centroids, delta, round_idx=1):
         print(f"   ⚖️ 修正 {n_hard} 条 Zone II (CPU 双轴分块, "
               f"{len(centroids)} 质心)...")
 
-        # ---- 全部在 CPU, normalized ----
-        emb_norm = F.normalize(embeddings.detach().cpu(), dim=-1)
-        query = emb_norm[hard_indices.cpu()]
+        # ---- 全部在 CPU, 已归一化 ----
+        emb_cpu = embeddings.detach() if embeddings.device.type == 'cpu' else embeddings.detach().cpu()
+        query = emb_cpu[hard_indices.cpu() if hard_indices.is_cuda else hard_indices]
 
         sorted_ids = sorted(centroids.keys())
         centroid_matrix = torch.stack([centroids[k] for k in sorted_ids])

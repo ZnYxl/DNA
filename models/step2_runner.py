@@ -220,6 +220,13 @@ def run_step2(args):
 
     print(f"   ✅ 推理写入完成: {offset} samples, embeddings {embeddings.shape}", flush=True)
 
+    # ★★★ 原地归一化 (避免后续函数反复拷贝, 省 4.1GB)
+    print(f"   🔄 原地归一化 embeddings...", flush=True)
+    norms = embeddings.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    embeddings.div_(norms)
+    del norms
+    print(f"   ✅ 归一化完成 (in-place, 零额外内存)", flush=True)
+
     # ★★★ 释放 GPU 显存 — 后续 refine 全在 CPU
     print(f"   🗑️ 释放 GPU 显存...", flush=True)
     del model
@@ -281,6 +288,11 @@ def run_step2(args):
     print("\n" + "=" * 60)
     print("🧬 Consensus 解码 (按簇重新推理)")
     print("=" * 60)
+
+    # ★ 释放最大的张量 (embeddings ~2GB + centroids), consensus 不需要它们
+    del embeddings, centroids
+    import gc; gc.collect()
+    print("   🗑️ 已释放 embeddings/centroids, 回收内存", flush=True)
 
     # 重新加载模型到 GPU 做 consensus
     device_consensus = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -392,6 +404,7 @@ def _consensus_with_reinference(model, dataset, new_labels, zone_ids,
 
     processed = 0
     total_clusters = len(cluster_to_didx)
+    CONSENSUS_BATCH = 512  # 大簇分批推理, 防 OOM
 
     for label, didx_list in cluster_to_didx.items():
         if len(didx_list) < 2:
@@ -404,18 +417,28 @@ def _consensus_with_reinference(model, dataset, new_labels, zone_ids,
             real_idx = dataset.valid_indices[didx]
             seq = dataset.data_loader.reads[real_idx]
             reads_list.append(seq_to_onehot(seq, max_len))
-            hc_flags.append(zone_np[didx] == 1)  # Zone I = 高置信度
+            hc_flags.append(zone_np[didx] == 1)
 
-        reads_tensor = torch.stack(reads_list).to(device)
-        hc_mask = torch.tensor(hc_flags, device=device)
+        hc_mask = torch.tensor(hc_flags)
+        count = len(didx_list)
 
-        with torch.no_grad():
-            emb, pooled = model.encode_reads(reads_tensor)
-            evid, stre, alph = model.decode_to_evidence(emb)
-        strength_seq = stre.mean(dim=1)
+        # ★ 分批推理 (防止大簇 OOM)
+        all_alph = []
+        all_stre = []
+        for bi in range(0, count, CONSENSUS_BATCH):
+            be = min(bi + CONSENSUS_BATCH, count)
+            batch_tensor = torch.stack(reads_list[bi:be]).to(device)
+            with torch.no_grad():
+                emb, pooled = model.encode_reads(batch_tensor)
+                evid, stre, alph = model.decode_to_evidence(emb)
+            all_alph.append(alph.cpu())
+            all_stre.append(stre.mean(dim=1).cpu())
+            del emb, pooled, evid, stre, alph, batch_tensor
+
+        alph = torch.cat(all_alph)
+        strength_seq = torch.cat(all_stre)
 
         high_conf_count = int(hc_mask.sum().item())
-        count = len(didx_list)
 
         if high_conf_count == 0:
             continue
@@ -443,6 +466,7 @@ def _consensus_with_reinference(model, dataset, new_labels, zone_ids,
 
         processed += 1
         if processed % 5000 == 0:
+            torch.cuda.empty_cache()  # 定期清理碎片
             print(f"      Consensus: {processed}/{total_clusters}", flush=True)
 
     print(f"\n   🧬 共识序列: {len(consensus_dict)} 个")
