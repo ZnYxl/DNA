@@ -1,33 +1,74 @@
 # models/main_loop.py
 """
-SSI-EC 闭环迭代总控 (Universal Edition)
+SSI-EC 闭环迭代总控 (v2 精简版)
 
-修复清单:
+v2 变更:
+  [NEW] 迭代结束后调用 Post-processing: 全量距离分配 (消除所有 -1)
+  [NEW] 最终评估: 完整指标体系 (ARI/NMI/Purity/Recovery/Recall@cluster)
+  [NEW] 收敛性追踪: 每轮标签变化率
+
+保留:
   [FIX] 预训练权重路径修正
-  [NEW] --gt_tags_file 支持 GT 评估
-  [NEW] training_cap 可配置
-  通用设计：通过命令行参数切换 Goldman / id20 / ERR036
+  [FIX] --gt_tags_file 支持 GT 评估
+  [FIX] training_cap 可配置
 
 用法:
+  # exp_1
+  python main_loop.py \\
+    --experiment_dir .../exp_1_Real \\
+    --max_length 150 \\
+    --gt_tags_file .../exp1_bwa_tags_reads.txt
+
   # id20
-  python main_loop.py --experiment_dir .../id20_Real --max_length 150 --gt_tags_file .../id20_tags_reads.txt
-  # Goldman
-  python main_loop.py --experiment_dir .../Goldman_Real --max_length 117 --gt_tags_file None
+  python main_loop.py \\
+    --experiment_dir .../id20_Real \\
+    --max_length 150 \\
+    --gt_tags_file .../id20_tags_reads.txt
 """
 import os
 import argparse
 import sys
+import numpy as np
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir  = os.path.dirname(current_dir)
+parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-from models.step1_train  import train_step1
+from models.step1_train import train_step1
 from models.step2_runner import run_step2
 
 
+def compute_label_change_rate(prev_labels_path, curr_labels_path):
+    """
+    收敛性追踪: 计算两轮之间的标签变化率
+    = Hamming(labels_t, labels_{t-1}) / N
+    """
+    if prev_labels_path is None or not os.path.exists(prev_labels_path):
+        return None
+    if curr_labels_path is None or not os.path.exists(curr_labels_path):
+        return None
+
+    try:
+        prev = np.loadtxt(prev_labels_path, dtype=int)
+        curr = np.loadtxt(curr_labels_path, dtype=int)
+
+        if len(prev) != len(curr):
+            return None
+
+        # 只比较两轮都有有效标签的 reads
+        valid = (prev >= 0) & (curr >= 0)
+        if valid.sum() == 0:
+            return None
+
+        changed = (prev[valid] != curr[valid]).sum()
+        rate = changed / valid.sum()
+        return rate
+    except Exception:
+        return None
+
+
 def main_loop():
-    parser = argparse.ArgumentParser(description="SSI-EC Master Loop")
+    parser = argparse.ArgumentParser(description="SSI-EC Master Loop (v2)")
 
     # ===== 数据集配置 =====
     parser.add_argument('--experiment_dir', type=str,
@@ -47,7 +88,7 @@ def main_loop():
     parser.add_argument('--max_iterations', type=int, default=3)
     parser.add_argument('--device', type=str, default='cuda')
 
-    # ===== [FIX] 预训练权重 =====
+    # ===== 预训练权重 =====
     parser.add_argument('--feddna_checkpoint', type=str,
                         default='/mnt/st_data/liangxinyi/code/result/FLDNA_I/I_1214234233/model/epoch1_I.pth')
 
@@ -63,11 +104,15 @@ def main_loop():
     if args.gt_tags_file and args.gt_tags_file.lower() == 'none':
         args.gt_tags_file = None
 
-    current_labels_path     = None
+    current_labels_path = None
     current_checkpoint_path = None
-    current_state_path      = None
+    current_state_path = None
+    current_centroids_path = None
 
-    print(f"🚀 SSI-EC 闭环迭代启动")
+    # 收敛性追踪
+    convergence_log = []
+
+    print(f"🚀 SSI-EC 闭环迭代启动 (v2)")
     print(f"📂 实验目录: {args.experiment_dir}")
     print(f"📏 序列长度: {args.max_length} bp")
     print(f"🔁 迭代轮数: {args.max_iterations}")
@@ -80,58 +125,29 @@ def main_loop():
         print(f"🔄 Round {iteration} / {args.max_iterations}")
         print(f"{'=' * 80}\n")
 
-        step1_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step1")
-        step2_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step2")
-        step1_model_path = os.path.join(step1_out, "models", "step1_final_model.pth")
-        step2_label_dir  = os.path.join(args.experiment_dir, "04_Iterative_Labels")
-
-        # ============== 断点恢复检测 ==============
-        # 检查 Step1 是否已完成 (模型文件存在)
-        step1_done = os.path.exists(step1_model_path)
-        # 检查 Step2 是否已完成 (consensus fasta 存在)
-        step2_fasta = os.path.join(step2_out, "consensus_sequences.fasta")
-        step2_done = os.path.exists(step2_fasta)
-
-        if step1_done and step2_done:
-            # 两步都完成 → 恢复状态, 跳过整轮
-            print(f"   ⏩ Round {iteration} 已完成, 恢复状态跳过...")
-            current_checkpoint_path = step1_model_path
-            # 找最新的 refined_labels 和 read_state
-            if os.path.isdir(step2_label_dir):
-                label_files = sorted([f for f in os.listdir(step2_label_dir)
-                                      if f.startswith("refined_labels_")])
-                state_files = sorted([f for f in os.listdir(step2_label_dir)
-                                      if f.startswith("read_state_")])
-                if label_files:
-                    current_labels_path = os.path.join(step2_label_dir, label_files[-1])
-                if state_files:
-                    current_state_path = os.path.join(step2_label_dir, state_files[-1])
-            print(f"      checkpoint: {os.path.basename(step1_model_path)}")
-            print(f"      labels:     {os.path.basename(current_labels_path) if current_labels_path else 'None'}")
-            continue
+        prev_labels_path = current_labels_path  # 保留上一轮标签用于收敛性计算
 
         # ============== Step 1 ==============
-        if step1_done:
-            print(f"[Step 1] ⏩ 模型已存在, 跳过训练")
-            step1_checkpoint = step1_model_path
-        else:
-            print(f"[Step 1] Evidence Learning...")
-            step1_args = argparse.Namespace(
-                experiment_dir=args.experiment_dir, output_dir=step1_out,
-                batch_size=args.batch_size, max_clusters_per_batch=args.max_clusters_per_batch,
-                weight_decay=args.weight_decay, dim=args.dim, max_length=args.max_length,
-                min_clusters=args.min_clusters, device=args.device, round_idx=iteration,
-                feddna_checkpoint=args.feddna_checkpoint,
-                prev_checkpoint=current_checkpoint_path,
-                refined_labels=current_labels_path, prev_state=current_state_path,
-                training_cap=args.training_cap,
-            )
-            step1_checkpoint = train_step1(step1_args)
-            if step1_checkpoint is None:
-                print("❌ Step 1 失败"); break
+        print(f"[Step 1] Evidence Learning...")
+        step1_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step1")
+
+        step1_args = argparse.Namespace(
+            experiment_dir=args.experiment_dir, output_dir=step1_out,
+            batch_size=args.batch_size, max_clusters_per_batch=args.max_clusters_per_batch,
+            weight_decay=args.weight_decay, dim=args.dim, max_length=args.max_length,
+            min_clusters=args.min_clusters, device=args.device, round_idx=iteration,
+            feddna_checkpoint=args.feddna_checkpoint,
+            prev_checkpoint=current_checkpoint_path,
+            refined_labels=current_labels_path, prev_state=current_state_path,
+            training_cap=args.training_cap,
+        )
+        step1_checkpoint = train_step1(step1_args)
+        if step1_checkpoint is None:
+            print("❌ Step 1 失败"); break
 
         # ============== Step 2 ==============
         print(f"\n[Step 2] Refine & Decode...")
+        step2_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step2")
 
         step2_args = argparse.Namespace(
             experiment_dir=args.experiment_dir, step1_checkpoint=step1_checkpoint,
@@ -146,12 +162,78 @@ def main_loop():
         # ============== 状态更新 ==============
         if results and 'next_round_files' in results:
             nrf = results['next_round_files']
-            current_labels_path     = nrf['labels']
-            current_state_path      = nrf.get('state')
+            current_labels_path = nrf['labels']
+            current_state_path = nrf.get('state')
+            current_centroids_path = nrf.get('centroids')
             current_checkpoint_path = step1_checkpoint
             print(f"\n✅ Round {iteration} 完成. 标签: {os.path.basename(current_labels_path)}")
+
+            # 收敛性追踪
+            change_rate = compute_label_change_rate(prev_labels_path, current_labels_path)
+            if change_rate is not None:
+                convergence_log.append({
+                    'round': iteration,
+                    'label_change_rate': change_rate
+                })
+                print(f"   📈 标签变化率: {change_rate:.4f} ({change_rate*100:.2f}%)")
+            else:
+                print(f"   📈 标签变化率: N/A (首轮)")
         else:
             print("❌ Step 2 失败"); break
+
+    # =====================================================================
+    # Post-processing: 全量距离分配
+    # =====================================================================
+    if current_labels_path and current_centroids_path and current_checkpoint_path:
+        print(f"\n{'=' * 80}")
+        print(f"🔧 Post-processing: 全量距离分配")
+        print(f"{'=' * 80}")
+
+        try:
+            from models.post_process import post_process_final_assignment
+
+            pp_output_dir = os.path.join(args.experiment_dir, "results", "final")
+            final_labels_path = post_process_final_assignment(
+                experiment_dir=args.experiment_dir,
+                final_checkpoint_path=current_checkpoint_path,
+                final_labels_path=current_labels_path,
+                centroids_path=current_centroids_path,
+                output_dir=pp_output_dir,
+                device=args.device,
+                dim=args.dim,
+                max_length=args.max_length,
+                gt_tags_file=args.gt_tags_file,
+            )
+            print(f"\n✅ 最终标签: {final_labels_path}")
+        except Exception as e:
+            print(f"❌ Post-processing 失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # =====================================================================
+    # 收敛性报告
+    # =====================================================================
+    if convergence_log:
+        print(f"\n{'=' * 60}")
+        print(f"📈 收敛性报告")
+        print(f"{'=' * 60}")
+        for entry in convergence_log:
+            r = entry['round']
+            cr = entry['label_change_rate']
+            bar = '█' * int(cr * 100) + '░' * (50 - int(cr * 100))
+            print(f"   Round {r}: {cr:.4f} ({cr*100:.2f}%) {bar}")
+
+        # 保存收敛性日志
+        try:
+            conv_path = os.path.join(args.experiment_dir, "results", "convergence_log.txt")
+            os.makedirs(os.path.dirname(conv_path), exist_ok=True)
+            with open(conv_path, 'w') as f:
+                f.write("Round,Label_Change_Rate\n")
+                for entry in convergence_log:
+                    f.write(f"{entry['round']},{entry['label_change_rate']:.6f}\n")
+            print(f"   💾 收敛性日志: {conv_path}")
+        except Exception as e:
+            print(f"   ⚠️ 保存收敛性日志失败: {e}")
 
     print(f"\n🎉 实验完成！结果: {args.experiment_dir}/results/")
 
