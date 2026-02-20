@@ -109,6 +109,50 @@ def main_loop():
     current_state_path = None
     current_centroids_path = None
 
+    # =====================================================================
+    # 自动恢复: 扫描已完成的轮次, 从断点继续
+    # =====================================================================
+    start_iteration = 1
+    results_dir = os.path.join(args.experiment_dir, "results")
+    labels_dir = os.path.join(args.experiment_dir, "04_Iterative_Labels")
+
+    for check_round in range(1, args.max_iterations + 1):
+        step1_dir = os.path.join(results_dir, f"iter_{check_round}_step1", "models")
+        step2_dir = os.path.join(results_dir, f"iter_{check_round}_step2")
+
+        # 检查 Step 1 checkpoint
+        ckpt_path = os.path.join(step1_dir, "step1_final_model.pth")
+        if not os.path.exists(ckpt_path):
+            break
+
+        # 检查 Step 2 输出 (找 labels 和 state)
+        if not os.path.exists(step2_dir):
+            break
+
+        # 找到最新的 labels/state/centroids
+        import glob
+        label_files = sorted(glob.glob(os.path.join(labels_dir, "refined_labels_*.txt")))
+        state_files = sorted(glob.glob(os.path.join(labels_dir, "read_state_*.pt")))
+        centroid_files = sorted(glob.glob(os.path.join(labels_dir, "centroids_*.pt")))
+
+        if not label_files:
+            break
+
+        # 这一轮完整, 更新状态
+        current_checkpoint_path = ckpt_path
+        current_labels_path = label_files[-1]
+        current_state_path = state_files[-1] if state_files else None
+        current_centroids_path = centroid_files[-1] if centroid_files else None
+        start_iteration = check_round + 1
+        print(f"   ✅ 检测到 Round {check_round} 已完成:")
+        print(f"      checkpoint: {os.path.basename(ckpt_path)}")
+        print(f"      labels:     {os.path.basename(current_labels_path)}")
+
+    if start_iteration > 1:
+        print(f"\n⏩ 从 Round {start_iteration} 继续 (跳过已完成的 {start_iteration - 1} 轮)")
+    else:
+        print(f"\n🆕 从 Round 1 开始 (无已有结果)")
+
     # 收敛性追踪
     convergence_log = []
 
@@ -120,7 +164,7 @@ def main_loop():
     if args.gt_tags_file:
         print(f"📋 GT 评估:  {os.path.basename(args.gt_tags_file)}")
 
-    for iteration in range(1, args.max_iterations + 1):
+    for iteration in range(start_iteration, args.max_iterations + 1):
         print(f"\n{'=' * 80}")
         print(f"🔄 Round {iteration} / {args.max_iterations}")
         print(f"{'=' * 80}\n")

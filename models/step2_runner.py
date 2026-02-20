@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import sys
+import gc
 import argparse
 import numpy as np
 from datetime import datetime
@@ -101,6 +102,9 @@ def run_step2(args):
             model.length_adapter = nn.Linear(sh[1], sh[0]).to(device)
     model.load_state_dict(sd, strict=False)
     model.eval()
+    checkpoint_path_for_consensus = args.step1_checkpoint  # 保存路径, consensus 时重新加载
+    del checkpoint, sd  # ★ 释放 checkpoint 内存
+    gc.collect()
 
     # =====================================================================
     # 2. 推理 (全量, 只保留标量: pooled_emb, strength, u_epi, u_ale)
@@ -110,25 +114,13 @@ def run_step2(args):
     print("🔮 推理 (提取 Embeddings)")
     print("=" * 60)
 
-    cap = getattr(args, 'training_cap', TOTAL_READS)
-    use_full = (cap >= TOTAL_READS)
-
-    if use_full:
-        dataset = Step1Dataset(
-            data_loader,
-            max_len=model_max_len,
-            inference_mode=True
-        )
-        print(f"   🔮 全量推理: {TOTAL_READS} reads (label >= 0)")
-    else:
-        dataset = Step1Dataset(
-            data_loader,
-            max_len=model_max_len,
-            training_cap=cap,
-            round_idx=args.round_idx,
-            inference_mode=False
-        )
-        print(f"   🧪 测试模式: {cap} reads")
+    # Step 2 始终全量推理 (training_cap 仅限制 Step 1 训练)
+    dataset = Step1Dataset(
+        data_loader,
+        max_len=model_max_len,
+        inference_mode=True  # 全量, 不受 training_cap 限制
+    )
+    print(f"   🔮 全量推理: {TOTAL_READS} reads (label >= 0)")
 
     inference_loader = torch.utils.data.DataLoader(
         dataset, batch_size=1024, shuffle=False,
@@ -193,10 +185,16 @@ def run_step2(args):
 
     print(f"   ✅ 推理完成: {offset} samples, embeddings {embeddings.shape}", flush=True)
 
+    # 归一化 embeddings (质心计算也会归一化, 必须一致)
+    print(f"   🔄 原地归一化 embeddings...")
+    embeddings = F.normalize(embeddings, dim=-1)
+    print(f"   ✅ 归一化完成")
+
     # 释放 GPU
     print(f"   🗑️ 释放 GPU 显存...", flush=True)
     del model
     torch.cuda.empty_cache()
+    gc.collect()
     print(f"   ✅ GPU 显存已释放", flush=True)
 
     # =====================================================================
@@ -210,12 +208,22 @@ def run_step2(args):
     )
     delta = compute_global_delta(embeddings, labels, zone_ids, centroids)
 
+    # ★ 内存优化: 释放不再需要的 strength, u_epi, u_ale
+    del strength, u_epi, u_ale
+    gc.collect()
+    print(f"   🗑️ 已释放 strength/u_epi/u_ale, 进入修正阶段", flush=True)
+
     # =====================================================================
     # 4. Zone-aware 修正
     # =====================================================================
     new_labels, noise_mask, refine_stats = refine_reads(
         embeddings, labels, zone_ids, centroids, delta, round_idx=args.round_idx
     )
+
+    # ★ 内存优化: refine 完成, embeddings 不再需要
+    del embeddings
+    gc.collect()
+    print(f"   🗑️ 已释放 embeddings", flush=True)
 
     # =====================================================================
     # 5. Consensus 解码 (按簇重新推理 evidence)
@@ -232,13 +240,17 @@ def run_step2(args):
         device=str(device_consensus)
     ).to(device_consensus)
 
-    sd = checkpoint['model_state_dict']
+    # ★ 重新加载 checkpoint (之前已释放以节省内存)
+    checkpoint_reload = torch.load(checkpoint_path_for_consensus, map_location=device_consensus)
+    sd = checkpoint_reload['model_state_dict']
     if 'length_adapter.weight' in sd:
         sh = sd['length_adapter.weight'].shape
         if sh[0] == model_max_len:
             model_consensus.length_adapter = nn.Linear(sh[1], sh[0]).to(device_consensus)
     model_consensus.load_state_dict(sd, strict=False)
     model_consensus.eval()
+    del checkpoint_reload, sd
+    gc.collect()
 
     consensus_dict = _consensus_with_reinference(
         model_consensus, dataset, new_labels, zone_ids, flat_real_indices,
