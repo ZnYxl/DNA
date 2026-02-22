@@ -125,15 +125,15 @@ def run_step2(args):
     inference_loader = torch.utils.data.DataLoader(
         dataset, batch_size=1024, shuffle=False,
         num_workers=0,
-        pin_memory=True
+        pin_memory=False  # ★ 节省锁定内存
     )
 
-    # 预分配张量
+    # 预分配张量 (embeddings 用 float16 节省 50% 内存)
     N = len(dataset)
     D = step1_args.get('dim', args.dim)
-    print(f"   📦 预分配: {N} samples × {D} dim", flush=True)
+    print(f"   📦 预分配: {N} samples × {D} dim (float16)", flush=True)
 
-    embeddings = torch.zeros(N, D)
+    embeddings = torch.zeros(N, D, dtype=torch.float16)  # ★ float16: 省 1.8GB
     strength = torch.zeros(N)
     u_epi = torch.zeros(N)
     u_ale = torch.zeros(N)
@@ -159,7 +159,9 @@ def run_step2(args):
         evid, stre, alph = model.decode_to_evidence(emb)
         epi, ale = decompose_uncertainty(alph)
 
-        embeddings[offset:offset+B] = pooled.cpu()
+        # ★ 归一化后转 float16 存储
+        pooled_normed = F.normalize(pooled, dim=-1)
+        embeddings[offset:offset+B] = pooled_normed.cpu().half()
         strength[offset:offset+B] = stre.mean(dim=1).cpu()
         u_epi[offset:offset+B] = epi.cpu()
         u_ale[offset:offset+B] = ale.cpu()
@@ -183,54 +185,89 @@ def run_step2(args):
     labels = labels[:offset]
     flat_real_indices = flat_real_indices[:offset].numpy()
 
-    print(f"   ✅ 推理完成: {offset} samples, embeddings {embeddings.shape}", flush=True)
+    print(f"   ✅ 推理完成: {offset} samples, embeddings {embeddings.shape} (float16)", flush=True)
 
-    # 归一化 embeddings (质心计算也会归一化, 必须一致)
-    print(f"   🔄 原地归一化 embeddings...")
-    embeddings = F.normalize(embeddings, dim=-1)
-    print(f"   ✅ 归一化完成")
-
-    # 释放 GPU
-    print(f"   🗑️ 释放 GPU 显存...", flush=True)
-    del model
+    # ★ 释放 GPU + inference 相关对象
+    print(f"   🗑️ 释放 GPU 显存 + 推理对象...", flush=True)
+    del model, inference_loader
     torch.cuda.empty_cache()
     gc.collect()
-    print(f"   ✅ GPU 显存已释放", flush=True)
+
+    # ★★★ 关键: 保存 valid_indices 后释放 data_loader.reads (~2GB!)
+    # consensus 需要 reads，但我们保存 experiment_dir 路径，后面从磁盘重读
+    _saved_valid_indices = list(dataset.valid_indices)
+    _saved_gt_labels = list(data_loader.gt_labels) if hasattr(data_loader, 'gt_labels') else []
+    data_loader.reads = []  # ★ 释放 ~2GB 字符串内存
+    del dataset
+    gc.collect()
+    print(f"   ✅ 已释放 reads 字符串 (~2GB) + GPU 显存", flush=True)
 
     # =====================================================================
     # 3. 三区制划分 & 质心 & Delta
-    #    [v2] 不再有动量更新, 不再有哨兵标签
     # =====================================================================
     zone_ids, zone_stats = split_confidence_by_zone(u_epi, u_ale, labels)
 
+    # ★ 质心计算: float16 embeddings 自动 upcast (index_add_ 不支持 fp16)
+    emb_f32_for_centroids = embeddings.float()
     centroids, cluster_sizes = compute_centroids_weighted(
-        embeddings, labels, strength, zone_ids
+        emb_f32_for_centroids, labels, strength, zone_ids
     )
-    delta = compute_global_delta(embeddings, labels, zone_ids, centroids)
+    delta = compute_global_delta(emb_f32_for_centroids, labels, zone_ids, centroids)
+    del emb_f32_for_centroids
+    gc.collect()
 
-    # ★ 内存优化: 释放不再需要的 strength, u_epi, u_ale
+    # ★★★ 保存状态到 numpy (在删除任何变量之前!)
+    print(f"   💾 保存状态变量到 numpy...", flush=True)
+    _np_u_epi = u_epi.cpu().numpy().copy()
+    _np_u_ale = u_ale.cpu().numpy().copy()
+    _np_strength = strength.cpu().numpy().copy()
+    _np_zone_ids = zone_ids.cpu().numpy().copy()
+    _avg_strength = float(strength.mean().item())
+
+    # ★ 释放不再需要的 torch 张量
     del strength, u_epi, u_ale
     gc.collect()
-    print(f"   🗑️ 已释放 strength/u_epi/u_ale, 进入修正阶段", flush=True)
+    print(f"   🗑️ 已释放 strength/u_epi/u_ale 张量", flush=True)
 
     # =====================================================================
     # 4. Zone-aware 修正
     # =====================================================================
+    # refine 需要 embeddings, 用 float16 → float32 分块处理
+    emb_f32_for_refine = embeddings.float()
+    del embeddings  # 释放 float16 版本
+    gc.collect()
+
     new_labels, noise_mask, refine_stats = refine_reads(
-        embeddings, labels, zone_ids, centroids, delta, round_idx=args.round_idx
+        emb_f32_for_refine, labels, zone_ids, centroids, delta, round_idx=args.round_idx
     )
 
-    # ★ 内存优化: refine 完成, embeddings 不再需要
-    del embeddings
+    # ★ refine 完成, embeddings 不再需要
+    del emb_f32_for_refine
     gc.collect()
     print(f"   🗑️ 已释放 embeddings", flush=True)
 
     # =====================================================================
-    # 5. Consensus 解码 (按簇重新推理 evidence)
+    # 5. Consensus 解码 (从磁盘重新加载 reads)
     # =====================================================================
     print("\n" + "=" * 60)
     print("🧬 Consensus 解码 (按簇重新推理)")
     print("=" * 60)
+
+    # ★ 从磁盘重新加载 reads (只在 consensus 阶段需要)
+    print(f"   📂 从磁盘重新加载 reads (仅 consensus 用)...", flush=True)
+    _disk_reads = []
+    read_path = os.path.join(
+        data_loader.feddna_dir if hasattr(data_loader, 'feddna_dir')
+        else os.path.join(args.experiment_dir, "03_FedDNA_In"),
+        "read.txt"
+    )
+    with open(read_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("====="):
+                continue
+            _disk_reads.append(line)
+    print(f"   ✅ 重新加载 {len(_disk_reads)} 条 reads", flush=True)
 
     device_consensus = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     model_consensus = Step1EvidentialModel(
@@ -240,7 +277,6 @@ def run_step2(args):
         device=str(device_consensus)
     ).to(device_consensus)
 
-    # ★ 重新加载 checkpoint (之前已释放以节省内存)
     checkpoint_reload = torch.load(checkpoint_path_for_consensus, map_location=device_consensus)
     sd = checkpoint_reload['model_state_dict']
     if 'length_adapter.weight' in sd:
@@ -252,33 +288,35 @@ def run_step2(args):
     del checkpoint_reload, sd
     gc.collect()
 
-    consensus_dict = _consensus_with_reinference(
-        model_consensus, dataset, new_labels, zone_ids, flat_real_indices,
+    # ★ 使用磁盘读取的 reads 做 consensus
+    consensus_dict = _consensus_with_reinference_from_reads(
+        model_consensus, _disk_reads, _saved_valid_indices,
+        new_labels, zone_ids, flat_real_indices,
         model_max_len, device_consensus
     )
 
-    del model_consensus
+    del model_consensus, _disk_reads
     torch.cuda.empty_cache()
+    gc.collect()
 
     fasta_path = os.path.join(args.output_dir, "consensus_sequences.fasta")
     save_consensus_sequences(consensus_dict, fasta_path)
 
     # =====================================================================
-    # 5b. GT 评估 (可选)
+    # 5b. GT 评估 (用保存的 numpy 数据)
     # =====================================================================
-    if gt_tags_file and os.path.exists(gt_tags_file):
-        _evaluate_with_gt(consensus_dict, data_loader, new_labels,
-                          flat_real_indices, args.output_dir)
+    if gt_tags_file and os.path.exists(gt_tags_file) and _saved_gt_labels:
+        _evaluate_with_gt_numpy(consensus_dict, _saved_gt_labels, new_labels,
+                                flat_real_indices, args.output_dir)
 
     # =====================================================================
     # 5c. 每轮评估指标 (ARI/NMI 等)
     # =====================================================================
-    if gt_tags_file and os.path.exists(gt_tags_file):
+    if gt_tags_file and os.path.exists(gt_tags_file) and _saved_gt_labels:
         try:
             from models.eval_metrics import compute_all_metrics, save_metrics_report
-            gt_arr = np.array(data_loader.gt_labels)
+            gt_arr = np.array(_saved_gt_labels)
 
-            # 构建全长预测标签
             round_pred = np.full(TOTAL_READS, -1, dtype=int)
             round_pred[flat_real_indices] = new_labels.cpu().numpy()
 
@@ -290,8 +328,7 @@ def run_step2(args):
             print(f"   ⚠️ 评估指标计算跳过: {e}")
 
     # =====================================================================
-    # 6. 保存全长状态
-    #    [v2] 额外保存质心 (供 post-processing 使用)
+    # 6. 保存全长状态 (使用之前保存的 numpy)
     # =====================================================================
     next_round_dir = os.path.join(args.experiment_dir, "04_Iterative_Labels")
     os.makedirs(next_round_dir, exist_ok=True)
@@ -303,16 +340,16 @@ def run_step2(args):
     label_path = os.path.join(next_round_dir, f"refined_labels_{ts}.txt")
     np.savetxt(label_path, full_labels, fmt='%d')
 
-    # 保存状态
+    # 保存状态 (用之前 copy 的 numpy)
     full_u_epi = np.zeros(TOTAL_READS, dtype=np.float32)
     full_u_ale = np.zeros(TOTAL_READS, dtype=np.float32)
     full_strength = np.zeros(TOTAL_READS, dtype=np.float32)
     full_zone_ids = np.zeros(TOTAL_READS, dtype=np.int64)
 
-    full_u_epi[flat_real_indices] = u_epi.cpu().numpy()
-    full_u_ale[flat_real_indices] = u_ale.cpu().numpy()
-    full_strength[flat_real_indices] = strength.cpu().numpy()
-    full_zone_ids[flat_real_indices] = zone_ids.cpu().numpy()
+    full_u_epi[flat_real_indices] = _np_u_epi
+    full_u_ale[flat_real_indices] = _np_u_ale
+    full_strength[flat_real_indices] = _np_strength
+    full_zone_ids[flat_real_indices] = _np_zone_ids
 
     state_path = os.path.join(next_round_dir, f"read_state_{ts}.pt")
     torch.save({
@@ -320,6 +357,9 @@ def run_step2(args):
         'strength': full_strength, 'zone_ids': full_zone_ids,
         'round_idx': args.round_idx
     }, state_path)
+
+    del full_u_epi, full_u_ale, full_strength, full_zone_ids
+    gc.collect()
 
     # [v2] 保存质心
     centroids_path = os.path.join(next_round_dir, f"centroids_{ts}.pt")
@@ -334,15 +374,21 @@ def run_step2(args):
     # =====================================================================
     # 7. 论文数据埋点
     # =====================================================================
-    _record_paper_log(args, TOTAL_READS, refine_stats, consensus_dict,
-                      new_labels, strength, delta)
+    _record_paper_log_safe(args, TOTAL_READS, refine_stats, consensus_dict,
+                           _avg_strength, delta)
 
-    # 可视化
+    # 可视化 (用 numpy 数据)
     try:
         viz = Step1Visualizer(args.output_dir)
-        viz.plot_uncertainty_distribution(u_epi, u_ale, zone_ids)
+        viz.plot_uncertainty_distribution(
+            torch.tensor(_np_u_epi), torch.tensor(_np_u_ale),
+            torch.tensor(_np_zone_ids)
+        )
     except Exception as e:
         print(f"   ⚠️ 可视化跳过: {e}")
+
+    del _np_u_epi, _np_u_ale, _np_strength, _np_zone_ids
+    gc.collect()
 
     return {
         'next_round_files': {
@@ -354,18 +400,19 @@ def run_step2(args):
     }
 
 
+
 # ===========================================================================
-# 按簇重新推理 evidence 做 consensus (省内存)
+# 按簇重新推理 evidence 做 consensus (从 reads 列表, 省内存)
 # ===========================================================================
-def _consensus_with_reinference(model, dataset, new_labels, zone_ids,
-                                flat_real_indices, max_len, device):
+def _consensus_with_reinference_from_reads(model, reads_list, valid_indices,
+                                           new_labels, zone_ids,
+                                           flat_real_indices, max_len, device):
     from models.step1_data import seq_to_onehot
 
     cluster_to_didx = defaultdict(list)
     labels_np = new_labels.cpu().numpy()
 
-    for didx in range(len(dataset)):
-        real_idx = dataset.valid_indices[didx]
+    for didx in range(len(valid_indices)):
         label = int(labels_np[didx]) if didx < len(labels_np) else -1
         if label >= 0:
             cluster_to_didx[label].append(didx)
@@ -381,16 +428,22 @@ def _consensus_with_reinference(model, dataset, new_labels, zone_ids,
         if len(didx_list) < 2:
             continue
 
-        reads_list = []
+        reads_batch = []
         hc_flags = []
         for didx in didx_list:
-            real_idx = dataset.valid_indices[didx]
-            seq = dataset.data_loader.reads[real_idx]
-            reads_list.append(seq_to_onehot(seq, max_len))
+            real_idx = valid_indices[didx]
+            if real_idx < len(reads_list):
+                seq = reads_list[real_idx]
+            else:
+                continue
+            reads_batch.append(seq_to_onehot(seq, max_len))
             hc_flags.append(zone_np[didx] == 1)
 
-        reads_tensor = torch.stack(reads_list).to(device)
-        hc_mask = torch.tensor(hc_flags, device=device)
+        if len(reads_batch) < 2:
+            continue
+
+        reads_tensor = torch.stack(reads_batch).to(device)
+        hc_mask = torch.tensor(np.array(hc_flags, dtype=bool), device=device)
 
         with torch.no_grad():
             emb, pooled = model.encode_reads(reads_tensor)
@@ -428,22 +481,20 @@ def _consensus_with_reinference(model, dataset, new_labels, zone_ids,
         if processed % 5000 == 0:
             print(f"      Consensus: {processed}/{total_clusters}", flush=True)
 
-    print(f"\n   🧬 共识序列: {len(consensus_dict)} 个")
+    print(f"\n   \U0001f9ec 共识序列: {len(consensus_dict)} 个")
     return consensus_dict
 
 
 # ===========================================================================
-# GT 评估
+# GT 评估 (用 numpy gt_labels, 不依赖 data_loader)
 # ===========================================================================
-def _evaluate_with_gt(consensus_dict, data_loader, new_labels,
-                      flat_real_indices, output_dir):
+def _evaluate_with_gt_numpy(consensus_dict, gt_labels_list, new_labels,
+                            flat_real_indices, output_dir):
     print("\n" + "=" * 60)
-    print("📋 GT 评估")
+    print("\U0001f4cb GT 评估")
     print("=" * 60)
 
     labels_np = new_labels.cpu().numpy()
-    gt_labels = data_loader.gt_labels
-
     cluster_gt_counts = defaultdict(Counter)
     total_assigned = 0
 
@@ -451,7 +502,7 @@ def _evaluate_with_gt(consensus_dict, data_loader, new_labels,
         label = int(labels_np[i])
         if label < 0:
             continue
-        gt = gt_labels[didx_real]
+        gt = gt_labels_list[didx_real] if didx_real < len(gt_labels_list) else -1
         if gt >= 0:
             cluster_gt_counts[label][gt] += 1
             total_assigned += 1
@@ -460,46 +511,41 @@ def _evaluate_with_gt(consensus_dict, data_loader, new_labels,
         print("   ⚠️ 无 GT 匹配")
         return
 
-    # Purity
     total_correct = 0
     for cid, gt_counter in cluster_gt_counts.items():
         total_correct += gt_counter.most_common(1)[0][1]
     purity = total_correct / max(total_assigned, 1)
 
-    # Recovery
     all_gt = set()
-    recovered_gt = set()
-    for cid, gt_counter in cluster_gt_counts.items():
-        for gt_id in gt_counter:
-            all_gt.add(gt_id)
-        recovered_gt.add(gt_counter.most_common(1)[0][0])
-    recovery = len(recovered_gt) / max(len(all_gt), 1)
+    for gt_counter in cluster_gt_counts.values():
+        all_gt.update(gt_counter.keys())
+    gt_total = len(set(g for g in gt_labels_list if g >= 0))
+    recovery = len(all_gt) / max(gt_total, 1)
 
     print(f"   Purity:    {purity:.4f}  ({purity*100:.2f}%)")
     print(f"   Recovery:  {recovery:.4f}  ({recovery*100:.2f}%)")
     print(f"   Assigned:  {total_assigned:,}")
-    print(f"   GT Clusters: {len(all_gt):,}")
+    print(f"   GT Clusters: {gt_total:,}")
     print(f"   Pred Clusters with GT: {len(cluster_gt_counts):,}")
 
-    # 保存
     try:
-        report_path = os.path.join(output_dir, "gt_evaluation.txt")
-        with open(report_path, 'w') as f:
+        gt_eval_path = os.path.join(output_dir, "gt_evaluation.txt")
+        os.makedirs(output_dir, exist_ok=True)
+        with open(gt_eval_path, 'w') as f:
             f.write(f"Purity: {purity:.6f}\n")
             f.write(f"Recovery: {recovery:.6f}\n")
             f.write(f"Assigned: {total_assigned}\n")
-            f.write(f"GT Clusters: {len(all_gt)}\n")
-            f.write(f"Pred Clusters: {len(cluster_gt_counts)}\n")
-        print(f"   💾 GT 评估: {report_path}")
+            f.write(f"GT_Clusters: {gt_total}\n")
+        print(f"   💾 GT 评估: {gt_eval_path}")
     except Exception as e:
         print(f"   ⚠️ 保存 GT 评估失败: {e}")
 
 
 # ===========================================================================
-# 论文数据埋点 [v2] 移除 resurrection 相关字段
+# 论文数据埋点 (安全版, 不依赖已释放变量)
 # ===========================================================================
-def _record_paper_log(args, total_reads, refine_stats, consensus_dict,
-                      new_labels, strength, delta):
+def _record_paper_log_safe(args, total_reads, refine_stats, consensus_dict,
+                           avg_strength, delta):
     try:
         log_file = os.path.join(args.output_dir, "paper_log.csv")
         with open(log_file, 'w') as f:
@@ -510,14 +556,13 @@ def _record_paper_log(args, total_reads, refine_stats, consensus_dict,
             z2_fix = refine_stats.get('zone2_reassigned', 0)
             z3 = refine_stats.get('zone3_dirty', 0)
             final_clusters = len(consensus_dict)
-            avg_s = strength.mean().item()
 
             hc_ratios = [c['num_high_conf'] / c['num_reads']
                          for c in consensus_dict.values() if c['num_reads'] > 0]
             avg_hc = sum(hc_ratios) / len(hc_ratios) if hc_ratios else 0.0
 
             f.write(f"{args.round_idx},{total_reads},{z1},{z2_fix},{z3},"
-                    f"{final_clusters},{avg_s:.4f},{avg_hc:.4f},{delta:.4f}\n")
+                    f"{final_clusters},{avg_strength:.4f},{avg_hc:.4f},{delta:.4f}\n")
 
         print(f"   ✅ 数据: {log_file}")
     except Exception as e:

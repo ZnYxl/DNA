@@ -95,7 +95,8 @@ def main_loop():
     # ===== 训练超参 =====
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--max_clusters_per_batch', type=int, default=64)
-    parser.add_argument('--training_cap', type=int, default=2000000)
+    parser.add_argument('--training_cap', type=int, default=999999999,
+                        help="Step1 训练采样上限, 默认全量")
     parser.add_argument('--dim', type=int, default=256)
     parser.add_argument('--min_clusters', type=int, default=50)
     parser.add_argument('--weight_decay', type=float, default=1e-5)
