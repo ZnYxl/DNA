@@ -10,7 +10,7 @@ GT_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/给师妹的clover数据集/exp
 
 # 2. Clover 聚类输出文件 (Prediction)
 # 对应 run_real_data_exp1_Fixed.py 生成的结果
-CLOVER_OUT_FILE = "./Experiments/exp_1_Real/02_CloverOut/clover_result_merged.txt"
+CLOVER_OUT_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/exp_1_NoPrimer/02_CloverOut/clover_result_merged.txt"
 
 # ===========================================
 

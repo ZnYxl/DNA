@@ -1,0 +1,20 @@
+Traceback (most recent call last):
+  File "/mnt/st_data/liangxinyi/code/eval_reconstruction.py", line 556, in <module>
+Traceback (most recent call last):
+  File "/mnt/st_data/liangxinyi/code/eval_reconstruction.py", line 556, in <module>
+    main()
+  File "/mnt/st_data/liangxinyi/code/eval_reconstruction.py", line 411, in main
+    main()
+  File "/mnt/st_data/liangxinyi/code/eval_reconstruction.py", line 411, in main
+    evidence = infer_cluster_evidence(model, reads_seqs, model_max_len, device)
+  File "/mnt/st_data/liangxinyi/miniconda3/envs/dna/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    evidence = infer_cluster_evidence(model, reads_seqs, model_max_len, device)
+  File "/mnt/st_data/liangxinyi/miniconda3/envs/dna/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/mnt/st_data/liangxinyi/code/eval_reconstruction.py", line 172, in infer_cluster_evidence
+    return func(*args, **kwargs)
+  File "/mnt/st_data/liangxinyi/code/eval_reconstruction.py", line 172, in infer_cluster_evidence
+    fused_evid, _, _ = model(reads_tensor) 
+ValueError: not enough values to unpack (expected 3, got 2)
+    fused_evid, _, _ = model(reads_tensor) 
+ValueError: not enough values to unpack (expected 3, got 2)

@@ -7,7 +7,7 @@ import numpy as np
 from collections import Counter, defaultdict
 
 # ================= 路径配置 =================
-CLOVER_RESULT = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/exp_1_Real_last/02_CloverOut/clover_result_merged.txt"
+CLOVER_RESULT = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/exp_1_NoPrimer/02_CloverOut/clover_result_merged.txt"
 GT_TAGS_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/给师妹的clover数据集/exp_1/exp1_tags_reads.txt"
 # ============================================
 
