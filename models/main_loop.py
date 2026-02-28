@@ -1,160 +1,132 @@
 # models/main_loop.py
 """
-SSI-EC 闭环迭代总控 (v2 精简版)
+SSI-EC 主循环控制
 
-v2 变更:
-  [NEW] 迭代结束后调用 Post-processing: 全量距离分配 (消除所有 -1)
-  [NEW] 最终评估: 完整指标体系 (ARI/NMI/Purity/Recovery/Recall@cluster)
-  [NEW] 收敛性追踪: 每轮标签变化率
-
-保留:
-  [FIX] 预训练权重路径修正
-  [FIX] --gt_tags_file 支持 GT 评估
-  [FIX] training_cap 可配置
-
-用法:
-  # exp_1
-  python main_loop.py \\
-    --experiment_dir .../exp_1_Real \\
-    --max_length 150 \\
-    --gt_tags_file .../exp1_bwa_tags_reads.txt
-
-  # id20
-  python main_loop.py \\
-    --experiment_dir .../id20_Real \\
-    --max_length 150 \\
-    --gt_tags_file .../id20_tags_reads.txt
+修复清单:
+  [FIX-P0]  在 Round 间传递 consensus_path 和 cluster_change_info
+             - step1_args 新增 consensus_path, cluster_change_info
+             - 从 results['next_round_files'] 提取两个新键
+  [v2]      断点续跑支持
+  [v2]      收敛性追踪
 """
-import os
 import argparse
+import os
 import sys
+import glob
+import torch
 import numpy as np
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.insert(0, parent_dir)
+parent_dir  = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
 from models.step1_train import train_step1
 from models.step2_runner import run_step2
 
 
 def compute_label_change_rate(prev_labels_path, curr_labels_path):
-    """
-    收敛性追踪: 计算两轮之间的标签变化率
-    = Hamming(labels_t, labels_{t-1}) / N
-    """
+    """计算两轮间的标签变化率"""
     if prev_labels_path is None or not os.path.exists(prev_labels_path):
         return None
-    if curr_labels_path is None or not os.path.exists(curr_labels_path):
+    if not os.path.exists(curr_labels_path):
         return None
-
     try:
         prev = np.loadtxt(prev_labels_path, dtype=int)
         curr = np.loadtxt(curr_labels_path, dtype=int)
-
-        if len(prev) != len(curr):
-            return None
-
-        # 只比较两轮都有有效标签的 reads
-        valid = (prev >= 0) & (curr >= 0)
+        valid = (prev >= 0) | (curr >= 0)
         if valid.sum() == 0:
-            return None
-
+            return 0.0
         changed = (prev[valid] != curr[valid]).sum()
-        rate = changed / valid.sum()
-        return rate
-    except Exception:
+        return float(changed) / float(valid.sum())
+    except Exception as e:
+        print(f"   ⚠️ 变化率计算失败: {e}")
         return None
 
 
 def main_loop():
-    parser = argparse.ArgumentParser(description="SSI-EC Master Loop (v2)")
-
-    # ===== 数据集配置 =====
-    parser.add_argument('--experiment_dir', type=str,
-                        default='/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/id20_Real',
-                        help="实验根目录 (包含 03_FedDNA_In/read.txt)")
-    parser.add_argument('--max_length', type=int, default=150,
-                        help="id20=150, Goldman=117, ERR036=152")
-
-    # ===== GT 评估 (可选) =====
-    parser.add_argument('--gt_tags_file', type=str,
-                        default='/mnt/st_data/liangxinyi/code/CC/Step0/给师妹的clover数据集/id20/id20_tags_reads.txt',
-                        help="GT 标签文件, 无GT时设为 None")
-    parser.add_argument('--gt_refs_file', type=str, default=None,
-                        help="GT 参考序列 FASTA (可选)")
-
-    # ===== 迭代配置 =====
-    parser.add_argument('--max_iterations', type=int, default=3)
-    parser.add_argument('--device', type=str, default='cuda')
-
-    # ===== 预训练权重 =====
-    parser.add_argument('--feddna_checkpoint', type=str,
-                        default='/mnt/st_data/liangxinyi/code/result/FLDNA_I/I_1214234233/model/epoch1_I.pth')
-
-    # ===== 训练超参 =====
-    parser.add_argument('--batch_size', type=int, default=256)
+    parser = argparse.ArgumentParser(description='SSI-EC 主循环')
+    parser.add_argument('--experiment_dir',     type=str, required=True)
+    parser.add_argument('--feddna_checkpoint',  type=str, required=True)
+    parser.add_argument('--max_iterations',     type=int, default=3)
+    parser.add_argument('--dim',                type=int, default=256)
+    parser.add_argument('--max_length',         type=int, default=150)
+    parser.add_argument('--batch_size',         type=int, default=256)
     parser.add_argument('--max_clusters_per_batch', type=int, default=64)
-    parser.add_argument('--training_cap', type=int, default=999999999,
-                        help="Step1 训练采样上限, 默认全量")
-    parser.add_argument('--dim', type=int, default=256)
-    parser.add_argument('--min_clusters', type=int, default=50)
-    parser.add_argument('--weight_decay', type=float, default=1e-5)
-
+    parser.add_argument('--weight_decay',       type=float, default=1e-4)
+    parser.add_argument('--min_clusters',       type=int, default=50)
+    parser.add_argument('--device',             type=str, default='cuda')
+    parser.add_argument('--training_cap',       type=int, default=9999000000)
+    parser.add_argument('--gt_tags_file',       type=str, default=None)
+    parser.add_argument('--gt_refs_file',       type=str, default=None)
+    parser.add_argument('--cl_mode',            type=str, default='ours',
+                        choices=['standard', 'ale_only', 'epi_only', 'ours'],
+                        help='对比学习消融模式: standard=标准InfoNCE, ale_only=只用U_ale, '
+                             'epi_only=只用U_epi, ours=完整设计(默认)')
     args = parser.parse_args()
-    if args.gt_tags_file and args.gt_tags_file.lower() == 'none':
-        args.gt_tags_file = None
 
-    current_labels_path = None
-    current_checkpoint_path = None
-    current_state_path = None
-    current_centroids_path = None
+    os.makedirs(os.path.join(args.experiment_dir, 'results'), exist_ok=True)
 
     # =====================================================================
-    # 自动恢复: 扫描已完成的轮次, 从断点继续
+    # 断点续跑检测
     # =====================================================================
+    results_dir = os.path.join(args.experiment_dir, 'results')
+    labels_dir  = os.path.join(args.experiment_dir, '04_Iterative_Labels')
+
+    current_checkpoint_path    = None
+    current_labels_path        = None
+    current_state_path         = None
+    current_centroids_path     = None
+    current_consensus_path     = None        # [FIX-P0] 新增
+    current_cluster_change_info = None       # [FIX-P0] 新增（内存中的 dict，不是路径）
     start_iteration = 1
-    results_dir = os.path.join(args.experiment_dir, "results")
-    labels_dir = os.path.join(args.experiment_dir, "04_Iterative_Labels")
 
-    for check_round in range(1, args.max_iterations + 1):
-        step1_dir = os.path.join(results_dir, f"iter_{check_round}_step1", "models")
-        step2_dir = os.path.join(results_dir, f"iter_{check_round}_step2")
+    if os.path.exists(labels_dir):
+        for check_round in range(1, args.max_iterations + 1):
+            step1_dir = os.path.join(results_dir, f"iter_{check_round}_step1")
+            step2_dir = os.path.join(results_dir, f"iter_{check_round}_step2")
 
-        # 检查 Step 1 checkpoint
-        ckpt_path = os.path.join(step1_dir, "step1_final_model.pth")
-        if not os.path.exists(ckpt_path):
-            break
+            ckpt_path = os.path.join(step1_dir, "models", "step1_final_model.pth")
+            if not os.path.exists(ckpt_path):
+                # 兼容旧路径格式
+                ckpt_path = os.path.join(step1_dir, "step1_final_model.pth")
+                if not os.path.exists(ckpt_path):
+                    break
 
-        # 检查 Step 2 输出 (找 labels 和 state)
-        if not os.path.exists(step2_dir):
-            break
+            if not os.path.exists(step2_dir):
+                break
 
-        # 找到最新的 labels/state/centroids
-        import glob
-        label_files = sorted(glob.glob(os.path.join(labels_dir, "refined_labels_*.txt")))
-        state_files = sorted(glob.glob(os.path.join(labels_dir, "read_state_*.pt")))
-        centroid_files = sorted(glob.glob(os.path.join(labels_dir, "centroids_*.pt")))
+            label_files   = sorted(glob.glob(os.path.join(labels_dir, "refined_labels_*.txt")))
+            state_files   = sorted(glob.glob(os.path.join(labels_dir, "read_state_*.pt")))
+            centroid_files= sorted(glob.glob(os.path.join(labels_dir, "centroids_*.pt")))
+            consensus_files = sorted(glob.glob(os.path.join(labels_dir, "consensus_dict_*.pt")))  # [FIX-P0]
+            change_files  = sorted(glob.glob(os.path.join(labels_dir, "cluster_change_info_*.pt")))  # [FIX-P0]
 
-        if not label_files:
-            break
+            if not label_files:
+                break
 
-        # 这一轮完整, 更新状态
-        current_checkpoint_path = ckpt_path
-        current_labels_path = label_files[-1]
-        current_state_path = state_files[-1] if state_files else None
-        current_centroids_path = centroid_files[-1] if centroid_files else None
-        start_iteration = check_round + 1
-        print(f"   ✅ 检测到 Round {check_round} 已完成:")
-        print(f"      checkpoint: {os.path.basename(ckpt_path)}")
-        print(f"      labels:     {os.path.basename(current_labels_path)}")
+            current_checkpoint_path = ckpt_path
+            current_labels_path     = label_files[-1]
+            current_state_path      = state_files[-1] if state_files else None
+            current_centroids_path  = centroid_files[-1] if centroid_files else None
+
+            # [FIX-P0] 加载 consensus_path 和 cluster_change_info
+            if consensus_files:
+                current_consensus_path = consensus_files[-1]
+            if change_files:
+                try:
+                    current_cluster_change_info = torch.load(change_files[-1], map_location='cpu')
+                except Exception:
+                    current_cluster_change_info = None
+
+            start_iteration = check_round + 1
+            print(f"   ✅ 检测到 Round {check_round} 已完成")
 
     if start_iteration > 1:
         print(f"\n⏩ 从 Round {start_iteration} 继续 (跳过已完成的 {start_iteration - 1} 轮)")
     else:
         print(f"\n🆕 从 Round 1 开始 (无已有结果)")
 
-    # 收敛性追踪
     convergence_log = []
 
     print(f"🚀 SSI-EC 闭环迭代启动 (v2)")
@@ -170,21 +142,32 @@ def main_loop():
         print(f"🔄 Round {iteration} / {args.max_iterations}")
         print(f"{'=' * 80}\n")
 
-        prev_labels_path = current_labels_path  # 保留上一轮标签用于收敛性计算
+        prev_labels_path = current_labels_path
 
         # ============== Step 1 ==============
         print(f"[Step 1] Evidence Learning...")
         step1_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step1")
 
         step1_args = argparse.Namespace(
-            experiment_dir=args.experiment_dir, output_dir=step1_out,
-            batch_size=args.batch_size, max_clusters_per_batch=args.max_clusters_per_batch,
-            weight_decay=args.weight_decay, dim=args.dim, max_length=args.max_length,
-            min_clusters=args.min_clusters, device=args.device, round_idx=iteration,
+            experiment_dir=args.experiment_dir,
+            output_dir=step1_out,
+            batch_size=args.batch_size,
+            max_clusters_per_batch=args.max_clusters_per_batch,
+            weight_decay=args.weight_decay,
+            dim=args.dim,
+            max_length=args.max_length,
+            min_clusters=args.min_clusters,
+            device=args.device,
+            round_idx=iteration,
             feddna_checkpoint=args.feddna_checkpoint,
             prev_checkpoint=current_checkpoint_path,
-            refined_labels=current_labels_path, prev_state=current_state_path,
+            refined_labels=current_labels_path,
+            prev_state=current_state_path,
             training_cap=args.training_cap,
+            cl_mode=args.cl_mode,                   # 消融实验 flag
+            # [FIX-P0] 新增：传递 consensus_path 和 cluster_change_info
+            consensus_path=current_consensus_path,
+            cluster_change_info=current_cluster_change_info,
         )
         step1_checkpoint = train_step1(step1_args)
         if step1_checkpoint is None:
@@ -195,11 +178,18 @@ def main_loop():
         step2_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step2")
 
         step2_args = argparse.Namespace(
-            experiment_dir=args.experiment_dir, step1_checkpoint=step1_checkpoint,
-            output_dir=step2_out, dim=args.dim, max_length=args.max_length,
-            device=args.device, round_idx=iteration,
-            refined_labels=current_labels_path, prev_state=current_state_path,
-            gt_tags_file=args.gt_tags_file, gt_refs_file=args.gt_refs_file,
+            experiment_dir=args.experiment_dir,
+            step1_checkpoint=step1_checkpoint,
+            output_dir=step2_out,
+            dim=args.dim,
+            max_length=args.max_length,
+            batch_size=args.batch_size,          # step2 推理 DataLoader 需要
+            device=args.device,
+            round_idx=iteration,
+            refined_labels=current_labels_path,
+            prev_state=current_state_path,
+            gt_tags_file=args.gt_tags_file,
+            gt_refs_file=args.gt_refs_file,
             training_cap=args.training_cap,
         )
         results = run_step2(step2_args)
@@ -207,19 +197,31 @@ def main_loop():
         # ============== 状态更新 ==============
         if results and 'next_round_files' in results:
             nrf = results['next_round_files']
-            current_labels_path = nrf['labels']
-            current_state_path = nrf.get('state')
+            current_labels_path    = nrf['labels']
+            current_state_path     = nrf.get('state')
             current_centroids_path = nrf.get('centroids')
             current_checkpoint_path = step1_checkpoint
-            print(f"\n✅ Round {iteration} 完成. 标签: {os.path.basename(current_labels_path)}")
 
-            # 收敛性追踪
+            # [FIX-P0] 更新 consensus_path 和 cluster_change_info
+            current_consensus_path = nrf.get('consensus')
+            change_info_path = nrf.get('cluster_change_info')
+            if change_info_path and os.path.exists(change_info_path):
+                try:
+                    current_cluster_change_info = torch.load(change_info_path, map_location='cpu')
+                except Exception as e:
+                    print(f"   ⚠️ 加载 cluster_change_info 失败: {e}")
+                    current_cluster_change_info = None
+            else:
+                current_cluster_change_info = None
+
+            print(f"\n✅ Round {iteration} 完成.")
+            print(f"   标签: {os.path.basename(current_labels_path)}")
+            if current_consensus_path:
+                print(f"   Consensus: {os.path.basename(current_consensus_path)}")
+
             change_rate = compute_label_change_rate(prev_labels_path, current_labels_path)
             if change_rate is not None:
-                convergence_log.append({
-                    'round': iteration,
-                    'label_change_rate': change_rate
-                })
+                convergence_log.append({'round': iteration, 'label_change_rate': change_rate})
                 print(f"   📈 标签变化率: {change_rate:.4f} ({change_rate*100:.2f}%)")
             else:
                 print(f"   📈 标签变化率: N/A (首轮)")
@@ -265,10 +267,9 @@ def main_loop():
         for entry in convergence_log:
             r = entry['round']
             cr = entry['label_change_rate']
-            bar = '█' * int(cr * 100) + '░' * (50 - int(cr * 100))
+            bar = '█' * min(50, int(cr * 100)) + '░' * max(0, 50 - int(cr * 100))
             print(f"   Round {r}: {cr:.4f} ({cr*100:.2f}%) {bar}")
 
-        # 保存收敛性日志
         try:
             conv_path = os.path.join(args.experiment_dir, "results", "convergence_log.txt")
             os.makedirs(os.path.dirname(conv_path), exist_ok=True)
