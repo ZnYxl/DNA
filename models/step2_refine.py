@@ -31,6 +31,7 @@ MIN_ZONE1_SAFETY   = 3
 ZONE2_WEIGHT_CAP   = 0.30
 DELTA_P            = 95
 ROUND1_DELTA_SCALE = 1.5
+MAX_ZONE3_RATIO = 0.30   # [FIX-Bug#2] Zone III 绝对上限
 
 
 # ===========================================================================
@@ -161,7 +162,7 @@ def _find_gmm_threshold(values, fallback_percentile=0.70):
 
         # 验证: 阈值切出的 Zone I 比例应在 [40%, 90%]
         zone1_ratio = (values < threshold).sum() / len(values)
-        if zone1_ratio < 0.40 or zone1_ratio > 0.90:
+        if zone1_ratio < 0.40 or zone1_ratio > 0.95:
             print(f"      ⚠️ GMM 阈值不合理 (Zone I={zone1_ratio:.1%}), fallback")
             return float(np.quantile(values, fallback_percentile)), 'fallback'
 
@@ -181,7 +182,8 @@ def split_confidence_by_zone(u_epi, u_ale, labels):
       第一刀: CDF 拐点 (Kneedle) → Zone III (U_ale 长尾噪声)
       第二刀: K=2 GMM            → Zone I / Zone II (U_epi 认知边界)
 
-    接口与 v2 完全一致, step2_runner.py 无需改动。
+    [FIX-Bug#2] 新增安全阀: Zone III 实际比例超过 30% 时强制回退
+    [FIX-Bug#6] 打印实际比例而非硬编码 "≈10%"
     """
     N      = len(labels)
     device = labels.device
@@ -198,18 +200,43 @@ def split_confidence_by_zone(u_epi, u_ale, labels):
 
     knee_value = _find_cdf_knee(ale_sorted)
 
+    # [FIX-Bug#2] Kneedle 成功时也要验证比例
     if knee_value is not None:
         ale_threshold = knee_value
-        ale_method = 'CDF knee'
         zone3_ratio = (ale_valid >= ale_threshold).sum() / len(ale_valid)
-        print(f"   🔪 第一刀 (U_ale → Zone III): {ale_method}")
-        print(f"      阈值 = {ale_threshold:.6f}, Zone III = {zone3_ratio:.1%}")
-    else:
+        if zone3_ratio > MAX_ZONE3_RATIO:
+            print(f"   🔪 第一刀 (U_ale → Zone III): CDF knee 比例={zone3_ratio:.1%} 过高, 降级 fallback")
+            knee_value = None  # 强制走 fallback
+        else:
+            print(f"   🔪 第一刀 (U_ale → Zone III): CDF knee")
+            print(f"      阈值 = {ale_threshold:.6f}, Zone III = {zone3_ratio:.1%}")
+
+    if knee_value is None:
         # Fallback: P90
         ale_threshold = float(np.quantile(ale_valid, 1.0 - FALLBACK_DIRTY_PERCENTILE))
         ale_method = f'fallback P{int((1-FALLBACK_DIRTY_PERCENTILE)*100)}'
         print(f"   🔪 第一刀 (U_ale → Zone III): {ale_method} (拐点未找到)")
-        print(f"      阈值 = {ale_threshold:.6f}, Zone III ≈ {FALLBACK_DIRTY_PERCENTILE:.0%}")
+        print(f"      阈值 = {ale_threshold:.6f}")
+
+    # [FIX-Bug#2] 安全阀：验证实际 Zone III 比例，防止天花板导致雪崩
+    actual_zone3_ratio = float((ale_valid >= ale_threshold).mean())
+    if actual_zone3_ratio > MAX_ZONE3_RATIO:
+        # 阈值切太多了（典型原因：大量数据挤在同一个值上）
+        # 策略：用严格大于 + epsilon 打破平局
+        ale_threshold_new = float(np.quantile(ale_valid, 1.0 - FALLBACK_DIRTY_PERCENTILE)) + 1e-6
+        new_ratio = float((ale_valid >= ale_threshold_new).mean())
+        if new_ratio > MAX_ZONE3_RATIO:
+            # 仍然超标：按排序直接切最脏的 10%
+            target_idx = int(len(ale_sorted) * (1.0 - FALLBACK_DIRTY_PERCENTILE))
+            target_idx = min(target_idx, len(ale_sorted) - 1)
+            ale_threshold_new = float(ale_sorted[target_idx]) + 1e-6
+            new_ratio = float((ale_valid >= ale_threshold_new).mean())
+        print(f"      ⚠️ 安全阀触发: 原比例={actual_zone3_ratio:.1%} 过高, "
+              f"新阈值={ale_threshold_new:.6f}, 新比例={new_ratio:.1%}")
+        ale_threshold = ale_threshold_new
+        actual_zone3_ratio = new_ratio
+
+    print(f"      Zone III 实际比例 = {actual_zone3_ratio:.1%}")
 
     is_dirty = valid & (u_ale >= ale_threshold)
     zone_ids[is_dirty] = 3

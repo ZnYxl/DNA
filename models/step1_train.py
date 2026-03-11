@@ -225,8 +225,8 @@ def train_step1(args):
 
         epoch_loss  = epoch_con = epoch_rec = epoch_kl = 0
         epoch_str   = epoch_hc = epoch_u_epi = epoch_u_ale = epoch_qc = 0
-        epoch_w_cc  = epoch_w_da = epoch_cos_pos = epoch_cos_neg = 0
-        epoch_probe_cnt = 0
+        epoch_w_cc = epoch_w_da = epoch_cos_pos = epoch_cos_neg = 0
+        epoch_w_cc_cnt = epoch_w_da_cnt = epoch_cos_pos_cnt = epoch_cos_neg_cnt = 0
         num_batches = 0
         total_batches = len(batch_indices_list)
 
@@ -256,15 +256,15 @@ def train_step1(args):
             epoch_u_ale += outputs.get('u_ale_mean', 0.0)
             epoch_qc    += outputs.get('queue_count', 0)
 
-            # 累积探针（仅非 nan）
+            # [FIX-Bug#4] 四个探针独立累积，避免 nan 交叉污染
             wcc = outputs.get('w_clean_clean', float('nan'))
             wda = outputs.get('w_dirty_any',   float('nan'))
             cp  = outputs.get('cos_sim_pos',   float('nan'))
             cn  = outputs.get('cos_sim_neg',   float('nan'))
-            if not (wcc != wcc):  # nan check
-                epoch_w_cc += wcc; epoch_w_da += wda
-                epoch_cos_pos += cp; epoch_cos_neg += cn
-                epoch_probe_cnt += 1
+            if wcc == wcc: epoch_w_cc += wcc; epoch_w_cc_cnt += 1
+            if wda == wda: epoch_w_da += wda; epoch_w_da_cnt += 1
+            if cp == cp:   epoch_cos_pos += cp; epoch_cos_pos_cnt += 1
+            if cn == cn:   epoch_cos_neg += cn; epoch_cos_neg_cnt += 1
 
             num_batches += 1
 
@@ -293,15 +293,22 @@ def train_step1(args):
               f"Loss: {avg(epoch_loss):.4f} | Str: {avg(epoch_str):.1f} | "
               f"Recon: {avg(epoch_rec):.4f} | U_epi: {avg(epoch_u_epi):.4f}")
 
-        # 三个诊断探针汇报
-        if epoch_probe_cnt > 0:
-            pc = epoch_probe_cnt
-            print(f"   🔬 探针 A | w(干净-干净): {epoch_w_cc/pc:.4f}  "
-                  f"w(含脏-任意): {epoch_w_da/pc:.4f}  "
-                  f"比值: {(epoch_w_cc/pc) / max(epoch_w_da/pc, 1e-6):.1f}x")
-            print(f"   🔬 探针 B | cos_pos: {epoch_cos_pos/pc:.4f}  "
-                  f"cos_neg: {epoch_cos_neg/pc:.4f}  "
-                  f"margin: {(epoch_cos_pos-epoch_cos_neg)/pc:.4f}")
+        # [FIX-Bug#4] 四个探针独立汇报
+        avg_wcc = epoch_w_cc / max(epoch_w_cc_cnt, 1)
+        avg_wda = epoch_w_da / max(epoch_w_da_cnt, 1)
+        avg_cp  = epoch_cos_pos / max(epoch_cos_pos_cnt, 1)
+        avg_cn  = epoch_cos_neg / max(epoch_cos_neg_cnt, 1)
+        wcc_s = f"{avg_wcc:.4f}" if epoch_w_cc_cnt > 0 else "nan"
+        wda_s = f"{avg_wda:.4f}" if epoch_w_da_cnt > 0 else "nan"
+        cp_s  = f"{avg_cp:.4f}"  if epoch_cos_pos_cnt > 0 else "nan"
+        cn_s  = f"{avg_cn:.4f}"  if epoch_cos_neg_cnt > 0 else "nan"
+        if epoch_w_cc_cnt > 0 or epoch_w_da_cnt > 0:
+            ratio_s = f"{avg_wcc / max(avg_wda, 1e-6):.1f}x" if epoch_w_da_cnt > 0 else "nan"
+            print(f"   🔬 探针 A | w(干净-干净): {wcc_s}  "
+                  f"w(含脏-任意): {wda_s}  比值: {ratio_s}")
+        if epoch_cos_pos_cnt > 0 or epoch_cos_neg_cnt > 0:
+            margin_s = f"{avg_cp - avg_cn:.4f}" if (epoch_cos_pos_cnt > 0 and epoch_cos_neg_cnt > 0) else "nan"
+            print(f"   🔬 探针 B | cos_pos: {cp_s}  cos_neg: {cn_s}  margin: {margin_s}")
 
     # =====================================================================
     # 9. 保存 checkpoint

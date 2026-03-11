@@ -73,7 +73,7 @@ def decompose_uncertainty(alpha):
     u_epi = u_epi_per_pos.mean(dim=-1).clamp(min=0.0)
 
     u_ale_per_pos = (rho * (psi_S_plus1 - psi_alpha_plus1)).sum(dim=-1)
-    u_ale = u_ale_per_pos.mean(dim=-1).clamp(min=0.0, max=0.95)
+    u_ale = u_ale_per_pos.mean(dim=-1).clamp(min=0.0)
 
     return u_epi, u_ale
 
@@ -301,8 +301,9 @@ class Step1EvidentialModel(nn.Module):
         # 使用 u_ale 阈值 0.5 区分干净/脏样本（实际运行中对应 Zone I vs Zone III）
         probe_stats = {}
         with torch.no_grad():
-            clean_mask = (u_ale < 0.5)   # 粗略的"干净"判断
-            dirty_mask = (u_ale >= 0.5)
+            ale_median = u_ale.median()
+            clean_mask = (u_ale < ale_median)
+            dirty_mask = (u_ale >= ale_median)
 
             # 探针 A：干净-干净 pair 的平均 w_ij vs 脏-任意 pair 的平均 w_ij
             cc_mask = clean_mask.unsqueeze(1) & clean_mask.unsqueeze(0) & ~self_mask
