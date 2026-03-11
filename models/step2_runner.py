@@ -17,6 +17,7 @@ import sys
 from datetime import datetime
 from collections import defaultdict
 from typing import Dict, Optional
+from models.merge_clusters import merge_close_centroids
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir  = os.path.dirname(current_dir)
@@ -288,6 +289,15 @@ def run_step2(args):
     centroids, cluster_sizes = compute_centroids_weighted(
         embeddings_f32, labels_tensor, strength, zone_ids
     )
+
+    # ★ 安全簇合并 (MNN + 最大簇大小约束)
+    centroids, labels_tensor, merge_stats = merge_close_centroids(
+        centroids, labels_tensor, cluster_sizes,
+        embeddings_f32, zone_ids, strength,
+        threshold=0.95,          # 比上次的 0.90 更保守
+        max_cluster_size=2000,   # GT 平均 335 reads/簇, 2000 覆盖 >99%
+    )
+
     delta = compute_global_delta(embeddings_f32, labels_tensor, zone_ids, centroids)
     new_labels, noise_mask, refine_stats = refine_reads(
         embeddings_f32, labels_tensor, zone_ids, centroids, delta, round_idx=round_idx
