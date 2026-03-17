@@ -9,6 +9,9 @@ Step1 训练主程 (Universal Edition)
   [FIX-#7]  epoch 数量: R1=10, R2+=5 (与实际测试一致)
   [FIX-#6]  Visualizer args 安全获取 (getattr)
   [NEW]     training_cap / round_idx 传递给 Dataset
+  [FIX-G1]  超参改为 getattr，支持外部命令行传参覆盖
+  [FIX-G3]  forward 传入 round_idx，修复 Round2+ KL Loss 全为0 的问题
+  [FIX-KEY] consensus_dict 加载后强制 int key，防止 str/int 类型不匹配静默失效
 """
 import torch
 import torch.optim as optim
@@ -32,12 +35,12 @@ from models.step1_visualizer import Step1Visualizer
 
 
 # ---------------------------------------------------------------------------
-# Hot Start 超参
+# Hot Start 超参默认值（可通过 args 从 main_loop.py 外部覆盖）
 # ---------------------------------------------------------------------------
-ROUND1_EPOCHS = 10
-ROUND1_LR     = 1e-4
-ROUND2_EPOCHS = 5
-ROUND2_LR     = 1e-5
+_DEFAULT_ROUND1_EPOCHS = 10
+_DEFAULT_ROUND1_LR     = 1e-4
+_DEFAULT_ROUND2_EPOCHS = 5
+_DEFAULT_ROUND2_LR     = 1e-5
 
 
 class ListBatchSampler:
@@ -82,6 +85,7 @@ def train_step1(args):
         # Round 2+: 从 Step 2 输出加载（strength 加权 consensus）
         print(f"   📂 加载 consensus from: {consensus_path}")
         consensus_dict = torch.load(consensus_path, map_location='cpu')
+        consensus_dict = {int(k): v for k, v in consensus_dict.items()}  # [FIX-KEY] 强制int key
         print(f"   ✅ 加载 {len(consensus_dict)} 个簇的 consensus")
     else:
         # Round 1: 直接从 ref.txt 读（预处理脚本已做 Clover majority vote）
@@ -119,6 +123,7 @@ def train_step1(args):
         round_idx=round_idx,
         consensus_dict=consensus_dict,              # [FIX-P0]
         cluster_change_info=cluster_change_info,    # [FIX-P0]
+        cv_threshold=getattr(args, 'cv_threshold', 0.3),  # 困难簇 CV 阈值，默认0.3可调
     )
 
     # =====================================================================
@@ -181,8 +186,8 @@ def train_step1(args):
     # =====================================================================
     # 7. 优化器 + 调度器
     # =====================================================================
-    epochs = ROUND1_EPOCHS if round_idx <= 1 else ROUND2_EPOCHS
-    lr     = ROUND1_LR     if round_idx <= 1 else ROUND2_LR
+    epochs = getattr(args, 'round1_epochs', _DEFAULT_ROUND1_EPOCHS) if round_idx <= 1 else getattr(args, 'round2_epochs', _DEFAULT_ROUND2_EPOCHS)
+    lr     = getattr(args, 'round1_lr',     _DEFAULT_ROUND1_LR)     if round_idx <= 1 else getattr(args, 'round2_lr',     _DEFAULT_ROUND2_LR)
 
     print(f"\n   📐 训练超参: epochs={epochs}, lr={lr}")
 
@@ -239,7 +244,7 @@ def train_step1(args):
             consensus_batch  = batch_data['consensus_target'].to(device)
 
             # [FIX-P0] 传入 consensus_target
-            loss_dict, outputs = model(reads_batch, labels_batch, consensus_batch, epoch=epoch)
+            loss_dict, outputs = model(reads_batch, labels_batch, consensus_batch, epoch=epoch, round_idx=round_idx)
 
             optimizer.zero_grad()
             loss_dict['total'].backward()

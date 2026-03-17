@@ -45,7 +45,8 @@ def compute_consensus_from_memory(
     for cluster_id, didx_list in cluster_to_didx.items():
         if len(didx_list) < 1:
             continue
-        vote_matrix = np.zeros((max_len, 4), dtype=np.float64)
+        # [FIX-N] 第5列(index 4)静默吸收 'N'，避免 np.add.at IndexError
+        vote_matrix = np.zeros((max_len, 5), dtype=np.float64)
         for didx in didx_list:
             real_idx = flat_real_indices[didx]
             read = reads_list[real_idx] if real_idx < len(reads_list) else ''
@@ -58,25 +59,47 @@ def compute_consensus_from_memory(
                 np.add.at(vote_matrix[:L], (np.arange(L), indices), s)
         # ★ 修复 padding：argmax([0,0,0,0])=0 → 'A' one-hot，
         #   会让 masked_bayes_risk 把 padding 位置误判为有效碱基，污染 Loss
-        has_vote = vote_matrix.sum(axis=1) > 0
-        consensus_indices = vote_matrix.argmax(axis=1)
+        # [FIX-N] 仅对 ACGT 4列计算 has_vote 和 argmax，第5列('N')自然截断
+        has_vote = vote_matrix[:, :4].sum(axis=1) > 0
+        consensus_indices = vote_matrix[:, :4].argmax(axis=1)
         one_hot = np.eye(4, dtype=np.float32)[consensus_indices]
         one_hot[~has_vote] = 0.0                       # padding → all zeros
         consensus_dict[cluster_id] = torch.from_numpy(one_hot)
     return consensus_dict
 
 
-def compute_cluster_change_info(old_labels_np, new_labels_np, flat_real_indices):
-    cluster_old: Dict[int, list] = defaultdict(list)
-    cluster_chg: Dict[int, list] = defaultdict(list)
-    for didx, (old_l, new_l) in enumerate(zip(old_labels_np, new_labels_np)):
-        if old_l >= 0:
-            cluster_old[int(old_l)].append(didx)
-            cluster_chg[int(old_l)].append(1 if old_l != new_l else 0)
-    change_info = {}
-    for cid in cluster_old:
-        change_info[cid] = sum(cluster_chg[cid]) / max(len(cluster_old[cid]), 1)
-    return change_info
+def compute_cluster_difficulty(new_labels_np, flat_real_indices, strength_np) -> Dict[int, float]:
+    """
+    基于合并后新簇内 reads 的 strength 分布，衡量簇的困难程度。
+
+    原 compute_cluster_change_info 的问题:
+      MNN 合并后 67K→15K，几乎所有旧 cluster_id 都发生变化，
+      导致 change_frac ≈ 1.0 对绝大多数簇成立，采样退化为全量训练。
+
+    新指标: 变异系数 CV = std(strength) / mean(strength)
+      - 纯净簇: reads 来自同一分子，strength 高且集中 → 低 CV → 完美簇
+      - 混簇:   reads 来自多个分子，strength 低且分散 → 高 CV → 困难簇
+      - 阈值 CV_THRESHOLD = 0.3（可通过 args.cv_threshold 覆盖）
+
+    Returns:
+        {cluster_id: cv_value}  cv 越高越困难
+    """
+    cluster_strengths: Dict[int, list] = defaultdict(list)
+    for didx, label in enumerate(new_labels_np):
+        if label >= 0:
+            cluster_strengths[int(label)].append(float(strength_np[didx]))
+
+    difficulty: Dict[int, float] = {}
+    for cid, strengths in cluster_strengths.items():
+        if len(strengths) < 2:
+            difficulty[cid] = 0.0   # 单 read 簇，无法判断，视为完美
+            continue
+        arr = np.array(strengths)
+        mean_s = arr.mean()
+        cv = arr.std() / (mean_s + 1e-6)
+        difficulty[cid] = float(cv)
+
+    return difficulty
 
 
 def _evaluate_with_gt_numpy(consensus_dict, gt_labels_list, new_labels,
@@ -299,9 +322,12 @@ def run_step2(args):
     )
 
     delta = compute_global_delta(embeddings_f32, labels_tensor, zone_ids, centroids)
-    new_labels, noise_mask, refine_stats = refine_reads(
-        embeddings_f32, labels_tensor, zone_ids, centroids, delta, round_idx=round_idx
-    )
+    # [FIX-ZONE2] 不再做 Zone II 重分配：Zone I 可能无法覆盖全部 GT，
+    #             强制重分配会丢失 Zone II 中的有效 reads。
+    new_labels = labels_tensor          # 合并后的标签直接作为最终标签
+    noise_mask = (labels_tensor < 0)
+    refine_stats = {'zone2_reassigned': 0, 'zone2_noise': 0}
+    # 注意: delta 保留用于 _record_paper_log_safe 日志，不影响标签。
 
     _avg_strength = float(_np_strength.mean())
     del embeddings_f32
@@ -324,21 +350,33 @@ def run_step2(args):
 
     new_labels_np = new_labels.cpu().numpy()
 
-    consensus_dict = compute_consensus_from_memory(
-        reads_list=data_loader.reads,
-        labels_np=new_labels_np,
-        strength_np=_np_strength,
+    # [FIX-DECODE] 用 FedDNA ds_fusion 替换 majority-vote consensus
+    from models.step2_decode import run_feddna_decode
+    # 模型已在 model.cpu() 后，需要重新上 GPU
+    model.to(device)
+    consensus_dict = run_feddna_decode(
+        model=model,
+        data_loader=data_loader,
+        new_labels_np=new_labels_np,
         flat_real_indices=flat_real_indices,
-        max_len=model_max_len,
-        round_idx=round_idx
+        model_max_len=model_max_len,
+        device=device,
+        batch_size=getattr(args, 'batch_size', 512),
     )
+    model.cpu()
+    torch.cuda.empty_cache()
     print(f"   ✅ 生成 {len(consensus_dict)} 个簇的 consensus")
 
-    cluster_change_info = compute_cluster_change_info(
-        old_labels_np, new_labels_np, flat_real_indices
+    cv_threshold = getattr(args, 'cv_threshold', 0.3)
+    cluster_change_info = compute_cluster_difficulty(
+        new_labels_np, flat_real_indices, _np_strength
     )
-    hard_clusters = sum(1 for v in cluster_change_info.values() if v >= 0.05)
-    print(f"   ✅ cluster_change_info: {hard_clusters} 困难簇 / {len(cluster_change_info)} 总簇")
+    hard_clusters = sum(1 for v in cluster_change_info.values() if v >= cv_threshold)
+    easy_clusters = len(cluster_change_info) - hard_clusters
+    cv_values = list(cluster_change_info.values())
+    cv_median  = float(np.median(cv_values)) if cv_values else 0.0
+    print(f"   ✅ cluster_difficulty (CV): 困难簇(≥{cv_threshold})={hard_clusters}, "
+          f"完美簇={easy_clusters}, 中位CV={cv_median:.3f}")
 
     # =====================================================================
     # 7. 保存输出
@@ -387,30 +425,16 @@ def run_step2(args):
     torch.save(cluster_change_info, change_info_path)
     print(f"   💾 Cluster Change Info: {change_info_path}")
 
-    # [FIX-FASTA] 按实际最大 read 长度截断，去掉尾部填充 A
-    # 根源：padding 位置 vote_matrix 全零，argmax=0='A'
-    # 导致序列长度恒为 max_len=105bp，精确匹配评估全部失败
+    # [FIX-DECODE] 用 save_consensus_fasta 替换原 FASTA 保存逻辑
+    from models.step2_decode import save_consensus_fasta
     fasta_dir = os.path.join(args.output_dir, "consensus")
     os.makedirs(fasta_dir, exist_ok=True)
     fasta_path = os.path.join(fasta_dir, f"consensus_{ts}.fasta")
     try:
-        # 计算每个 cluster 实际最大 read 长度
-        cluster_actual_len: Dict[int, int] = {}
-        for didx, label in enumerate(new_labels_np):
-            if label >= 0:
-                real_idx = flat_real_indices[didx]
-                rl = min(len(data_loader.reads[real_idx]), model_max_len)
-                cid = int(label)
-                if cid not in cluster_actual_len or rl > cluster_actual_len[cid]:
-                    cluster_actual_len[cid] = rl
-
-        base_map = ['A', 'C', 'G', 'T']
-        with open(fasta_path, 'w') as ff:
-            for cluster_id, one_hot in sorted(consensus_dict.items()):
-                actual_len = cluster_actual_len.get(cluster_id, model_max_len)
-                indices = one_hot[:actual_len].argmax(dim=-1).numpy()
-                seq = ''.join(base_map[i] for i in indices)
-                ff.write(f">cluster_{cluster_id}\n{seq}\n")
+        save_consensus_fasta(
+            consensus_dict, new_labels_np, flat_real_indices,
+            data_loader, model_max_len, fasta_path
+        )
         print(f"   💾 Fasta: {fasta_path}")
     except Exception as e:
         print(f"   ⚠️ Fasta 保存失败: {e}")

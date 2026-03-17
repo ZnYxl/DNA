@@ -33,9 +33,9 @@ from collections import defaultdict
 
 def merge_close_centroids(centroids, labels, cluster_sizes,
                           embeddings, zone_ids, strength,
-                          threshold=0.95,
+                          threshold=0.98,
                           max_cluster_size=2000,
-                          max_rounds=30,
+                          max_rounds=60,
                           chunk_size=2000):
     """
     安全版簇合并: MNN + 最大簇大小约束 + 迭代。
@@ -62,16 +62,24 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
 
     if len(centroids) < 2:
         print(f"   ⚠️ 簇数 < 2, 跳过")
-        return centroids, labels, {'n_merges': 0}
+        return centroids, labels, {
+            'clusters_before': len(centroids),
+            'clusters_after':  len(centroids),
+            'n_merges': 0,
+            'time_seconds': 0.0,
+            'threshold': threshold,
+            'max_cluster_size': max_cluster_size,
+        }
 
     initial_K = len(centroids)
     total_merges = 0
     labels = labels.clone()
 
     # 维护动态簇大小
-    current_sizes = {}
-    for cid in centroids:
-        current_sizes[cid] = int((labels == cid).sum().item())
+    # [FIX-2] 用 Counter 一次遍历代替逐簇 O(N) 扫描，从 O(N×K) → O(N)
+    from collections import Counter
+    label_counts = Counter(labels.tolist())
+    current_sizes = {cid: label_counts.get(cid, 0) for cid in centroids}
 
     for round_idx in range(max_rounds):
         # ── 1. 构建质心矩阵 ──
@@ -80,7 +88,7 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
         if K < 2:
             break
 
-        cid_to_idx = {c: i for i, c in enumerate(cids)}
+        cid_to_idx = {c: i for i, c in enumerate(cids)}  # [DEAD CODE] 已删除，保留注释备查
         centroid_matrix = torch.stack([centroids[c] for c in cids])  # (K, D)
         centroid_normed = F.normalize(centroid_matrix, dim=1)
 
@@ -131,6 +139,7 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
 
         # 每轮中已被合并的簇不能再参与（避免冲突）
         merged_this_round = set()
+        recompute_cids = set()   # [FIX-1] 只记录本轮 keep 的簇，质心重算范围
         round_merges = 0
 
         for sim_val, cid_a, cid_b in merge_pairs:
@@ -158,12 +167,15 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
 
             merged_this_round.add(cid_a)
             merged_this_round.add(cid_b)
+            recompute_cids.add(keep)   # [FIX-1] 记录需要重算质心的簇
             round_merges += 1
 
         total_merges += round_merges
 
         # ── 5. 重算合并后的质心 ──
-        for cid in list(centroids.keys()):
+        # [FIX-1] 只重算本轮 keep 的簇（吸收了新 reads，质心改变）
+        # 未参与合并的簇质心完全不变，跳过，从 O(K×N) → O(|keep|×N)
+        for cid in recompute_cids:
             mask = (labels == cid)
             zone_mask = (zone_ids == 1) | (zone_ids == 2)
             valid_mask = mask & zone_mask

@@ -87,7 +87,7 @@ class Step1EvidentialModel(nn.Module):
                  queue_size=8192,
                  tau_sim=0.1,
                  tau_weight=1.0,
-                 r_ale=2.0,
+                 r_ale=8.0,
                  cl_mode='ours'):
         super().__init__()
 
@@ -178,7 +178,7 @@ class Step1EvidentialModel(nn.Module):
         # RNNBlock: LSTM(dim→256) → Linear(256→4) → softplus
         # 输出已经是 (B, L, 4)，直接使用
         output = self.rnnblock(embeddings)   # (B, L, 4)
-        evidence = F.softplus(output)        # (B, L, 4)，确保非负
+        evidence = output                    # RNNBlock内部已做Softplus，直接使用
 
         alpha = evidence + 1                 # Dirichlet 参数
         strength = alpha.sum(dim=-1)         # (B, L)，Dirichlet concentration
@@ -375,13 +375,14 @@ class Step1EvidentialModel(nn.Module):
     # Forward
     # [FIX-P0] 接收 consensus_target 并传给重建损失
     # ------------------------------------------------------------------
-    def forward(self, reads, cluster_labels, consensus_target, epoch=0):
+    def forward(self, reads, cluster_labels, consensus_target, epoch=0, round_idx=1):
         """
         Args:
             reads:            (B, L, 4) one-hot input reads
             cluster_labels:   (B,) cluster IDs
             consensus_target: (B, L, 4) one-hot pseudo-reference  ← [NEW]
             epoch:            current training epoch
+            round_idx:        当前迭代轮次，控制annealing_coef逻辑
         """
         embeddings, pooled_emb = self.encode_reads(reads)
         evidence, strength, alpha = self.decode_to_evidence(embeddings)
@@ -398,8 +399,8 @@ class Step1EvidentialModel(nn.Module):
             evidence, alpha, cluster_labels, consensus_target
         )
 
-        annealing_coef = min(1.0, max(0.0, (epoch - 5) / 10.0))
-        total_loss = con_loss + 10.0 * recon_loss + annealing_coef * 0.05 * kl_loss
+        annealing_coef = min(1.0, max(0.0, (epoch - 5) / 10.0)) if round_idx == 1 else 1.0
+        total_loss = con_loss + recon_loss + annealing_coef * 0.05 * kl_loss
 
         loss_dict = {
             'total':           total_loss,

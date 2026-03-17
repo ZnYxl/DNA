@@ -1,13 +1,24 @@
-# models/step1_data.py
+# models/step1_data.py (FIXED VERSION)
 """
 修复清单:
   [FIX-#1]  新增 inference_mode，Step2 推理不再受 training_cap 限制
   [FIX-#8]  每轮采样种子加入 round_idx
   [FIX-P0]  Step1Dataset 加入 consensus_dict，__getitem__ 返回 consensus_target
-  [FIX-P0]  Round 2+ 采样颗粒度改为"簇级"（困难簇100%，完美簇20%）
+  [FIX-P0]  Round 2+ 采样颗粒度改为"簇级"（困难簇100%，完美簇动态采样）
   [OPT]     numpy 向量化 one-hot 编码 (5-10x 加速)
   [NEW]     GT 标签加载 (id20 序列匹配)
   [NEW]     training_cap 可通过 args 配置
+  
+  [BUG-FIX-2025-03-16] 修复'N'碱基编码错误 (G老师发现)
+                       - 使用虚拟通道技巧，确保'N'被编码为[0,0,0,0]
+                       - 与模型mask机制完美联动
+  [BUG-FIX-2025-03-16] 添加consensus_dict格式验证
+  [BUG-FIX-2025-03-16] default_consensus使用时报警告
+  
+  [TUNING-2025-03-16]  采样策略优化（基于实验数据调整）
+                       - Round 1: 强制全量训练（确保baseline稳定）
+                       - 困难簇阈值: 10% (更聚焦真正需要改进的簇)
+                       - 完美簇采样率: R2=40%, R3+=25% (防止灾难性遗忘)
 """
 import os
 import torch
@@ -15,25 +26,54 @@ import numpy as np
 from torch.utils.data import Dataset
 from typing import Dict, List, Optional
 from collections import defaultdict
+import warnings
 
 # ============================================================
-# 高性能 One-Hot 编码 (numpy 向量化)
+# 高性能 One-Hot 编码 (numpy 向量化) - FIXED
 # ============================================================
-_BASE_LUT = np.zeros(256, dtype=np.int64)
+# [BUG-FIX] G老师发现：使用虚拟通道处理'N'碱基，确保'N'被编码为[0,0,0,0]
+# 原问题：'N'被错误映射到索引0（与'A'相同），导致模型产生虚假置信度
+# 解决方案：使用第5通道作为虚拟通道，'N'的1.0写入第5通道，截断后前4通道全为0
+_BASE_LUT = np.full(256, 4, dtype=np.int64)  # 默认索引4（虚拟通道）
 for _c, _i in [('A',0),('C',1),('G',2),('T',3),
-               ('a',0),('c',1),('g',2),('t',3),
-               ('N',0),('n',0)]:
+               ('a',0),('c',1),('g',2),('t',3)]:
     _BASE_LUT[ord(_c)] = _i
+# 'N', 'n' 以及任何异常字符保持索引4
 
 
 def seq_to_onehot(seq: str, max_len: int) -> torch.Tensor:
-    """numpy 向量化版本，比逐字符循环快 5-10 倍"""
+    """
+    numpy 向量化版本，比逐字符循环快 5-10 倍
+    
+    [BUG-FIX 2025-03-16] 使用5通道技巧处理'N'碱基：
+      - 正常碱基(A/C/G/T): 映射到索引0-3 → [1,0,0,0] / [0,1,0,0] / [0,0,1,0] / [0,0,0,1]
+      - 未知碱基(N)或异常字符: 映射到索引4 → 第4通道置1
+      - 返回前4个通道: 'N'位置自动变成[0,0,0,0]
+      - 与step1_model.py的mask机制完美联动 (mask = consensus.sum(dim=-1) > 0)
+    
+    示例:
+        seq = "ACGNT" → indices = [0,1,2,4,3]
+        tensor[5通道] = [[1,0,0,0,0],  # A
+                         [0,1,0,0,0],  # C
+                         [0,0,1,0,0],  # G
+                         [0,0,0,0,1],  # N (第4通道)
+                         [0,0,0,1,0]]  # T
+        返回前4通道:    [[1,0,0,0],    # A
+                         [0,1,0,0],    # C
+                         [0,0,1,0],    # G
+                         [0,0,0,0],    # N ✓ 正确！
+                         [0,0,0,1]]    # T
+    """
     L = min(len(seq), max_len)
     byte_arr = np.frombuffer(seq[:L].encode('ascii'), dtype=np.uint8)
     indices = _BASE_LUT[byte_arr]
-    tensor = torch.zeros(max_len, 4)
+    
+    # 开辟5个通道 (A,C,G,T,虚拟通道)
+    tensor = torch.zeros(max_len, 5)
     tensor[np.arange(L), indices] = 1.0
-    return tensor
+    
+    # 返回前4个通道：'N'的1.0在第4通道，截断后前4个通道全是0
+    return tensor[:, :4]  # shape: (max_len, 4)
 
 
 # ============================================================
@@ -128,7 +168,7 @@ class CloverDataLoader:
         with open(gt_tags_file) as f:
             for line in f:
                 total_lines += 1
-                parts = line.strip().split('	')
+                parts = line.strip().split('\t')
                 if len(parts) >= 2:
                     try:
                         cluster_id = int(parts[0])
@@ -153,6 +193,7 @@ class CloverDataLoader:
 # Dataset (通用)
 # [FIX-P0] 加入 consensus_dict 支持
 # [FIX-P0] Round 2+ 改为簇级采样
+# [BUG-FIX] 添加格式验证和警告机制
 # ============================================================
 class Step1Dataset(Dataset):
     def __init__(self, data_loader: CloverDataLoader, max_len: int = 150,
@@ -160,24 +201,33 @@ class Step1Dataset(Dataset):
                  inference_mode: bool = False,
                  round_idx: int = 1,
                  consensus_dict: Optional[Dict[int, torch.Tensor]] = None,
-                 cluster_change_info: Optional[Dict[int, float]] = None):
+                 cluster_change_info: Optional[Dict[int, float]] = None,
+                 cv_threshold: float = 0.3):
         """
         Args:
-            training_cap:        训练时的样本上限（仅 Round 1 无 cluster_change_info 时生效）
+            training_cap:        训练时的样本上限（Round 2+有效，Round 1强制全量）
             inference_mode:      True 时忽略 training_cap，使用全部有效样本
             round_idx:           轮次索引，用于变化采样种子
             consensus_dict:      {cluster_id: Tensor(L, 4)} 每个簇的伪 reference one-hot
-            cluster_change_info: {cluster_id: change_fraction} Round2+ 簇级采样依据
-                                  困难簇 (change_frac >= 0.05): 100% reads
-                                  完美簇 (change_frac < 0.05): 20% reads
+            cluster_change_info: {cluster_id: CV值} Round2+ 簇级采样依据
+                                  困难簇 (CV >= cv_threshold): 100% reads（混簇，需重训）
+                                  完美簇 (CV <  cv_threshold): R2=40%, R3+=25%（纯净簇，保结构）
+            cv_threshold:        CV 困难/完美 分界线，默认 0.3（可调）
         """
         self.data_loader = data_loader
         self.max_len = max_len
+        self.round_idx = round_idx
         self.consensus_dict = consensus_dict or {}
+        self.cv_threshold = cv_threshold
 
-        # 默认 consensus: 全 A 的 one-hot (保底，不应被实际使用)
+        # [BUG-FIX] 验证consensus_dict格式
+        if self.consensus_dict:
+            self._validate_consensus_dict()
+
+        # 默认 consensus: 全零向量（与padding一致，触发mask机制）
+        # [BUG-FIX] 改为全零，而非全A，这样更安全
         self._default_consensus = torch.zeros(max_len, 4)
-        self._default_consensus[:, 0] = 1.0  # 全 A
+        self._default_consensus_used = False  # 追踪是否使用了default
 
         full_valid_indices = [i for i, label in enumerate(data_loader.clover_labels) if label >= 0]
         total_valid = len(full_valid_indices)
@@ -187,13 +237,28 @@ class Step1Dataset(Dataset):
             self.valid_indices = full_valid_indices
             print(f"   📊 Inference Mode: {len(self.valid_indices)} samples (全量)")
 
+        elif round_idx == 1:
+            # =====================================================
+            # Round 1: 强制全量训练（忽略training_cap）
+            # 确保baseline稳定，为后续迭代提供可靠起点
+            # =====================================================
+            self.valid_indices = full_valid_indices
+            print(f"   📊 Round 1 (强制全量): {len(self.valid_indices)} samples")
+
         elif cluster_change_info is not None and round_idx >= 2:
             # =====================================================
-            # [FIX-P0] Round 2+ 簇级采样
-            # 困难簇 (change_frac >= 0.05): 保留 100%
-            # 完美簇 (change_frac < 0.05):  随机采样 20%
+            # Round 2+ 簇级采样 (Curriculum Learning)
+            #
+            # cluster_change_info 现在存储的是 CV（变异系数）:
+            #   CV = std(strength) / mean(strength)  (来自 step2_runner)
+            #
+            # 困难簇 (CV >= cv_threshold): 混簇，strength 分散 → 100% reads
+            # 完美簇 (CV <  cv_threshold): 纯净簇，结构稳定  → R2=40%, R3+=25%
+            #
+            # cv_threshold 默认 0.3，可在 dataset 构造时通过 cv_threshold 参数覆盖
             # =====================================================
-            print(f"   🔀 Round {round_idx} 簇级采样 (Hard/Easy split)...")
+            cv_threshold = getattr(self, 'cv_threshold', 0.3)
+            print(f"   🔀 Round {round_idx} 簇级采样 (CV困难度, threshold={cv_threshold})...")
             rng = np.random.RandomState(42 + round_idx)
 
             cluster_to_indices: Dict[int, List[int]] = defaultdict(list)
@@ -204,39 +269,58 @@ class Step1Dataset(Dataset):
 
             selected = []
             n_hard = n_easy = n_hard_reads = n_easy_reads = 0
+
+            # 动态采样率：Round 2多采样（防遗忘），Round 3+稳定后降低
+            easy_ratio = 0.40 if round_idx == 2 else 0.25
+
             for cluster_id, idxs in cluster_to_indices.items():
-                change_frac = cluster_change_info.get(cluster_id, 0.0)
-                if change_frac >= 0.05:
-                    # 困难簇: 全部保留
+                cv = cluster_change_info.get(cluster_id, 0.0)
+                if cv >= cv_threshold:  # 困难簇：CV高=混簇=需重点训练
                     selected.extend(idxs)
                     n_hard += 1
                     n_hard_reads += len(idxs)
-                else:
-                    # 完美簇: 随机采 20%
-                    k = max(1, int(len(idxs) * 0.20))
+                else:                   # 完美簇：CV低=纯净=采样保持结构
+                    k = max(1, int(len(idxs) * easy_ratio))
                     chosen = rng.choice(idxs, k, replace=False).tolist()
                     selected.extend(chosen)
                     n_easy += 1
                     n_easy_reads += len(chosen)
 
             self.valid_indices = selected
-            print(f"   ✅ 困难簇: {n_hard} 簇 × 100% = {n_hard_reads} reads")
-            print(f"   ✅ 完美簇: {n_easy} 簇 × 20%  = {n_easy_reads} reads")
+            print(f"   ✅ 困难簇 (CV≥{cv_threshold}): {n_hard} 簇 × 100% = {n_hard_reads} reads")
+            print(f"   ✅ 完美簇 (CV<{cv_threshold}): {n_easy} 簇 × {int(easy_ratio*100)}%  = {n_easy_reads} reads")
             print(f"   📊 Dataset Size: {len(self.valid_indices)} / {total_valid} samples")
 
         else:
-            # Round 1 或无 cluster_change_info: 使用 training_cap 随机采样
+            # Fallback: 如果Round 2+没有cluster_change_info，使用training_cap
             if total_valid > training_cap:
                 seed = 42 + round_idx
                 rng = np.random.RandomState(seed)
                 self.valid_indices = rng.choice(
                     full_valid_indices, training_cap, replace=False
                 ).tolist()
-                print(f"   ✂️ Training: {total_valid} → {training_cap} (seed={seed})")
+                print(f"   ✂️ Training (fallback): {total_valid} → {training_cap} (seed={seed})")
             else:
                 self.valid_indices = full_valid_indices
 
             print(f"   📊 Dataset Size: {len(self.valid_indices)} samples")
+
+    def _validate_consensus_dict(self):
+        """[BUG-FIX] 验证consensus_dict的格式"""
+        issues = []
+        for cluster_id, consensus in list(self.consensus_dict.items())[:10]:  # 只检查前10个
+            if not isinstance(consensus, torch.Tensor):
+                issues.append(f"cluster {cluster_id}: 不是Tensor")
+            elif consensus.shape != (self.max_len, 4):
+                issues.append(f"cluster {cluster_id}: shape {consensus.shape} != ({self.max_len}, 4)")
+            elif consensus.dim() != 2:
+                issues.append(f"cluster {cluster_id}: 维度 {consensus.dim()} != 2")
+        
+        if issues:
+            warnings.warn(
+                f"⚠️ consensus_dict 格式问题:\n" + "\n".join(issues[:5]),
+                UserWarning
+            )
 
     def __len__(self):
         return len(self.valid_indices)
@@ -250,7 +334,17 @@ class Step1Dataset(Dataset):
         gt_label = self.data_loader.gt_labels[real_idx]
 
         # [FIX-P0] 提供 consensus_target
-        consensus_target = self.consensus_dict.get(clover_label, self._default_consensus)
+        if clover_label in self.consensus_dict:
+            consensus_target = self.consensus_dict[clover_label]
+        else:
+            # [BUG-FIX] 使用default时报警告
+            if not self._default_consensus_used:
+                warnings.warn(
+                    f"⚠️ cluster {clover_label} 缺失consensus，使用default（全零向量）",
+                    UserWarning
+                )
+                self._default_consensus_used = True
+            consensus_target = self._default_consensus
 
         return {
             'encoding': encoding,

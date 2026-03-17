@@ -59,6 +59,8 @@ def main_loop():
     parser.add_argument('--training_cap',       type=int, default=9999000000)
     parser.add_argument('--gt_tags_file',       type=str, default=None)
     parser.add_argument('--gt_refs_file',       type=str, default=None)
+    parser.add_argument('--cv_threshold',       type=float, default=0.3,
+                        help='困难簇 CV 阈值，默认 0.3，第一轮跑完后根据日志中位CV调整')
     parser.add_argument('--cl_mode',            type=str, default='ours',
                         choices=['standard', 'ale_only', 'epi_only', 'ours'],
                         help='对比学习消融模式: standard=标准InfoNCE, ale_only=只用U_ale, '
@@ -165,6 +167,7 @@ def main_loop():
             prev_state=current_state_path,
             training_cap=args.training_cap,
             cl_mode=args.cl_mode,                   # 消融实验 flag
+            cv_threshold=args.cv_threshold,         # 困难簇 CV 阈值
             # [FIX-P0] 新增：传递 consensus_path 和 cluster_change_info
             consensus_path=current_consensus_path,
             cluster_change_info=current_cluster_change_info,
@@ -191,6 +194,7 @@ def main_loop():
             gt_tags_file=args.gt_tags_file,
             gt_refs_file=args.gt_refs_file,
             training_cap=args.training_cap,
+            cv_threshold=args.cv_threshold,         # 困难簇 CV 阈值
         )
         results = run_step2(step2_args)
 

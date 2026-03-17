@@ -143,9 +143,8 @@ def _edit_distance(s1, s2):
 
 
 # ═══════════════════════════════════════════════════
-# 指标
+# 替换原有的 compute_metrics 函数
 # ═══════════════════════════════════════════════════
-
 def compute_metrics(pred, gt, name):
     valid = (pred >= 0) & (gt >= 0)
     n_valid = valid.sum()
@@ -155,13 +154,35 @@ def compute_metrics(pred, gt, name):
         print(f"  ⚠️ 无有效评估样本")
         return None
 
-    # Purity
+    # 将预测结果按簇分组
     c2g = defaultdict(list)
     for pi, gi in zip(p, g):
         c2g[pi].append(gi)
-    correct = sum(Counter(gs).most_common(1)[0][1] for gs in c2g.values())
-    pur = correct / n_valid
 
+    # --------------------------------------------------
+    # 1. 严格 Purity (SSI-EC 标准：不过滤任何簇)
+    # --------------------------------------------------
+    correct_strict = sum(Counter(gs).most_common(1)[0][1] for gs in c2g.values())
+    pur_strict = correct_strict / n_valid
+
+    # --------------------------------------------------
+    # 2. 对齐 Clover 的 Purity (核心修改：丢弃 size <= 1 的簇)
+    # --------------------------------------------------
+    clover_total_reads = 0
+    clover_correct_reads = 0
+    clover_valid_clusters = 0
+
+    for pi, gs in c2g.items():
+        if len(gs) > 1:  # 完全对齐 Clover: tag_len > Cluster_size_threshold (1)
+            clover_total_reads += len(gs)
+            clover_correct_reads += Counter(gs).most_common(1)[0][1]
+            clover_valid_clusters += 1
+
+    pur_clover = clover_correct_reads / clover_total_reads if clover_total_reads > 0 else 0.0
+
+    # --------------------------------------------------
+    # 3. 其他指标
+    # --------------------------------------------------
     # Perfect Cluster Rate
     perfect = sum(1 for gs in c2g.values() if len(set(gs)) == 1)
     pcr = perfect / len(c2g)
@@ -177,19 +198,20 @@ def compute_metrics(pred, gt, name):
     n_pred = len(c2g)
     n_gt = len(set(g.tolist()))
 
-    print(f"\n{'─'*65}")
+    print(f"\n{'─'*70}")
     print(f"  📊 {name}")
-    print(f"{'─'*65}")
+    print(f"{'─'*70}")
     print(f"  Reads 评估: {n_valid:>12,} / {len(pred):,} ({n_valid/len(pred)*100:.1f}%)")
     print(f"  预测簇数:   {n_pred:>12,}")
     print(f"  GT 簇数:    {n_gt:>12,}")
-    print(f"  Purity:              {pur:.4f}  ({correct:,}/{n_valid:,})")
+    print(f"  Purity (严格标准):     {pur_strict:.4f}  ({correct_strict:,}/{n_valid:,})")
+    print(f"  Purity (Clover对齐):   {pur_clover:.4f}  ({clover_correct_reads:,}/{clover_total_reads:,}) [已过滤 {n_pred - clover_valid_clusters:,} 个孤立簇]")
     print(f"  Perfect Cluster Rate: {pcr:.4f}  ({perfect:,}/{n_pred:,})")
     if ari is not None:
         print(f"  ARI:                 {ari:.6f}")
         print(f"  NMI:                 {nmi:.4f}")
 
-    return {'name': name, 'pur': pur, 'pcr': pcr, 'ari': ari, 'nmi': nmi,
+    return {'name': name, 'pur': pur_strict, 'pur_clover': pur_clover, 'pcr': pcr, 'ari': ari, 'nmi': nmi,
             'n_pred': n_pred, 'n_gt': n_gt, 'n_reads': int(n_valid),
             'coverage': n_valid / len(pred)}
 
@@ -378,19 +400,20 @@ def main():
 
     # 4. 汇总表
     if all_results:
-        print(f"\n{'='*90}")
-        print(f"{'📋 汇总':^90s}")
-        print(f"{'='*90}")
-        print(f"  {'Method':<35s} {'Purity':>8s} {'PCR':>8s} {'ARI':>10s} "
-              f"{'NMI':>8s} {'Pred':>7s} {'GT':>6s} {'Cover':>7s}")
-        print(f"  {'─'*85}")
+        print(f"\n{'='*105}")
+        print(f"{'📋 SSI-EC vs Clover 全局评估汇总':^105s}")
+        print(f"{'='*105}")
+        print(f"  {'Method':<30s} {'Strict Pur':>10s} {'Clover Pur':>10s} {'PCR':>8s} {'ARI':>9s} "
+              f"{'NMI':>7s} {'Pred':>7s} {'GT':>6s} {'Cover':>7s}")
+        print(f"  {'─'*100}")
         for r in all_results:
-            a = f"{r['ari']:.6f}" if r['ari'] is not None else "   N/A"
+            a = f"{r['ari']:.5f}" if r['ari'] is not None else "   N/A"
             n = f"{r['nmi']:.4f}" if r['nmi'] is not None else " N/A"
             c = f"{r['coverage']*100:.1f}%"
-            print(f"  {r['name']:<35s} {r['pur']:>8.4f} {r['pcr']:>8.4f} "
-                  f"{a:>10s} {n:>8s} {r['n_pred']:>7,} {r['n_gt']:>6,} {c:>7s}")
-        print(f"{'='*90}")
+            # 这里同时打印出 Strict Purity 和 Clover Purity
+            print(f"  {r['name']:<30s} {r['pur']:>10.4f} {r['pur_clover']:>10.4f} {r['pcr']:>8.4f} "
+                  f"{a:>9s} {n:>7s} {r['n_pred']:>7,} {r['n_gt']:>6,} {c:>7s}")
+        print(f"{'='*105}")
 
     print(f"\n✅ 评估完成")
 

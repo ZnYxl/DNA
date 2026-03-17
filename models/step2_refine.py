@@ -30,7 +30,7 @@ FALLBACK_SAFE_PERCENTILE  = 0.70
 MIN_ZONE1_SAFETY   = 3
 ZONE2_WEIGHT_CAP   = 0.30
 DELTA_P            = 95
-ROUND1_DELTA_SCALE = 1.5
+# ROUND1_DELTA_SCALE 已删除: refine_reads 被 FIX-ZONE2 废弃, 该常量不再使用
 MAX_ZONE3_RATIO = 0.30   # [FIX-Bug#2] Zone III 绝对上限
 
 
@@ -69,13 +69,12 @@ def _find_cdf_knee(values_sorted):
     y_norm = y  # 已经是 [0, 1]
 
     # Kneedle: 找离对角线 (0,0)→(1,1) 最远的点
-    # 对角线: y = x
-    # 对于 convex 曲线 (CDF), 拐点在 y - x 最大处 (曲线在对角线上方)
-    # 但我们的 CDF 是 concave (先快后慢) 还是 convex 取决于分布
-    # 对于长尾分布, CDF 先快速上升(大量数据集中在低值)再变慢 → concave
-    # 我们要找的是 CDF 开始"变慢"的点 = 从主体进入尾巴的转折
-    # 即 x_norm - y_norm 最大的点 (CDF 落后于对角线最远)
-    diff = x_norm - y_norm
+    # U_ale 是右偏分布: 大量 reads 集中在低值, CDF 先快速爬升再变缓 → 凹函数
+    # 凹 CDF 曲线全程在对角线上方, 即 y_norm > x_norm 全程成立
+    # 拐点 = 曲线离对角线最远处 = y_norm - x_norm 最大的点
+    # [FIX] 原代码用 x_norm - y_norm (凸函数公式), 对凹 CDF 全程为负,
+    #       argmax 只会落在边界点而非真正的肘点, 导致几乎永远触发 fallback
+    diff = y_norm - x_norm
 
     # 忽略首尾 5% (避免边界效应)
     margin = max(1, n_points // 20)
@@ -160,7 +159,7 @@ def _find_gmm_threshold(values, fallback_percentile=0.70):
         w1 = 1.0 / max(std1, 1e-10)
         threshold = (mu0 * w1 + mu1 * w0) / (w0 + w1)
 
-        # 验证: 阈值切出的 Zone I 比例应在 [40%, 90%]
+        # 验证: 阈值切出的 Zone I 比例应在 [40%, 95%]
         zone1_ratio = (values < threshold).sum() / len(values)
         if zone1_ratio < 0.40 or zone1_ratio > 0.95:
             print(f"      ⚠️ GMM 阈值不合理 (Zone I={zone1_ratio:.1%}), fallback")
@@ -358,19 +357,26 @@ def compute_global_delta(embeddings, labels, zone_ids, centroids):
 
 
 # ===========================================================================
-# 4. Zone-aware 修正 (含 Round-aware delta scaling)
+# 4. Zone-aware 修正 (已废弃 — FIX-ZONE2)
 # ===========================================================================
+# [DEAD CODE] refine_reads 不再被 step2_runner 调用。
+# 原因: FIX-ZONE2 决定不做 Zone II 重分配，直接使用 MNN 合并后的标签，
+#       避免 Zone I 无法覆盖全部 GT 时强制重分配丢失有效 reads。
+# 保留函数体仅供参考，请勿在新代码中调用。
 def refine_reads(embeddings, labels, zone_ids, centroids, delta,
                  round_idx=1, chunk_size=5000):
     """
+    [DEPRECATED — FIX-ZONE2] 此函数不再被调用，保留仅供参考。
+
     Zone I:   保持
     Zone II:  距离判决 (< eff_delta → 最近簇, ≥ → -1)
     Zone III: -1
     """
     t_start = time.time()
 
-    eff_delta = delta * (ROUND1_DELTA_SCALE if round_idx == 1 else 1.0)
-    print(f"\n   🔧 修正 (round={round_idx}, delta={delta:.4f}, eff={eff_delta:.4f})")
+    # [DEPRECATED] ROUND1_DELTA_SCALE 已删除，eff_delta 直接等于 delta
+    eff_delta = delta
+    print(f"\n   🔧 修正 (round={round_idx}, delta={delta:.4f}) [DEPRECATED, 不应被调用]")
 
     N = len(labels)
     new_labels = labels.clone()
