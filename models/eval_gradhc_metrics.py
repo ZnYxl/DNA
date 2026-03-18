@@ -35,10 +35,11 @@ GT_REFS_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/给师妹的clover数据�
 
 # 指定要评估的 refined_labels 文件（按时间戳顺序）
 REFINED_LABELS = [
-    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_084145.txt"),  # Round 1
-    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_110601.txt"),  # Round 2
+    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_114538.txt"),  # Round 1
+    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_150319.txt"),  # Round 2
+    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_174703.txt"),  # Round 3
 ]
-ROUND_NAMES = ["SSI-EC R1", "SSI-EC R2"]
+ROUND_NAMES = ["SSI-EC R1", "SSI-EC R2", "SSI-EC R3"]
 
 # ═══════════════════════════════════════════════════════════════
 # 数据加载

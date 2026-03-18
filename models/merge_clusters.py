@@ -31,33 +31,73 @@ import time
 from collections import defaultdict
 
 
+# ---------------------------------------------------------------------------
+# 序列双重校验工具函数
+# ---------------------------------------------------------------------------
+_BASE_MAP = ['A', 'C', 'G', 'T']
+
+def _onehot_to_seq(one_hot: torch.Tensor) -> str:
+    """将 (L, 4) one-hot tensor 转为碱基字符串，padding(全零)位截断"""
+    has_vote = one_hot.sum(dim=-1) > 0          # (L,) bool
+    L = int(has_vote.sum().item())
+    if L == 0:
+        return ''
+    indices = one_hot[:L].argmax(dim=-1).tolist()
+    return ''.join(_BASE_MAP[i] for i in indices)
+
+
+def _kmer_jaccard(seq_a: str, seq_b: str, k: int = 8) -> float:
+    """
+    k-mer Jaccard 相似度。
+    相比编辑距离，对 IDS 错误更鲁棒，且计算复杂度 O(L) 而非 O(L²)。
+    返回 [0, 1]，越高越相似。
+    """
+    if len(seq_a) < k or len(seq_b) < k:
+        return 0.0
+    set_a = set(seq_a[i:i+k] for i in range(len(seq_a) - k + 1))
+    set_b = set(seq_b[i:i+k] for i in range(len(seq_b) - k + 1))
+    inter = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return inter / union if union > 0 else 0.0
+
+
 def merge_close_centroids(centroids, labels, cluster_sizes,
                           embeddings, zone_ids, strength,
                           threshold=0.98,
                           max_cluster_size=2000,
                           max_rounds=60,
-                          chunk_size=2000):
+                          chunk_size=2000,
+                          consensus_dict=None,
+                          seq_jaccard_threshold=0.5,
+                          kmer_k=8):
     """
-    安全版簇合并: MNN + 最大簇大小约束 + 迭代。
+    安全版簇合并: MNN + 序列双重校验 + 最大簇大小约束 + 迭代。
 
     Args:
-        centroids:        dict {cluster_id: tensor(D,)}
-        labels:           tensor(N,) 当前标签
-        cluster_sizes:    dict {cluster_id: int}
-        embeddings:       tensor(N, D) 全量 embeddings
-        zone_ids:         tensor(N,) zone 标记
-        strength:         tensor(N,) strength
-        threshold:        float, cosine similarity 合并阈值 (默认 0.95，比上次的 0.90 更保守)
-        max_cluster_size: int, 合并后簇大小上限 (默认 2000)
-        max_rounds:       int, 最大迭代轮数
-        chunk_size:       int, 分块大小
+        centroids:             dict {cluster_id: tensor(D,)}
+        labels:                tensor(N,) 当前标签
+        cluster_sizes:         dict {cluster_id: int}
+        embeddings:            tensor(N, D) 全量 embeddings
+        zone_ids:              tensor(N,) zone 标记
+        strength:              tensor(N,) strength
+        threshold:             float, cosine similarity 合并阈值 (默认 0.98)
+        max_cluster_size:      int, 合并后簇大小上限 (默认 2000)
+        max_rounds:            int, 最大迭代轮数 (默认 60)
+        chunk_size:            int, 分块大小
+        consensus_dict:        dict {cluster_id: tensor(L,4)} 上一轮的 consensus，
+                               用于序列双重校验。为 None 时跳过序列校验。
+        seq_jaccard_threshold: float, k-mer Jaccard 最低阈值 (默认 0.5)
+                               只有 embedding 相似度 > threshold 且
+                               序列 Jaccard > seq_jaccard_threshold 才合并
+        kmer_k:                int, k-mer 大小 (默认 8)
 
     Returns:
         new_centroids, new_labels, merge_stats
     """
     t0 = time.time()
     print(f"\n{'='*60}")
-    print(f"🔗 安全簇合并 (MNN, threshold={threshold}, max_size={max_cluster_size})")
+    seq_check_str = f", seq_jaccard≥{seq_jaccard_threshold}" if consensus_dict else ", 无序列校验(Round1)"
+    print(f"🔗 安全簇合并 (MNN, threshold={threshold}, max_size={max_cluster_size}{seq_check_str})")
     print(f"{'='*60}")
 
     if len(centroids) < 2:
@@ -76,10 +116,9 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
     labels = labels.clone()
 
     # 维护动态簇大小
-    # [FIX-2] 用 Counter 一次遍历代替逐簇 O(N) 扫描，从 O(N×K) → O(N)
-    from collections import Counter
-    label_counts = Counter(labels.tolist())
-    current_sizes = {cid: label_counts.get(cid, 0) for cid in centroids}
+    current_sizes = {}
+    for cid in centroids:
+        current_sizes[cid] = int((labels == cid).sum().item())
 
     for round_idx in range(max_rounds):
         # ── 1. 构建质心矩阵 ──
@@ -88,7 +127,7 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
         if K < 2:
             break
 
-        cid_to_idx = {c: i for i, c in enumerate(cids)}  # [DEAD CODE] 已删除，保留注释备查
+        cid_to_idx = {c: i for i, c in enumerate(cids)}
         centroid_matrix = torch.stack([centroids[c] for c in cids])  # (K, D)
         centroid_normed = F.normalize(centroid_matrix, dim=1)
 
@@ -112,8 +151,9 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
             nn_sim[i_start:i_end] = max_sim
             nn_idx[i_start:i_end] = max_idx
 
-        # ── 3. 找 Mutual Nearest Neighbor 对 ──
+        # ── 3. 找 Mutual Nearest Neighbor 对 + 序列双重校验 ──
         merge_pairs = []
+        seq_rejected = 0
         for i in range(K):
             j = nn_idx[i].item()
             if j < 0:
@@ -128,7 +168,21 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
                     size_a = current_sizes.get(cid_a, 0)
                     size_b = current_sizes.get(cid_b, 0)
                     if size_a + size_b <= max_cluster_size:
+                        # [序列双重校验] 有 consensus_dict 时验证序列相似度
+                        if consensus_dict is not None:
+                            ca = consensus_dict.get(cid_a)
+                            cb = consensus_dict.get(cid_b)
+                            if ca is not None and cb is not None:
+                                seq_a = _onehot_to_seq(ca)
+                                seq_b = _onehot_to_seq(cb)
+                                jaccard = _kmer_jaccard(seq_a, seq_b, k=kmer_k)
+                                if jaccard < seq_jaccard_threshold:
+                                    seq_rejected += 1
+                                    continue  # 序列不相似，拒绝合并
                         merge_pairs.append((nn_sim[i].item(), cid_a, cid_b))
+
+        if seq_rejected > 0:
+            print(f"   🔒 序列校验拒绝: {seq_rejected} 对 (Jaccard<{seq_jaccard_threshold})")
 
         if len(merge_pairs) == 0:
             print(f"   Round {round_idx+1}: 无可合并的 MNN 对, 终止")
@@ -139,7 +193,6 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
 
         # 每轮中已被合并的簇不能再参与（避免冲突）
         merged_this_round = set()
-        recompute_cids = set()   # [FIX-1] 只记录本轮 keep 的簇，质心重算范围
         round_merges = 0
 
         for sim_val, cid_a, cid_b in merge_pairs:
@@ -167,15 +220,12 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
 
             merged_this_round.add(cid_a)
             merged_this_round.add(cid_b)
-            recompute_cids.add(keep)   # [FIX-1] 记录需要重算质心的簇
             round_merges += 1
 
         total_merges += round_merges
 
         # ── 5. 重算合并后的质心 ──
-        # [FIX-1] 只重算本轮 keep 的簇（吸收了新 reads，质心改变）
-        # 未参与合并的簇质心完全不变，跳过，从 O(K×N) → O(|keep|×N)
-        for cid in recompute_cids:
+        for cid in list(centroids.keys()):
             mask = (labels == cid)
             zone_mask = (zone_ids == 1) | (zone_ids == 2)
             valid_mask = mask & zone_mask

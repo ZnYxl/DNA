@@ -313,12 +313,27 @@ def run_step2(args):
         embeddings_f32, labels_tensor, strength, zone_ids
     )
 
-    # ★ 安全簇合并 (MNN + 最大簇大小约束)
+    # ★ 安全簇合并 (MNN + 序列双重校验 + 最大簇大小约束)
+    # 序列校验用上一轮的 consensus_dict（当轮的在 Section 6 才生成）
+    prev_consensus_dict = None
+    prev_consensus_path = getattr(args, 'consensus_path', None)
+    if prev_consensus_path and os.path.exists(prev_consensus_path):
+        try:
+            prev_consensus_dict = torch.load(prev_consensus_path, map_location='cpu')
+            prev_consensus_dict = {int(k): v for k, v in prev_consensus_dict.items()}
+            print(f"   📂 加载上一轮 consensus 用于序列校验: {len(prev_consensus_dict)} 个簇")
+        except Exception as e:
+            print(f"   ⚠️ 加载上一轮 consensus 失败: {e}，跳过序列校验")
+            prev_consensus_dict = None
+
     centroids, labels_tensor, merge_stats = merge_close_centroids(
         centroids, labels_tensor, cluster_sizes,
         embeddings_f32, zone_ids, strength,
-        threshold=0.95,          # 比上次的 0.90 更保守
-        max_cluster_size=2000,   # GT 平均 335 reads/簇, 2000 覆盖 >99%
+        threshold=0.98,
+        max_cluster_size=2000,
+        max_rounds=60,
+        consensus_dict=prev_consensus_dict,
+        seq_jaccard_threshold=0.5,
     )
 
     delta = compute_global_delta(embeddings_f32, labels_tensor, zone_ids, centroids)
@@ -367,17 +382,19 @@ def run_step2(args):
     torch.cuda.empty_cache()
     print(f"   ✅ 生成 {len(consensus_dict)} 个簇的 consensus")
 
+    cv_values = list(cluster_change_info.values()) if cluster_change_info else []
+    median_cv = float(np.median(cv_values)) if cv_values else 0.05
+    cv_threshold = max(0.05, median_cv * 2.5)
+    print(f"   📊 动态 CV 阈值: 中位CV={median_cv:.4f} × 2.5 = {cv_threshold:.4f}")
     cluster_change_info = compute_cluster_difficulty(
         new_labels_np, flat_real_indices, _np_strength
     )
-    cv_values = list(cluster_change_info.values())
-    median_cv  = float(np.median(cv_values)) if cv_values else 0.05
-    cv_threshold = max(0.05, median_cv * 2.5)
-    print(f"   📊 动态 CV 阈值: 中位CV={median_cv:.4f} × 2.5 = {cv_threshold:.4f}")
     hard_clusters = sum(1 for v in cluster_change_info.values() if v >= cv_threshold)
     easy_clusters = len(cluster_change_info) - hard_clusters
-    print(f"   ✅ cluster_difficulty (CV): 困难簇(≥{cv_threshold:.4f})={hard_clusters}, "
-          f"完美簇={easy_clusters}, 中位CV={median_cv:.3f}")
+    cv_values = list(cluster_change_info.values())
+    cv_median  = float(np.median(cv_values)) if cv_values else 0.0
+    print(f"   ✅ cluster_difficulty (CV): 困难簇(≥{cv_threshold})={hard_clusters}, "
+          f"完美簇={easy_clusters}, 中位CV={cv_median:.3f}")
 
     # =====================================================================
     # 7. 保存输出

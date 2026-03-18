@@ -178,6 +178,15 @@ def train_step1(args):
 
                 model.load_state_dict(sd, strict=False)
                 print(f"   ✅ 加载上一轮权重成功")
+
+                # [FREEZE-ENC] Round 2+: 冻结 Encoder，只微调 Decoder + 投影头
+                # 原因: Encoder 在 Round 1 已收敛，轮间 Strength 崩塌的主因是
+                #       Encoder 参数被新的 consensus 目标剧烈扰动
+                model.encoder.requires_grad_(False)
+                frozen_params = sum(p.numel() for p in model.encoder.parameters())
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                print(f"   🔒 Encoder 已冻结 ({frozen_params:,} 参数)")
+                print(f"   🔓 可训练参数: {trainable_params:,} (Decoder + 投影头)")
             except Exception as e:
                 print(f"   ⚠️ 加载失败: {e}，使用随机初始化")
         else:
