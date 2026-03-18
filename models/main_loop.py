@@ -60,8 +60,12 @@ def main_loop():
     parser.add_argument('--gt_tags_file',       type=str, default=None)
     parser.add_argument('--gt_refs_file',       type=str, default=None)
     parser.add_argument('--cv_threshold',       type=float, default=0.3,
-                        help='困难簇 CV 阈值，默认 0.3，第一轮跑完后根据日志中位CV调整')
-    parser.add_argument('--cl_mode',            type=str, default='ours',
+                        help='困难簇 CV 阈值，默认 0.3')
+    parser.add_argument('--skip_step1_round',   type=int,   default=0,
+                        help='跳过指定轮次的 Step 1，直接从 Step 2 开始')
+    parser.add_argument('--prev_checkpoint',    type=str,   default=None,
+                        help='手动指定第一轮跳过 Step 1 时的 checkpoint 路径')
+    parser.add_argument('--cl_mode',            type=str,   default='ours',
                         choices=['standard', 'ale_only', 'epi_only', 'ours'],
                         help='对比学习消融模式: standard=标准InfoNCE, ale_only=只用U_ale, '
                              'epi_only=只用U_epi, ours=完整设计(默认)')
@@ -83,7 +87,7 @@ def main_loop():
     current_cluster_change_info = None       # [FIX-P0] 新增（内存中的 dict，不是路径）
     start_iteration = 1
 
-    if os.path.exists(labels_dir):
+    if os.path.exists(results_dir):
         for check_round in range(1, args.max_iterations + 1):
             step1_dir = os.path.join(results_dir, f"iter_{check_round}_step1")
             step2_dir = os.path.join(results_dir, f"iter_{check_round}_step2")
@@ -96,6 +100,11 @@ def main_loop():
                     break
 
             if not os.path.exists(step2_dir):
+                # step1 完成但 step2 未跑（典型：手动跳过 step2 重跑场景）
+                # 保存 step1 checkpoint，让 skip_step1_round 能拿到
+                current_checkpoint_path = ckpt_path
+                start_iteration = check_round   # 从本轮开始，step1 会被 skip_step1_round 跳过
+                print(f"   ✅ 检测到 Round {check_round} Step1 已完成，Step2 未跑")
                 break
 
             label_files   = sorted(glob.glob(os.path.join(labels_dir, "refined_labels_*.txt")))
@@ -124,6 +133,10 @@ def main_loop():
             start_iteration = check_round + 1
             print(f"   ✅ 检测到 Round {check_round} 已完成")
 
+            if args.prev_checkpoint and os.path.exists(args.prev_checkpoint):
+                current_checkpoint_path = args.prev_checkpoint
+                print(f"   ⚡ 已捕获手动指定的 checkpoint: {current_checkpoint_path}")
+
     if start_iteration > 1:
         print(f"\n⏩ 从 Round {start_iteration} 继续 (跳过已完成的 {start_iteration - 1} 轮)")
     else:
@@ -147,34 +160,42 @@ def main_loop():
         prev_labels_path = current_labels_path
 
         # ============== Step 1 ==============
-        print(f"[Step 1] Evidence Learning...")
-        step1_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step1")
+        if args.skip_step1_round == iteration:
+            ckpt_name = os.path.basename(current_checkpoint_path) if current_checkpoint_path else "未找到模型(None)"
+            print(f"[Step 1] 跳过 Round {iteration} Step 1（使用已有 checkpoint: {ckpt_name}）")
+            
+            step1_checkpoint = current_checkpoint_path
+            if step1_checkpoint is None:
+                print("❌ skip_step1_round 指定跳过，但 current_checkpoint_path 为空，请检查路径")
+                break
+        else:
+            print(f"[Step 1] Evidence Learning...")
+            step1_out = os.path.join(args.experiment_dir, "results", f"iter_{iteration}_step1")
 
-        step1_args = argparse.Namespace(
-            experiment_dir=args.experiment_dir,
-            output_dir=step1_out,
-            batch_size=args.batch_size,
-            max_clusters_per_batch=args.max_clusters_per_batch,
-            weight_decay=args.weight_decay,
-            dim=args.dim,
-            max_length=args.max_length,
-            min_clusters=args.min_clusters,
-            device=args.device,
-            round_idx=iteration,
-            feddna_checkpoint=args.feddna_checkpoint,
-            prev_checkpoint=current_checkpoint_path,
-            refined_labels=current_labels_path,
-            prev_state=current_state_path,
-            training_cap=args.training_cap,
-            cl_mode=args.cl_mode,                   # 消融实验 flag
-            cv_threshold=args.cv_threshold,         # 困难簇 CV 阈值
-            # [FIX-P0] 新增：传递 consensus_path 和 cluster_change_info
-            consensus_path=current_consensus_path,
-            cluster_change_info=current_cluster_change_info,
-        )
-        step1_checkpoint = train_step1(step1_args)
-        if step1_checkpoint is None:
-            print("❌ Step 1 失败"); break
+            step1_args = argparse.Namespace(
+                experiment_dir=args.experiment_dir,
+                output_dir=step1_out,
+                batch_size=args.batch_size,
+                max_clusters_per_batch=args.max_clusters_per_batch,
+                weight_decay=args.weight_decay,
+                dim=args.dim,
+                max_length=args.max_length,
+                min_clusters=args.min_clusters,
+                device=args.device,
+                round_idx=iteration,
+                feddna_checkpoint=args.feddna_checkpoint,
+                prev_checkpoint=current_checkpoint_path,
+                refined_labels=current_labels_path,
+                prev_state=current_state_path,
+                training_cap=args.training_cap,
+                cl_mode=args.cl_mode,
+                cv_threshold=getattr(args, 'cv_threshold', 0.3),
+                consensus_path=current_consensus_path,
+                cluster_change_info=current_cluster_change_info,
+            )
+            step1_checkpoint = train_step1(step1_args)
+            if step1_checkpoint is None:
+                print("❌ Step 1 失败"); break
 
         # ============== Step 2 ==============
         print(f"\n[Step 2] Refine & Decode...")
@@ -194,7 +215,6 @@ def main_loop():
             gt_tags_file=args.gt_tags_file,
             gt_refs_file=args.gt_refs_file,
             training_cap=args.training_cap,
-            cv_threshold=args.cv_threshold,         # 困难簇 CV 阈值
         )
         results = run_step2(step2_args)
 

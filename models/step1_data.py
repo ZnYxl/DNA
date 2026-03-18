@@ -271,7 +271,7 @@ class Step1Dataset(Dataset):
             n_hard = n_easy = n_hard_reads = n_easy_reads = 0
 
             # 动态采样率：Round 2多采样（防遗忘），Round 3+稳定后降低
-            easy_ratio = 0.40 if round_idx == 2 else 0.25
+            easy_ratio = 0.80 if round_idx == 2 else 0.50
 
             for cluster_id, idxs in cluster_to_indices.items():
                 cv = cluster_change_info.get(cluster_id, 0.0)
