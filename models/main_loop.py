@@ -215,6 +215,7 @@ def main_loop():
             gt_tags_file=args.gt_tags_file,
             gt_refs_file=args.gt_refs_file,
             training_cap=args.training_cap,
+            consensus_path=current_consensus_path,  # 上一轮 consensus，用于序列双重校验
         )
         results = run_step2(step2_args)
 

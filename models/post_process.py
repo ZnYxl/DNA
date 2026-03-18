@@ -204,7 +204,7 @@ def post_process_final_assignment(experiment_dir, final_checkpoint_path,
     # 准备质心矩阵
     sorted_cids = sorted(centroids.keys())
     centroid_matrix = torch.stack([centroids[c] for c in sorted_cids])
-    # 质心已在 compute_centroids_weighted 中 normalized
+    centroid_matrix = F.normalize(centroid_matrix, dim=-1)
 
     # 分块计算最近邻 (避免 OOM)
     final_labels = labels.copy()

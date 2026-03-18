@@ -372,6 +372,7 @@ def refine_reads(embeddings, labels, zone_ids, centroids, delta,
     Zone II:  距离判决 (< eff_delta → 最近簇, ≥ → -1)
     Zone III: -1
     """
+    raise RuntimeError("❌ refine_reads 已废弃，请勿调用！使用 merge_close_centroids 替代")
     t_start = time.time()
 
     # [DEPRECATED] ROUND1_DELTA_SCALE 已删除，eff_delta 直接等于 delta

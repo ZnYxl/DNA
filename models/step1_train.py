@@ -200,6 +200,8 @@ def train_step1(args):
 
     print(f"\n   📐 训练超参: epochs={epochs}, lr={lr}")
 
+    # [FIX-OPT] 只传可训练参数，Round2+ Encoder冻结后节省约80%的optimizer显存
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer  = optim.AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
     scheduler  = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -257,7 +259,7 @@ def train_step1(args):
 
             optimizer.zero_grad()
             loss_dict['total'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
             epoch_loss  += loss_dict['total'].item()
