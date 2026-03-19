@@ -116,9 +116,10 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
     labels = labels.clone()
 
     # 维护动态簇大小
-    current_sizes = {}
-    for cid in centroids:
-        current_sizes[cid] = int((labels == cid).sum().item())
+    # [FIX-PERF] 用 Counter 一次遍历代替逐簇 O(N) 扫描，从 O(K×N) → O(N)
+    from collections import Counter
+    label_counts = Counter(labels.tolist())
+    current_sizes = {cid: label_counts.get(cid, 0) for cid in centroids}
 
     for round_idx in range(max_rounds):
         # ── 1. 构建质心矩阵 ──
@@ -193,6 +194,7 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
 
         # 每轮中已被合并的簇不能再参与（避免冲突）
         merged_this_round = set()
+        recompute_cids = set()   # [FIX-PERF] 只记录本轮 keep 的簇，质心重算范围
         round_merges = 0
 
         for sim_val, cid_a, cid_b in merge_pairs:
@@ -220,12 +222,15 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
 
             merged_this_round.add(cid_a)
             merged_this_round.add(cid_b)
+            recompute_cids.add(keep)   # [FIX-PERF] 记录需要重算质心的簇
             round_merges += 1
 
         total_merges += round_merges
 
         # ── 5. 重算合并后的质心 ──
-        for cid in list(centroids.keys()):
+        # [FIX-PERF] 只重算本轮 keep 的簇（吸收了新 reads，质心改变）
+        # 未参与合并的簇质心完全不变，跳过，从 O(K×N) → O(|keep|×N)
+        for cid in recompute_cids:
             mask = (labels == cid)
             zone_mask = (zone_ids == 1) | (zone_ids == 2)
             valid_mask = mask & zone_mask
