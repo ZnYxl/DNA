@@ -382,13 +382,13 @@ def run_step2(args):
     torch.cuda.empty_cache()
     print(f"   ✅ 生成 {len(consensus_dict)} 个簇的 consensus")
 
+    cluster_change_info = compute_cluster_difficulty(
+        new_labels_np, flat_real_indices, _np_strength
+    )
     cv_values = list(cluster_change_info.values()) if cluster_change_info else []
     median_cv = float(np.median(cv_values)) if cv_values else 0.05
     cv_threshold = max(0.05, median_cv * 2.5)
     print(f"   📊 动态 CV 阈值: 中位CV={median_cv:.4f} × 2.5 = {cv_threshold:.4f}")
-    cluster_change_info = compute_cluster_difficulty(
-        new_labels_np, flat_real_indices, _np_strength
-    )
     hard_clusters = sum(1 for v in cluster_change_info.values() if v >= cv_threshold)
     easy_clusters = len(cluster_change_info) - hard_clusters
     cv_values = list(cluster_change_info.values())
