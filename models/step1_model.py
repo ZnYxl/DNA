@@ -3,8 +3,13 @@
 SSI-EC 证据学习模型 (Universal Edition)
 
 修复清单:
-  [FIX-P0]  self_reconstruction_loss: target 从 inputs（噪声read）改为 consensus_target（伪reference）
-  [FIX-P0]  forward: 接收 consensus_target 并传入重建损失
+  [FIX-P0]       self_reconstruction_loss: target 从 inputs（噪声read）改为 consensus_target（伪reference）
+  [FIX-P0]       forward: 接收 consensus_target 并传入重建损失
+  [FIX-SOFT-NEG] uncertainty_weighted_contrastive: 动态软负样本屏蔽
+                 在 proj_emb 空间中余弦相似度 > 0.80 的异簇对不参与负样本排斥，
+                 消除 Clover 过分割导致的同源碎片排斥力势垒。
+                 自适应退火：训练初期 proj_emb 未收敛，屏蔽自然休眠；
+                 收敛后同源碎片相似度突破阈值，屏蔽平滑介入。
 
 保持不变:
   - encoder/decoder 结构
@@ -278,6 +283,29 @@ class Step1EvidentialModel(nn.Module):
                                     dtype=torch.bool, device=self.device)], dim=1
         )
 
+        # ── [FIX-SOFT-NEG] 动态软负样本屏蔽（自适应退火） ────────────────
+        # 物理含义：Clover 过分割导致同一 GT 分子被切成多个子簇，这些子簇在
+        # proj_emb 超球面上余弦相似度 > 0.80，却被当成硬负样本互相推开，
+        # 形成排斥力势垒，阻止 Step 2 的 MNN 完成合并。
+        #
+        # 修复：检测 batch 内高相似度的异簇对，从 neg_mask 中移除，卸除排斥力。
+        #
+        # 自适应退火（Feature, not a Bug）：
+        #   训练初期 proj_emb 未收敛 → 同源碎片相似度低于 0.80 → 屏蔽休眠
+        #   收敛后同源碎片相似度突破 0.80 → 屏蔽平滑介入
+        #   无需手动调度，完全数据驱动。
+        #
+        # 数学自洽性：作用在 proj_emb（L2 归一化，128 维）上，
+        # 与 InfoNCE 梯度所在的超球面空间一致，避免空间撕裂。
+        with torch.no_grad():
+            # proj_emb 已 L2 归一化，matmul 直接得余弦相似度矩阵
+            cos_sim_batch   = torch.matmul(proj_emb, proj_emb.T)         # (B, B)
+            diff_label_mask = ~pos_mask_inbatch & ~self_mask             # batch 内异簇且非自身
+            high_sim_mask   = (cos_sim_batch > 0.80) & diff_label_mask  # 高相似度的异簇对
+        # 从负样本 mask 中移除这些"疑似同源"对（只作用于 batch 内列，不影响 queue 列）
+        neg_mask_full[:, :B] &= ~high_sim_mask
+        n_soft_masked = int(high_sim_mask.sum().item())
+
         # 分子：正样本 exp（不加权）
         pos_exp_sum = (exp_sim * pos_mask_full.float()).sum(dim=1)         # (B,)
         # 分母：正样本 exp + 加权负样本 exp
@@ -296,10 +324,10 @@ class Step1EvidentialModel(nn.Module):
         w_pos_per_read = (w_inbatch * pos_mask_inbatch.float()).sum(dim=1)[has_pos].clamp(min=1e-6)
         loss = -(w_pos_per_read * log_prob[has_pos]).sum() / w_pos_per_read.sum()
 
-        # ── 三个诊断探针 ──────────────────────────────────────────────────
+        # ── 诊断探针 ──────────────────────────────────────────────────────
         # 探针目的：验证权重是否真的"两极分化"，以及 embedding 是否在分离
-        # 使用 u_ale 阈值 0.5 区分干净/脏样本（实际运行中对应 Zone I vs Zone III）
         probe_stats = {}
+        probe_stats['soft_neg_masked'] = n_soft_masked   # 软屏蔽计数（监控退火进度）
         with torch.no_grad():
             ale_median = u_ale.median()
             clean_mask = (u_ale < ale_median)
@@ -417,11 +445,12 @@ class Step1EvidentialModel(nn.Module):
             'queue_count':      int(self.queue_count.item()),
             'u_epi':            u_epi.detach(),
             'u_ale':            u_ale.detach(),
-            # ── 三个诊断探针（每 batch 打印，验证权重两极分化）──────────
-            'w_clean_clean':    probe_stats.get('w_clean_clean', float('nan')),
-            'w_dirty_any':      probe_stats.get('w_dirty_any',   float('nan')),
-            'cos_sim_pos':      probe_stats.get('cos_sim_pos',   float('nan')),
-            'cos_sim_neg':      probe_stats.get('cos_sim_neg',   float('nan')),
+            # ── 诊断探针（每 batch 打印，验证权重两极分化 + 软屏蔽退火进度）──
+            'w_clean_clean':    probe_stats.get('w_clean_clean',   float('nan')),
+            'w_dirty_any':      probe_stats.get('w_dirty_any',     float('nan')),
+            'cos_sim_pos':      probe_stats.get('cos_sim_pos',     float('nan')),
+            'cos_sim_neg':      probe_stats.get('cos_sim_neg',     float('nan')),
+            'soft_neg_masked':  probe_stats.get('soft_neg_masked', 0),
         }
         return loss_dict, outputs
 

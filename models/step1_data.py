@@ -231,11 +231,19 @@ class Step1Dataset(Dataset):
 
         full_valid_indices = [i for i, label in enumerate(data_loader.clover_labels) if label >= 0]
         total_valid = len(full_valid_indices)
+        # [FIX-DEAD-REVIVAL] EM 算法的 E 步在数学上要求无条件扫描整个样本空间。
+        # inference_mode=True 时必须包含 label=-1 的 reads，否则被错判的 reads
+        # 永远无法在后续 Round 中获得新的 U_ale/U_epi，无法证明自身是好数据。
+        all_indices = list(range(len(data_loader.clover_labels)))
 
         if inference_mode:
-            # Step 2 全量推理
-            self.valid_indices = full_valid_indices
-            print(f"   📊 Inference Mode: {len(self.valid_indices)} samples (全量)")
+            # Step 2 全量推理：包含 label=-1 的 reads（死数据复活入口）
+            # 注意：step2_runner 里的 labels_tensor 构建、Zone 划分、质心计算
+            #       内部均有 label >= 0 的合法性校验，放行 -1 不会引起崩溃。
+            self.valid_indices = all_indices
+            n_negative = len(all_indices) - total_valid
+            print(f"   📊 Inference Mode (全量): {len(self.valid_indices)} samples "
+                  f"(含 {n_negative} 条 label=-1 的待复活 reads)")
 
         elif round_idx == 1:
             # =====================================================

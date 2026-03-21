@@ -235,7 +235,7 @@ def run_step2(args):
     print("=" * 60)
 
     dataset = Step1Dataset(data_loader, max_len=model_max_len, inference_mode=True)
-    print(f"   🔮 全量推理: {TOTAL_READS} reads (label >= 0)")
+    print(f"   🔮 全量推理: {TOTAL_READS} reads (含 label=-1 待复活 reads)")
 
     inference_loader = torch.utils.data.DataLoader(
         dataset, batch_size=getattr(args, 'batch_size', 1024),
@@ -339,8 +339,14 @@ def run_step2(args):
     delta = compute_global_delta(embeddings_f32, labels_tensor, zone_ids, centroids)
     # [FIX-ZONE2] 不再做 Zone II 重分配：Zone I 可能无法覆盖全部 GT，
     #             强制重分配会丢失 Zone II 中的有效 reads。
-    new_labels = labels_tensor          # 合并后的标签直接作为最终标签
-    noise_mask = (labels_tensor < 0)
+    new_labels = labels_tensor.clone()  # 合并后的标签直接作为最终标签
+    # [FIX-ZONE3-LEAK] Zone III 的 reads 物理上已被排除在质心计算外，
+    # 但其旧标签仍会随 new_labels 传入下一轮训练，污染对比学习梯度。
+    # 必须在保存前显式置为 -1，切断泄露通道。
+    z3_count = int((zone_ids == 3).sum().item())
+    new_labels[zone_ids == 3] = -1
+    print(f"   🔒 Zone III 标签隔离: {z3_count} reads → -1")
+    noise_mask = (new_labels < 0)
     refine_stats = {'zone2_reassigned': 0, 'zone2_noise': 0}
     # 注意: delta 保留用于 _record_paper_log_safe 日志，不影响标签。
 

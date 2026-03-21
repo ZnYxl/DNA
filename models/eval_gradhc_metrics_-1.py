@@ -109,7 +109,7 @@ def _build_cluster_maps(pred, gt):
       g2c: dict  gt_id   → Counter{pred_id: count}  (每个GT分子被哪些预测簇覆盖)
       gt_sizes: dict  gt_id → total reads
     """
-    valid = (pred >= 0) & (gt >= 0)
+    valid = (gt >= 0)
     pv, gv = pred[valid], gt[valid]
 
     c2g = defaultdict(list)
@@ -224,7 +224,7 @@ def compute_accuracy_gamma(c2g, g2c, gt_sizes, gammas=(0.5, 0.75, 0.9, 1.0)):
 
 def compute_over_segmentation(pred, gt):
     """过分割率 = n_pred / n_gt，以及每个GT分子平均被切成几个子簇"""
-    valid = (pred >= 0) & (gt >= 0)
+    valid = (gt >= 0)
     gt2pred = defaultdict(set)
     for p, g in zip(pred[valid], gt[valid]):
         gt2pred[int(g)].add(int(p))
@@ -246,7 +246,7 @@ def compute_over_segmentation(pred, gt):
 
 
 def compute_ari_nmi(pred, gt):
-    valid = (pred >= 0) & (gt >= 0)
+    valid = (gt >= 0)
     pv, gv = pred[valid], gt[valid]
     try:
         from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
@@ -266,7 +266,7 @@ def evaluate_all(pred, gt, name, compute_ari_nmi_flag=True):
     print(f"  📊  {name}")
     print(f"{'═'*68}")
 
-    valid = (pred >= 0) & (gt >= 0)
+    valid = (gt >= 0)
     n_valid = int(valid.sum())
     n_pred = len(set(pred[valid].tolist()))
     n_gt_total = len(set(gt[gt >= 0].tolist()))
