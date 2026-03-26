@@ -11,6 +11,16 @@ SSI-EC Post-processing: 全量距离分配
   - DNA 存储中每条 read 必然来自某个 reference, 不存在"不属于任何簇"
   - 最后一轮质心来自迭代优化后的高质量 Zone I reads, 比 Clover 树索引中心更准确
   - 迭代过程中保持 -1 丢弃 (避免噪声污染训练), 只在最终评估时全量分配
+
+G老师审查修复清单:
+  [G老师-FIX] 度量衡对齐：删除 F.normalize，改用 torch.cdist 原始欧式距离
+    原来：F.normalize(noise_embeddings) + F.normalize(centroid_matrix) → 球面余弦距离
+    问题：delta 和死数据复活均在「原始 embedding 空间」用 L2 距离，
+          post_process 突然切到「单位球面空间」，参照系不一致。
+          质心是原始加权平均向量（norm != 1），归一化后位置偏移，
+          噪声 reads 可能被误分配到错误的簇。
+    修复：与 step2_refine.py compute_global_delta 和
+          step2_runner.py 死数据复活保持同一度量衡（原始 L2）。
 """
 import torch
 import torch.nn as nn
@@ -73,15 +83,16 @@ def post_process_final_assignment(experiment_dir, final_checkpoint_path,
     Post-processing: 对所有 label==-1 的 reads 做无条件最近邻分配
 
     Args:
-        experiment_dir:       实验根目录
+        experiment_dir:        实验根目录
         final_checkpoint_path: 最终轮次的 model checkpoint
-        final_labels_path:    最终轮次的 refined_labels.txt
-        centroids_path:       最终轮次保存的 centroids.pt
-        output_dir:           输出目录
-        device:               计算设备
-        dim:                  模型维度
-        max_length:           序列最大长度
-        gt_tags_file:         GT 标签文件 (可选)
+        final_labels_path:     最终轮次的 refined_labels.txt
+        centroids_path:        最终轮次保存的 centroids.pt
+        output_dir:            输出目录
+        device:                计算设备
+        dim:                   fallback 模型维度（实际从 checkpoint 里读，此值仅在
+                               checkpoint 没有记录 args 时才生效，正常情况下不起作用）
+        max_length:            同上，fallback 序列最大长度
+        gt_tags_file:          GT 标签文件（可选）
 
     Returns:
         final_labels_path: str, 最终标签文件路径
@@ -134,8 +145,13 @@ def post_process_final_assignment(experiment_dir, final_checkpoint_path,
     sd = checkpoint['model_state_dict']
     if 'length_adapter.weight' in sd:
         sh = sd['length_adapter.weight'].shape
-        if sh[0] == model_max_len:
+        # [致命缺陷2修复] 检查输入和输出两个维度都匹配
+        if sh[1] == model_max_len and sh[0] == model_max_len:
             model.length_adapter = nn.Linear(sh[1], sh[0]).to(device)
+            print(f"   🔧 恢复 length_adapter: Linear({sh[1]}, {sh[0]})")
+        else:
+            print(f"   ⚠️ checkpoint 的 length_adapter 维度 {sh} "
+                  f"与 max_length={model_max_len} 不兼容，已跳过")
     model.load_state_dict(sd, strict=False)
     model.eval()
     print(f"   ✅ 模型加载完成")
@@ -195,32 +211,38 @@ def post_process_final_assignment(experiment_dir, final_checkpoint_path,
     # =====================================================================
     # 6. 无条件最近邻分配
     # =====================================================================
-    print(f"   📍 最近邻分配...")
+    # [G老师-FIX] 度量衡对齐：使用原始欧式距离，与 EM 迭代中的 delta 计算
+    # 和死数据复活逻辑保持一致。
+    #
+    # 原来的问题：
+    #   delta 是在「原始 embedding 空间」算的 P95 L2 距离（step2_refine.py）
+    #   死数据复活也用「原始 embedding」的 torch.cdist（step2_runner.py）
+    #   但 post_process 突然对 embeddings 和 centroids 都做 F.normalize，
+    #   换到了「单位球面空间」计算余弦距离——参照系完全不同。
+    #
+    # 质心是加权平均算出的原始向量（norm != 1），强制归一化后质心位置偏移，
+    # 导致本该分配到簇 A 的噪声 read 被误分配到簇 B。
+    #
+    # 修复：删掉归一化，换回 torch.cdist，与前置流程度量衡完全一致。
+    print(f"   📍 最近邻分配 (原始欧式距离，与 EM 度量衡一致)...")
     t0 = time.time()
 
-    # Normalize embeddings
-    noise_emb_norm = F.normalize(noise_embeddings, dim=-1)
-
-    # 准备质心矩阵
     sorted_cids = sorted(centroids.keys())
     centroid_matrix = torch.stack([centroids[c] for c in sorted_cids])
-    centroid_matrix = F.normalize(centroid_matrix, dim=-1)
+    # 不做 F.normalize，保持原始 scale
 
-    # 分块计算最近邻 (避免 OOM)
     final_labels = labels.copy()
     chunk_size = 5000
 
-    for i in range(0, len(noise_emb_norm), chunk_size):
-        batch_emb = noise_emb_norm[i:i+chunk_size]
+    for i in range(0, len(noise_embeddings), chunk_size):
+        batch_emb     = noise_embeddings[i:i+chunk_size]      # 原始 embedding，不归一化
         batch_indices = noise_read_indices[i:i+chunk_size]
 
-        # Cosine similarity → L2 distance
-        sim = batch_emb @ centroid_matrix.T
-        dist = torch.sqrt((2.0 - 2.0 * sim).clamp(min=0.0))
+        dist       = torch.cdist(batch_emb, centroid_matrix)  # (chunk, K) 原始 L2
         nearest_idx = dist.argmin(dim=1)
 
         for j in range(len(batch_emb)):
-            read_idx = int(batch_indices[j])
+            read_idx   = int(batch_indices[j])
             cluster_id = sorted_cids[nearest_idx[j].item()]
             final_labels[read_idx] = cluster_id
 

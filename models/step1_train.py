@@ -12,6 +12,14 @@ Step1 训练主程 (Universal Edition)
   [FIX-G1]  超参改为 getattr，支持外部命令行传参覆盖
   [FIX-G3]  forward 传入 round_idx，修复 Round2+ KL Loss 全为0 的问题
   [FIX-KEY] consensus_dict 加载后强制 int key，防止 str/int 类型不匹配静默失效
+  [G老师-陷阱1] optimizer 传入 trainable_params 而非 model.parameters()
+               原来全量传入导致 AdamW 为冻结 Encoder 分配 Momentum/Variance 矩阵，
+               显存节省完全落空；修复后 Round2+ 节省约 80% optimizer 显存
+  [G老师-陷阱2] model.train() 后立即 model.encoder.eval()（Round 2+）
+               原来 model.train() 递归覆盖冻结 Encoder，导致：
+               - BatchNorm running_mean/var 被当前 batch 污染
+               - Dropout 随机丢弃特征，引起特征提取不稳定
+               修复后锁定统计量，特征提取绝对稳定
 """
 import torch
 import torch.optim as optim
@@ -159,7 +167,8 @@ def train_step1(args):
     if round_idx <= 1:
         feddna_ckpt = getattr(args, 'feddna_checkpoint', None)
         if feddna_ckpt and os.path.exists(feddna_ckpt):
-            model = load_pretrained_feddna(model, feddna_ckpt, device)
+            model = load_pretrained_feddna(model, feddna_ckpt, device,
+                                           max_length=args.max_length)
         else:
             print(f"   ⚠️ 未找到预训练权重，使用随机初始化")
     else:
@@ -172,9 +181,17 @@ def train_step1(args):
 
                 if 'length_adapter.weight' in sd:
                     sh = sd['length_adapter.weight'].shape
-                    if sh[0] == args.max_length:
+                    # [致命缺陷2修复] 必须检查输入和输出两个维度都匹配。
+                    # 原来只查 sh[0](输出) == max_length，如果 checkpoint 来自
+                    # FedDNA 且 noise_length != label_length（如 155→150），
+                    # 会创建 nn.Linear(155, 150)，但 encoder 输出长度是 150，
+                    # 导致 PyTorch matmul 维度不匹配 crash。
+                    if sh[1] == args.max_length and sh[0] == args.max_length:
                         model.length_adapter = nn_.Linear(sh[1], sh[0]).to(device)
-                        print(f"   🔧 预初始化 length_adapter: {sh}")
+                        print(f"   🔧 预初始化 length_adapter: Linear({sh[1]}, {sh[0]})")
+                    elif sh[1] != args.max_length or sh[0] != args.max_length:
+                        print(f"   ⚠️ checkpoint 的 length_adapter 维度 {sh} "
+                              f"与 max_length={args.max_length} 不兼容，已跳过")
 
                 model.load_state_dict(sd, strict=False)
                 print(f"   ✅ 加载上一轮权重成功")
@@ -200,9 +217,12 @@ def train_step1(args):
 
     print(f"\n   📐 训练超参: epochs={epochs}, lr={lr}")
 
-    # [FIX-OPT] 只传可训练参数，Round2+ Encoder冻结后节省约80%的optimizer显存
+    # [FIX-OPT][G老师-陷阱1-FIX] 只传可训练参数
+    # 原来传 model.parameters()（全量）：即使 Encoder requires_grad=False，
+    # AdamW 依然为它分配 Momentum + Variance 矩阵，80% 显存节省完全落空。
+    # 修复：传 trainable_params，optimizer 只管理真正需要更新的参数。
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer  = optim.AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
+    optimizer  = optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
     scheduler  = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     # =====================================================================
@@ -213,6 +233,17 @@ def train_step1(args):
     print("=" * 60)
 
     model.train()
+
+    # [G老师-陷阱2-FIX] Round 2+ 将冻结的 Encoder 强制拨回 eval 模式
+    # 问题根因：model.train() 递归设置所有子模块为 Train 模式，
+    #   包括刚刚冻结的 Encoder。虽然没有梯度反传，但 Train 模式下：
+    #   - BatchNorm 会用当前 batch 数据更新 running_mean / running_var（污染特征空间）
+    #   - Dropout 会随机丢弃神经元（引起特征提取不稳定）
+    # 修复：model.train() 之后立即把 Encoder 按回 eval 模式，
+    #   锁定其统计量，关闭 Dropout，保证特征提取的绝对稳定。
+    if round_idx >= 2:
+        model.encoder.eval()
+        print("   🔒 Encoder 已设为 eval 模式（BatchNorm统计量锁定，Dropout关闭）")
 
     training_history = {
         'total_loss': [], 'avg_strength': [], 'high_conf_ratio': [],

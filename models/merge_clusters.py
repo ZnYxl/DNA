@@ -21,6 +21,23 @@ models/merge_clusters.py — 安全版簇合并
      每轮只做 MNN 合并 → 重算质心 → 下一轮。
      簇数逐步收敛，不会一步跳崩。
 
+G老师审查修复清单:
+  [G老师-Bug1-FIX] seq_jaccard_threshold: 0.5 → 0.05
+    原来设 0.5 假设 consensus 质量好，但 Round2+ 的 consensus 与 GT 平均
+    ED≈57，两条烂序列的 Jaccard 趋近于 0，几乎所有 MNN 正确找到的同源碎片
+    对都被拒绝——R2+R3 合并骤降至 90 对的根本原因。
+    0.05 只拦截序列完全不相关的误合并，不再误杀正确合并对。
+
+  [G老师-Bug2-FIX] 质心重算：O(K×N) 全局 → 只重算本轮 keep 簇
+    原来对所有 K 个簇执行 `labels == cid`，K=40000, N=400万时产生
+    1600亿次布尔比较。实际只有本轮 keep 簇的成员发生了变化，
+    其他簇质心完全没变。新增 keep_cids_this_round 集合，只重算这些簇。
+
+  [G老师-Bug3-FIX] 补上遗失的 Zone II 安全阀（与 step2_refine.py 一致）
+    原来直接用全部 strength，碎片簇合并后 Zone II 的异常高 strength 会
+    主导新质心方向，引发质心漂移。
+    安全阀：Zone I reads < 3 条时，Zone II 的 strength 截断到 0.30。
+
 调用位置: step2_runner.py 中 compute_centroids_weighted() 之后,
           compute_global_delta() 之前
 """
@@ -68,7 +85,7 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
                           max_rounds=60,
                           chunk_size=2000,
                           consensus_dict=None,
-                          seq_jaccard_threshold=0.5,
+                          seq_jaccard_threshold=0.05,
                           kmer_k=8):
     """
     安全版簇合并: MNN + 序列双重校验 + 最大簇大小约束 + 迭代。
@@ -86,9 +103,13 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
         chunk_size:            int, 分块大小
         consensus_dict:        dict {cluster_id: tensor(L,4)} 上一轮的 consensus，
                                用于序列双重校验。为 None 时跳过序列校验。
-        seq_jaccard_threshold: float, k-mer Jaccard 最低阈值 (默认 0.5)
-                               只有 embedding 相似度 > threshold 且
-                               序列 Jaccard > seq_jaccard_threshold 才合并
+        seq_jaccard_threshold: float, k-mer Jaccard 最低阈值
+                               [G老师-Bug1-FIX] 从 0.5 降到 0.05。
+                               原设 0.5 假设 consensus 质量好，但 Round2+
+                               的 consensus 与 GT 平均 ED≈57，两条烂序列的
+                               Jaccard 趋近于 0，几乎所有 MNN 正确找到的
+                               同源碎片对都被拒绝——R2+R3 合并骤降至 90 对
+                               的根本原因。0.05 只拦截序列完全不相关的误合并。
         kmer_k:                int, k-mer 大小 (默认 8)
 
     Returns:
@@ -102,6 +123,9 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
 
     if len(centroids) < 2:
         print(f"   ⚠️ 簇数 < 2, 跳过")
+        # [问题1修复] 早返回路径补上 new_cluster_sizes，与正常路径返回值数量一致（4个）。
+        # 原来只返回3个值，调用方解包4个值时直接 crash。
+        early_sizes = {cid: int((labels == cid).sum().item()) for cid in centroids}
         return centroids, labels, {
             'clusters_before': len(centroids),
             'clusters_after':  len(centroids),
@@ -109,17 +133,17 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
             'time_seconds': 0.0,
             'threshold': threshold,
             'max_cluster_size': max_cluster_size,
-        }
+        }, early_sizes
 
     initial_K = len(centroids)
     total_merges = 0
     labels = labels.clone()
 
-    # 维护动态簇大小
-    # [FIX-PERF] 用 Counter 一次遍历代替逐簇 O(N) 扫描，从 O(K×N) → O(N)
-    from collections import Counter
-    label_counts = Counter(labels.tolist())
-    current_sizes = {cid: label_counts.get(cid, 0) for cid in centroids}
+    # [问题2修复] 用 Counter 一次 O(N) 遍历建立簇大小字典，替换原来的 O(K×N) 循环。
+    # 原来: for cid in centroids: (labels == cid).sum() → 67K × 390万 = 2600亿次比较。
+    from collections import Counter as _Counter
+    _label_counts = _Counter(labels.tolist())
+    current_sizes = {cid: _label_counts.get(cid, 0) for cid in centroids}
 
     for round_idx in range(max_rounds):
         # ── 1. 构建质心矩阵 ──
@@ -128,7 +152,7 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
         if K < 2:
             break
 
-        cid_to_idx = {c: i for i, c in enumerate(cids)}
+        # [问题3修复] 删除 cid_to_idx——全函数从未使用，每轮白白构建一次字典。
         centroid_matrix = torch.stack([centroids[c] for c in cids])  # (K, D)
         centroid_normed = F.normalize(centroid_matrix, dim=1)
 
@@ -194,7 +218,7 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
 
         # 每轮中已被合并的簇不能再参与（避免冲突）
         merged_this_round = set()
-        recompute_cids = set()   # [FIX-PERF] 只记录本轮 keep 的簇，质心重算范围
+        keep_cids_this_round = set()   # [G老师-Bug2-FIX] 记录本轮实际发生合并的 keep 簇
         round_merges = 0
 
         for sim_val, cid_a, cid_b in merge_pairs:
@@ -222,15 +246,19 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
 
             merged_this_round.add(cid_a)
             merged_this_round.add(cid_b)
-            recompute_cids.add(keep)   # [FIX-PERF] 记录需要重算质心的簇
+            keep_cids_this_round.add(keep)   # [G老师-Bug2-FIX] 记录 keep 簇
             round_merges += 1
 
         total_merges += round_merges
 
         # ── 5. 重算合并后的质心 ──
-        # [FIX-PERF] 只重算本轮 keep 的簇（吸收了新 reads，质心改变）
-        # 未参与合并的簇质心完全不变，跳过，从 O(K×N) → O(|keep|×N)
-        for cid in recompute_cids:
+        # [G老师-Bug2-FIX] 只重算本轮吸收了新成员的 keep 簇，不遍历全部 K 个簇。
+        # 原来 for cid in centroids.keys() 在 K=40000, N=400万 时会产生
+        # 40000 × 400万 = 1600亿次布尔比较，是严重的算力黑洞。
+        # 只有 keep 簇的成员发生了变化，其他簇质心完全没变，不需要重算。
+        for cid in keep_cids_this_round:
+            if cid not in centroids:
+                continue
             mask = (labels == cid)
             zone_mask = (zone_ids == 1) | (zone_ids == 2)
             valid_mask = mask & zone_mask
@@ -239,6 +267,16 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
                 continue
             emb = embeddings[valid_mask]
             w = strength[valid_mask].clone()
+
+            # [G老师-Bug3-FIX] 补上遗失的 Zone II 安全阀，与 step2_refine.py 保持一致。
+            # 原来直接用全部 strength，碎片簇合并后 Zone II 的异常高 strength
+            # 会直接主导新质心方向，引发质心漂移。
+            # 安全阀：Zone I reads < 3 条时，Zone II 的 strength 截断到 0.30。
+            z1_count = int((mask & (zone_ids == 1)).sum().item())
+            if z1_count < 3:
+                is_z2 = zone_ids[valid_mask] == 2
+                w[is_z2] = w[is_z2].clamp(max=0.30)   # ZONE2_WEIGHT_CAP
+
             w_sum = w.sum()
             if w_sum < 1e-10:
                 centroids[cid] = emb.mean(dim=0)
@@ -255,10 +293,10 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
     t1 = time.time()
 
     final_K = len(centroids)
-    # 更新 cluster_sizes
-    new_cluster_sizes = {}
-    for cid in centroids:
-        new_cluster_sizes[cid] = int((labels == cid).sum().item())
+    # [问题2修复] new_cluster_sizes 同样改用 Counter O(N) 替换 O(K×N) 循环。
+    # 合并后 K≈15K，15K × 390万 = 585亿次比较，同样是性能黑洞。
+    _final_counts = _Counter(labels.tolist())
+    new_cluster_sizes = {cid: _final_counts.get(cid, 0) for cid in centroids}
 
     merge_stats = {
         'clusters_before': initial_K,
@@ -278,4 +316,7 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
         sizes = sorted(new_cluster_sizes.values(), reverse=True)
         print(f"      簇大小: max={sizes[0]}, median={sizes[len(sizes)//2]}, min={sizes[-1]}")
 
-    return centroids, labels, merge_stats
+    # [残留问题1修复] new_cluster_sizes 算好了但只打日志，没有返回出去。
+    # 调用方用的仍是合并前的旧 cluster_sizes（含已被吸收消失的簇 ID），
+    # 保存到磁盘的元数据是错的。修复：把它加入返回值。
+    return centroids, labels, merge_stats, new_cluster_sizes

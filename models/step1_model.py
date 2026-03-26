@@ -302,9 +302,29 @@ class Step1EvidentialModel(nn.Module):
             cos_sim_batch   = torch.matmul(proj_emb, proj_emb.T)         # (B, B)
             diff_label_mask = ~pos_mask_inbatch & ~self_mask             # batch 内异簇且非自身
             high_sim_mask   = (cos_sim_batch > 0.80) & diff_label_mask  # 高相似度的异簇对
-        # 从负样本 mask 中移除这些"疑似同源"对（只作用于 batch 内列，不影响 queue 列）
-        neg_mask_full[:, :B] &= ~high_sim_mask
-        n_soft_masked = int(high_sim_mask.sum().item())
+
+        # [问题2修复] 原来只屏蔽 batch 内列（:B），Queue 列（B:）完全不受影响。
+        # 但 Queue 有 8192 条历史 reads，Clover 5.75× 过分割意味着同一分子的碎片
+        # 高概率分散在 batch 和 Queue 中，Queue 里的同源碎片照样被当硬负样本推开。
+        # 修复：对 Queue 列也计算 batch × queue 的高相似度异簇对，同样屏蔽。
+        neg_mask_full[:, :B] &= ~high_sim_mask   # batch 内列屏蔽（原有逻辑）
+
+        # Queue 列屏蔽（新增）
+        if sim_full.shape[1] > B:
+            q_count = sim_full.shape[1] - B
+            with torch.no_grad():
+                q_z_local    = self.queue_z[:q_count].detach().clone()           # (Q, 128)
+                cos_sim_queue = torch.matmul(proj_emb, q_z_local.T)             # (B, Q)
+                q_labels_local = self.queue_labels[:q_count].detach().clone()   # (Q,)
+                diff_label_q   = (cluster_labels.unsqueeze(1) !=
+                                  q_labels_local.unsqueeze(0))                   # (B, Q)
+                high_sim_q     = (cos_sim_queue > 0.80) & diff_label_q
+            neg_mask_full[:, B:] &= ~high_sim_q
+            n_soft_masked_q = int(high_sim_q.sum().item())
+        else:
+            n_soft_masked_q = 0
+
+        n_soft_masked = int(high_sim_mask.sum().item()) + n_soft_masked_q
 
         # 分子：正样本 exp（不加权）
         pos_exp_sum = (exp_sim * pos_mask_full.float()).sum(dim=1)         # (B,)
@@ -314,14 +334,17 @@ class Step1EvidentialModel(nn.Module):
         numerator   = pos_exp_sum + 1e-10
         log_prob    = torch.log(numerator) - torch.log(denominator)        # (B,)
 
-        # 只对 in-batch 有正样本的 read 计算 loss
-        has_pos = (pos_mask_inbatch.sum(dim=1) > 0)
+        # [问题2修复] has_pos 必须用 pos_mask_full（含Queue），不能用 pos_mask_inbatch。
+        # 原来用 inbatch：一条 read 在 batch 内没有同簇样本但 Queue 里有，
+        # has_pos=False → 这条 read 的 loss 被丢弃，Queue 正样本白建了。
+        # 同时 w_pos_per_read 也必须改用 w_full * pos_mask_full，
+        # 否则分子权重来自 inbatch、分母正样本来自 full，数学不对齐。
+        has_pos = (pos_mask_full.sum(dim=1) > 0)
         if not has_pos.any():
             self._dequeue_and_enqueue(proj_emb, u_epi, u_ale, cluster_labels)
             return torch.tensor(0.0, device=self.device, requires_grad=True), {}
 
-        # 加权平均：w_{i,pos} = 该 read 对所有 in-batch 正样本的权重之和
-        w_pos_per_read = (w_inbatch * pos_mask_inbatch.float()).sum(dim=1)[has_pos].clamp(min=1e-6)
+        w_pos_per_read = (w_full * pos_mask_full.float()).sum(dim=1)[has_pos].clamp(min=1e-6)
         loss = -(w_pos_per_read * log_prob[has_pos]).sum() / w_pos_per_read.sum()
 
         # ── 诊断探针 ──────────────────────────────────────────────────────
@@ -458,12 +481,53 @@ class Step1EvidentialModel(nn.Module):
 # ---------------------------------------------------------------------------
 # 预训练加载
 # ---------------------------------------------------------------------------
-def load_pretrained_feddna(model, path, device):
+def load_pretrained_feddna(model, path, device, max_length=150):
+    """
+    加载 FedDNA 预训练权重到 SSI-EC 模型。
+
+    [致命缺陷修复] length_adapter 动态恢复
+      原来 model.__init__ 设 self.length_adapter = None，导致 model.state_dict()
+      不含 length_adapter 的键，过滤条件 `k in model_sd` 会静默丢弃 checkpoint
+      里的 length_adapter 权重。Decoder 收到未经长度变换的特征，预训练权重失效。
+
+      修复：在构建 model_sd 之前，先探测 checkpoint 是否包含 length_adapter，
+      如果维度与当前 max_length 兼容就动态实例化，这样 state_dict 过滤时
+      能正确匹配并加载权重。
+
+    Args:
+        model:      Step1EvidentialModel 实例
+        path:       checkpoint 文件路径
+        device:     计算设备
+        max_length: 当前 SSI-EC 的序列统一长度。length_adapter 的输入输出
+                    维度必须都等于 max_length 才能兼容（SSI-EC 中 read 和
+                    consensus 都 pad 到 max_length，不存在长度映射需求）。
+    """
     try:
         ckpt = torch.load(path, map_location=device)
         sd = ckpt['model'] if 'model' in ckpt else (
             ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
         )
+
+        # [核心修复] 动态探测并实例化 length_adapter（在构建 model_sd 之前）
+        # FedDNA 的 length_adapter 是 nn.Linear(noise_length, label_length)，
+        # weight shape = (label_length, noise_length) = (out_features, in_features)。
+        # SSI-EC 中 encoder 输出的序列长度 = max_length，所以 Linear 的输入维度
+        # 必须 = max_length；输出也需要 = max_length（consensus 也是 max_length）。
+        if 'length_adapter.weight' in sd:
+            sh = sd['length_adapter.weight'].shape  # (out_features, in_features)
+            if sh[1] == max_length and sh[0] == max_length:
+                # 输入输出维度都匹配，可以安全加载
+                import torch.nn as nn_
+                model.length_adapter = nn_.Linear(sh[1], sh[0]).to(device)
+                print(f"   🔧 动态恢复 length_adapter: Linear({sh[1]}, {sh[0]})")
+            else:
+                # 维度不匹配（FedDNA 的 noise_length/label_length ≠ max_length）
+                # 跳过 length_adapter，Round 1 训练会让模型适应没有它的架构
+                print(f"   ⚠️ checkpoint 的 length_adapter 维度 {sh} "
+                      f"与 max_length={max_length} 不兼容，已跳过")
+                print(f"   💡 提示: 若要利用完整预训练权重，可设 --max_length {sh[1]}")
+
+        # 此时如果 length_adapter 被实例化，model.state_dict() 会包含它的键
         model_sd = model.state_dict()
         new_sd = {k: v for k, v in sd.items() if k in model_sd and v.shape == model_sd[k].shape}
         model.load_state_dict(new_sd, strict=False)

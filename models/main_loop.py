@@ -8,6 +8,23 @@ SSI-EC 主循环控制
              - 从 results['next_round_files'] 提取两个新键
   [v2]      断点续跑支持
   [v2]      收敛性追踪
+
+G老师审查修复清单:
+  [G老师-Bug1-FIX] 断点续跑时 Step1 未被真正跳过
+    原来：break 前没有设置 args.skip_step1_round，注释说"会被跳过"但条件永远为 False，
+          重启程序后 Step1 照常执行，checkpoint 被覆盖。
+    修复：检测到 Step1 完成 Step2 未跑时，自动执行
+          args.skip_step1_round = check_round，强制触发跳过逻辑。
+
+  [G老师-Bug2-FIX] 跨天运行时文件排序错乱（Time Bomb）
+    原来：sorted() 字典序排序，时间戳格式 "%H%M%S" 跨天后
+          001000 < 235500，断点续跑拿到旧文件，EM 迭代回滚。
+    修复：改用 key=os.path.getmtime 按实际修改时间排序。
+
+  [G老师-Bug3-FIX] 断点续跑路径的异常静默吞掉
+    原来：except Exception: current_cluster_change_info = None，
+          文件损坏时无任何提示，Curriculum Learning 悄悄失效。
+    修复：except Exception as e: print(...)，日志留下痕迹。
 """
 import argparse
 import os
@@ -69,6 +86,11 @@ def main_loop():
                         choices=['standard', 'ale_only', 'epi_only', 'ours'],
                         help='对比学习消融模式: standard=标准InfoNCE, ale_only=只用U_ale, '
                              'epi_only=只用U_epi, ours=完整设计(默认)')
+    parser.add_argument('--max_reads_per_cluster', type=int, default=30,
+                        help='训练时每簇最多采样的 reads 数，0=不限制。'
+                             '与 FedDNA 训练设计一致（FedDNA 用 5-30），'
+                             '建议 30（与feddna保持一致）。'
+                             '仅影响 Step1 训练，不影响 Step2 推理（全量）。')
     args = parser.parse_args()
 
     os.makedirs(os.path.join(args.experiment_dir, 'results'), exist_ok=True)
@@ -100,18 +122,28 @@ def main_loop():
                     break
 
             if not os.path.exists(step2_dir):
-                # step1 完成但 step2 未跑（典型：手动跳过 step2 重跑场景）
-                # 保存 step1 checkpoint，让 skip_step1_round 能拿到
+                # step1 完成但 step2 未跑（典型：中断后重跑场景）
                 current_checkpoint_path = ckpt_path
-                start_iteration = check_round   # 从本轮开始，step1 会被 skip_step1_round 跳过
+                start_iteration = check_round
+                # [G老师-Bug1-FIX] 原注释写"step1 会被 skip_step1_round 跳过"，
+                # 但 args.skip_step1_round 默认值是 0，不加命令行参数时
+                # 条件 args.skip_step1_round == check_round 永远 False，
+                # Step1 照常执行，辛苦跑好的 checkpoint 被无声覆盖。
+                # 修复：断点续跑检测到此情况时直接修改 args，强制触发跳过逻辑。
+                args.skip_step1_round = check_round
                 print(f"   ✅ 检测到 Round {check_round} Step1 已完成，Step2 未跑")
+                print(f"   ⚡ 自动设置 skip_step1_round={check_round}，将直接运行 Step2")
                 break
 
-            label_files   = sorted(glob.glob(os.path.join(labels_dir, "refined_labels_*.txt")))
-            state_files   = sorted(glob.glob(os.path.join(labels_dir, "read_state_*.pt")))
-            centroid_files= sorted(glob.glob(os.path.join(labels_dir, "centroids_*.pt")))
-            consensus_files = sorted(glob.glob(os.path.join(labels_dir, "consensus_dict_*.pt")))  # [FIX-P0]
-            change_files  = sorted(glob.glob(os.path.join(labels_dir, "cluster_change_info_*.pt")))  # [FIX-P0]
+            # [G老师-Bug2-FIX] 原来用 sorted() 字典序排序，但时间戳格式是 "%H%M%S"
+            # （只有时分秒，无日期）。跨天运行时 001000 < 235500，导致断点续跑
+            # 拿到的是上一轮的旧文件，EM 迭代回滚。
+            # 修复：改用 os.path.getmtime 按文件实际修改时间排序，与文件名无关。
+            label_files    = sorted(glob.glob(os.path.join(labels_dir, "refined_labels_*.txt")),    key=os.path.getmtime)
+            state_files    = sorted(glob.glob(os.path.join(labels_dir, "read_state_*.pt")),         key=os.path.getmtime)
+            centroid_files = sorted(glob.glob(os.path.join(labels_dir, "centroids_*.pt")),          key=os.path.getmtime)
+            consensus_files= sorted(glob.glob(os.path.join(labels_dir, "consensus_dict_*.pt")),     key=os.path.getmtime)
+            change_files   = sorted(glob.glob(os.path.join(labels_dir, "cluster_change_info_*.pt")),key=os.path.getmtime)
 
             if not label_files:
                 break
@@ -127,7 +159,11 @@ def main_loop():
             if change_files:
                 try:
                     current_cluster_change_info = torch.load(change_files[-1], map_location='cpu')
-                except Exception:
+                except Exception as e:
+                    # [G老师-Bug3-FIX] 原来静默吞掉异常，文件损坏时程序不报错，
+                    # 悄悄回退到全量采样，破坏 Curriculum Learning 策略。
+                    # 修复：至少打印异常，让日志留下痕迹。
+                    print(f"   ⚠️ 加载 cluster_change_info 失败 ({e})，将回退到无难度采样模式")
                     current_cluster_change_info = None
 
             start_iteration = check_round + 1
@@ -192,6 +228,7 @@ def main_loop():
                 cv_threshold=getattr(args, 'cv_threshold', 0.3),
                 consensus_path=current_consensus_path,
                 cluster_change_info=current_cluster_change_info,
+                max_reads_per_cluster=getattr(args, 'max_reads_per_cluster', 50),
             )
             step1_checkpoint = train_step1(step1_args)
             if step1_checkpoint is None:
@@ -207,7 +244,7 @@ def main_loop():
             output_dir=step2_out,
             dim=args.dim,
             max_length=args.max_length,
-            batch_size=args.batch_size,          # step2 推理 DataLoader 需要
+            batch_size=args.batch_size,
             device=args.device,
             round_idx=iteration,
             refined_labels=current_labels_path,
@@ -215,7 +252,10 @@ def main_loop():
             gt_tags_file=args.gt_tags_file,
             gt_refs_file=args.gt_refs_file,
             training_cap=args.training_cap,
-            consensus_path=current_consensus_path,  # 上一轮 consensus，用于序列双重校验
+            consensus_path=current_consensus_path,
+            cv_threshold=getattr(args, 'cv_threshold', 0.3),  # [残留问题2修复]
+            # 原来 step2_args 没有 cv_threshold，step2_runner 用 getattr 取到默认 0.3，
+            # 用户传 --cv_threshold 0.5 时 Step2 日志仍打印 0.3 下的统计，和 Step1 不一致。
         )
         results = run_step2(step2_args)
 

@@ -81,6 +81,11 @@ def run_feddna_decode(
         3. ds_fusion_masked（等权，与 FedDNA 完全一致）
         4. alpha = fused + 1 → prob = alpha/S → one_hot(argmax) 作为 consensus
 
+    注意：step2_runner 的全量推理阶段已经跑过一次 encoder，但只保留了
+    pooled emb (N, D)，没有保留序列级 emb (N, L, D)（需要 ~210GB，存不下）。
+    因此这里必须重跑一遍完整的 encoder → decoder，是架构上的必要代价，
+    若后续有更大内存预算，可考虑缓存 float16 序列级 emb 来消除这次重复推理。
+
     Returns:
         consensus_dict: {cluster_id: Tensor(L, 4)} one-hot，padding 位置全零
     """

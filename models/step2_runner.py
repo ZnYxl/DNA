@@ -3,9 +3,26 @@
 Step2: Evidence-Guided Clustering Refinement
 
 修复清单:
-  [FIX-EMA]    删除动量更新 Strength
-  [FIX-FASTA]  修复 Fasta 输出尾部填充 A 的 Bug
-  [FIX-P0]     next_round_files 增加 'consensus' 和 'cluster_change_info' 键
+  [FIX-EMA]         删除动量更新 Strength（原 EMA 污染 U_ale 分布）
+  [FIX-FASTA]       修复 Fasta 输出尾部填充 A 的 Bug
+  [FIX-P0]          next_round_files 增加 'consensus' 和 'cluster_change_info' 键
+  [FIX-ZONE3-LEAK]  Zone III 标签隔离：显式置 -1，切断泄露通道
+  [FIX-DECODE]      用 FedDNA ds_fusion 替换 majority-vote consensus
+
+  [G老师-问题1-FIX] 死数据复活逻辑实装（EM 闭环补全）
+                    原来 inference_mode=True 让 label=-1 reads 参与推理，
+                    但 clone() 后没有发放复活门票，复活功能只有入口没有出口。
+                    修复：对全部 label=-1 reads 计算到各质心的 L2 距离，
+                    距离 < delta 则复活分配到最近簇，否则保持 -1。
+
+  [G老师-问题2-FIX] CV 阈值统一来源（消除日志欺骗）
+                    原来动态计算 median×2.5 打印"X个困难簇"，
+                    但该值没有传出，Step1 实际用固定 0.3，两份日志数字不一致。
+                    修复：改用 getattr(args, 'cv_threshold', 0.3)，
+                    Step2 日志和 Step1 采样共用同一个阈值来源。
+
+  [G老师-问题3-FIX] 删除僵尸函数 compute_consensus_from_memory
+                    已被 run_feddna_decode 完全替代，40行冗余代码直接删除。
 """
 import torch
 import torch.nn as nn
@@ -29,43 +46,13 @@ from models.step1_data  import CloverDataLoader, Step1Dataset, _BASE_LUT
 from models.step1_visualizer import Step1Visualizer
 from models.step2_refine import (split_confidence_by_zone,
                                  compute_centroids_weighted,
-                                 compute_global_delta,
-                                 refine_reads)
+                                 compute_global_delta)
+# [问题6修复] 删除 refine_reads import：函数体第一行是 raise RuntimeError，
+# 永远不会被调用，但 import 会误导读者以为它仍在流程中。
 
 
-def compute_consensus_from_memory(
-    reads_list, labels_np, strength_np, flat_real_indices, max_len, round_idx=1
-) -> Dict[int, torch.Tensor]:
-    cluster_to_didx: Dict[int, list] = defaultdict(list)
-    for didx, label in enumerate(labels_np):
-        if label >= 0:
-            cluster_to_didx[int(label)].append(didx)
-
-    consensus_dict: Dict[int, torch.Tensor] = {}
-    for cluster_id, didx_list in cluster_to_didx.items():
-        if len(didx_list) < 1:
-            continue
-        # [FIX-N] 第5列(index 4)静默吸收 'N'，避免 np.add.at IndexError
-        vote_matrix = np.zeros((max_len, 5), dtype=np.float64)
-        for didx in didx_list:
-            real_idx = flat_real_indices[didx]
-            read = reads_list[real_idx] if real_idx < len(reads_list) else ''
-            s = float(strength_np[didx]) if round_idx >= 2 else 1.0
-            L = min(len(read), max_len)
-            if L > 0:
-                # ★ 向量化：numpy LUT 替代 Python 字典循环（~105x 加速）
-                byte_arr = np.frombuffer(read[:L].encode('ascii'), dtype=np.uint8)
-                indices = _BASE_LUT[byte_arr]
-                np.add.at(vote_matrix[:L], (np.arange(L), indices), s)
-        # ★ 修复 padding：argmax([0,0,0,0])=0 → 'A' one-hot，
-        #   会让 masked_bayes_risk 把 padding 位置误判为有效碱基，污染 Loss
-        # [FIX-N] 仅对 ACGT 4列计算 has_vote 和 argmax，第5列('N')自然截断
-        has_vote = vote_matrix[:, :4].sum(axis=1) > 0
-        consensus_indices = vote_matrix[:, :4].argmax(axis=1)
-        one_hot = np.eye(4, dtype=np.float32)[consensus_indices]
-        one_hot[~has_vote] = 0.0                       # padding → all zeros
-        consensus_dict[cluster_id] = torch.from_numpy(one_hot)
-    return consensus_dict
+# [G老师-问题3-已删除] compute_consensus_from_memory (majority-vote版本)
+# 已被 step2_decode.py 的 run_feddna_decode 完全替代，此处不再保留。
 
 
 def compute_cluster_difficulty(new_labels_np, flat_real_indices, strength_np) -> Dict[int, float]:
@@ -220,8 +207,13 @@ def run_step2(args):
     sd = checkpoint['model_state_dict']
     if 'length_adapter.weight' in sd:
         sh = sd['length_adapter.weight'].shape
-        if sh[0] == model_max_len:
+        # [致命缺陷2修复] 检查输入和输出两个维度都匹配 model_max_len
+        if sh[1] == model_max_len and sh[0] == model_max_len:
             model.length_adapter = nn.Linear(sh[1], sh[0]).to(device)
+            print(f"   🔧 恢复 length_adapter: Linear({sh[1]}, {sh[0]})")
+        else:
+            print(f"   ⚠️ checkpoint 的 length_adapter 维度 {sh} "
+                  f"与 max_length={model_max_len} 不兼容，已跳过")
     model.load_state_dict(sd, strict=False)
     model.eval()
     del checkpoint, sd
@@ -246,6 +238,10 @@ def run_step2(args):
     D = model_dim
     print(f"   📦 预分配: {N} samples × {D} dim (float16)", flush=True)
 
+    # 注意：只存 pooled emb (N, D)，不存序列级 emb (N, L, D)。
+    # 序列级 emb 需要 390万 × 105 × 256 × 2字节 ≈ 210GB，无法保留在内存中。
+    # 因此 Consensus 解码（run_feddna_decode）必须重跑一遍 encoder，
+    # 这是架构上的必要代价，不是 bug。
     embeddings  = torch.zeros(N, D, dtype=torch.float16)
     strength    = torch.zeros(N)
     u_epi       = torch.zeros(N)
@@ -313,6 +309,14 @@ def run_step2(args):
         embeddings_f32, labels_tensor, strength, zone_ids
     )
 
+    # [问题5修复] delta 必须在 MNN 合并之前计算。
+    # 原来顺序是：质心计算 → MNN合并（质心偏移）→ 算delta
+    # MNN 合并后 labels_tensor 更新了（absorb簇的reads归入keep簇），
+    # zone_ids 却没有更新，compute_global_delta 用偏移后的质心算距离，
+    # delta 的物理含义变成"Zone I read 到已偏移质心的距离"，系统性高估。
+    # 修复：在合并前用原始质心算 delta，保证它是干净的 Zone I 安全半径。
+    delta = compute_global_delta(embeddings_f32, labels_tensor, zone_ids, centroids)
+
     # ★ 安全簇合并 (MNN + 序列双重校验 + 最大簇大小约束)
     # 序列校验用上一轮的 consensus_dict（当轮的在 Section 6 才生成）
     prev_consensus_dict = None
@@ -326,26 +330,70 @@ def run_step2(args):
             print(f"   ⚠️ 加载上一轮 consensus 失败: {e}，跳过序列校验")
             prev_consensus_dict = None
 
-    centroids, labels_tensor, merge_stats = merge_close_centroids(
+    centroids, labels_tensor, merge_stats, cluster_sizes = merge_close_centroids(
         centroids, labels_tensor, cluster_sizes,
         embeddings_f32, zone_ids, strength,
         threshold=0.98,
         max_cluster_size=2000,
         max_rounds=60,
         consensus_dict=prev_consensus_dict,
-        seq_jaccard_threshold=0.5,
+        seq_jaccard_threshold=0.05,   # [问题1修复] 原来硬编码0.5覆盖了函数签名的修复
     )
+    # [残留问题1修复] cluster_sizes 现在是合并后的新值（来自 merge_close_centroids 返回值），
+    # 不再是合并前的旧值。保存到磁盘的元数据和实际质心一致。
 
-    delta = compute_global_delta(embeddings_f32, labels_tensor, zone_ids, centroids)
     # [FIX-ZONE2] 不再做 Zone II 重分配：Zone I 可能无法覆盖全部 GT，
     #             强制重分配会丢失 Zone II 中的有效 reads。
     new_labels = labels_tensor.clone()  # 合并后的标签直接作为最终标签
-    # [FIX-ZONE3-LEAK] Zone III 的 reads 物理上已被排除在质心计算外，
-    # 但其旧标签仍会随 new_labels 传入下一轮训练，污染对比学习梯度。
-    # 必须在保存前显式置为 -1，切断泄露通道。
+
+    # [FIX-ZONE3-LEAK] 先隔离 Zone III，再做死数据复活。
+    # [问题1修复] 原来顺序是：死数据复活 → Zone III 隔离。
+    # Zone III 的 reads 中有一部分上一轮就是 label=-1，它们会参与复活计算，
+    # 复活成功后立刻被 Zone III 隔离再次置为 -1，导致日志"成功复活 N 条"
+    # 包含了这些马上会被杀掉的 Zone III reads，数字虚高。
+    # 修复：先隔离 Zone III（无论旧标签是什么都置为 -1），
+    # 再对剩余 label=-1 的 reads 做复活，日志数字才真实反映有效复活量。
     z3_count = int((zone_ids == 3).sum().item())
     new_labels[zone_ids == 3] = -1
     print(f"   🔒 Zone III 标签隔离: {z3_count} reads → -1")
+
+    # =====================================================================
+    # [FIX-DEAD-REVIVAL] 死数据复活核心逻辑（补全 EM 闭环）
+    # =====================================================================
+    noise_mask    = (new_labels == -1)
+    noise_indices = torch.where(noise_mask)[0]
+
+    if len(noise_indices) > 0 and len(centroids) > 0:
+        print(f"\n   🧟 启动死数据复活判定: 候选 {len(noise_indices)} reads "
+              f"(门限 delta={delta:.4f})")
+        cids           = sorted(centroids.keys())
+        centroid_matrix = torch.stack([centroids[c] for c in cids]).cpu()
+
+        revived_count = 0
+        chunk_size    = 5000
+
+        for start in range(0, len(noise_indices), chunk_size):
+            end       = min(start + chunk_size, len(noise_indices))
+            batch_idx = noise_indices[start:end]
+            batch_emb = embeddings_f32[batch_idx]
+
+            dists              = torch.cdist(batch_emb, centroid_matrix)
+            min_dists, min_idx = dists.min(dim=1)
+            revive_mask        = min_dists < delta
+
+            # [问题7修复] 向量化替换 Python 逐条循环，百万级 reads 时快几个数量级
+            revive_positions = batch_idx[revive_mask]
+            revive_cluster_ids = torch.tensor(
+                [cids[j] for j in min_idx[revive_mask].tolist()],
+                dtype=torch.long
+            )
+            new_labels[revive_positions] = revive_cluster_ids
+            revived_count += int(revive_mask.sum().item())
+
+        print(f"   ✨ 成功复活: {revived_count} / {len(noise_indices)} reads")
+    else:
+        print(f"\n   🧟 死数据复活: 无候选数据或无有效质心，跳过")
+    # =====================================================================
     noise_mask = (new_labels < 0)
     refine_stats = {'zone2_reassigned': 0, 'zone2_noise': 0}
     # 注意: delta 保留用于 _record_paper_log_safe 日志，不影响标签。
@@ -391,15 +439,17 @@ def run_step2(args):
     cluster_change_info = compute_cluster_difficulty(
         new_labels_np, flat_real_indices, _np_strength
     )
-    cv_values = list(cluster_change_info.values()) if cluster_change_info else []
-    median_cv = float(np.median(cv_values)) if cv_values else 0.05
-    cv_threshold = max(0.05, median_cv * 2.5)
-    print(f"   📊 动态 CV 阈值: 中位CV={median_cv:.4f} × 2.5 = {cv_threshold:.4f}")
+    # [G老师-问题2-FIX] 使用 args 传入的 cv_threshold，而不是本地动态计算。
+    # 原来动态算出一个值打印"X个困难簇"，但这个值没有传出去，
+    # Step1 实际用的仍是固定 0.3，两份日志说的不是同一套数字——"欺骗"用户。
+    # 修复后：Step2 和 Step1 都用同一个来自 main_loop 的 cv_threshold。
+    cv_threshold  = getattr(args, 'cv_threshold', 0.3)
     hard_clusters = sum(1 for v in cluster_change_info.values() if v >= cv_threshold)
     easy_clusters = len(cluster_change_info) - hard_clusters
-    cv_values = list(cluster_change_info.values())
-    cv_median  = float(np.median(cv_values)) if cv_values else 0.0
-    print(f"   ✅ cluster_difficulty (CV): 困难簇(≥{cv_threshold})={hard_clusters}, "
+    cv_values     = list(cluster_change_info.values())
+    cv_median     = float(np.median(cv_values)) if cv_values else 0.0
+    print(f"   📊 困难簇判定阈值 (CV): {cv_threshold}  (来自 args.cv_threshold)")
+    print(f"   ✅ cluster_difficulty: 困难簇(≥{cv_threshold})={hard_clusters}, "
           f"完美簇={easy_clusters}, 中位CV={cv_median:.3f}")
 
     # =====================================================================

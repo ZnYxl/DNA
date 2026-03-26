@@ -14,6 +14,23 @@ v3 变更:
   [FIX-3] compute_global_delta 签名与 runner 一致
   [FIX-4] refine 距离计算: CPU 双轴分块 matmul，避免 OOM
   [FIX-5] compute_global_delta 只返回原始 delta
+
+G老师审查修复清单:
+  [G老师-Bug1-FIX] GMM 加权中点公式纠正 (_find_gmm_threshold 第160行)
+    原来: threshold = (mu0*w1 + mu1*w0) / (w0+w1)  ← w0/w1位置互换
+    w0=1/std0 很大(Zone I集中)被错误地乘到 mu1 上，阈值被拉向 Zone II 山峰，
+    导致大量 Zone II reads 被误判为 Zone I，三区制防线失效。
+    修复: threshold = (mu0*w0 + mu1*w1) / (w0+w1)，阈值正确靠近 Zone I。
+
+  [G老师-Bug2-FIX] compute_centroids_weighted 改为 O(N) 哈希索引
+    原来: for k in unique_labels: mask = (labels==k)
+    K=40000 × N=400万 = 1600亿次布尔比较，每次 Step2 卡死数分钟。
+    修复: 一次遍历建 defaultdict {label: [indices]}，之后 O(1) 直接取值。
+
+  [G老师-Bug3-FIX] compute_global_delta 改为纯向量化
+    原来: for k in unique: km = (z1_labels==k)
+    Zone I ~240万 reads × ~40000 簇 = 同款算力黑洞。
+    修复: 提取每条 Zone I read 对应质心堆成矩阵，一次性批量计算距离。
 """
 import torch
 import torch.nn.functional as F
@@ -152,12 +169,21 @@ def _find_gmm_threshold(values, fallback_percentile=0.70):
             print(f"      ⚠️ GMM 两分量重合 (sep={separation:.2f}), fallback")
             return float(np.quantile(values, fallback_percentile)), 'fallback'
 
-        # 交叉点: 两个高斯 PDF 相等的点
-        # 简化: 取加权中点 (按 std 反比加权)
-        # 更精确的做法是解方程, 但对一维情况加权中点足够好
-        w0 = 1.0 / max(std0, 1e-10)
-        w1 = 1.0 / max(std1, 1e-10)
-        threshold = (mu0 * w1 + mu1 * w0) / (w0 + w1)
+        # [问题5修复] 原来只扫 [mu0, mu1]，如果真正的 PDF 交叉点在 mu1 右侧
+        # （std1 >> std0 时可能出现），会漏掉交叉点，导致阈值直接取 mu1（偏大）。
+        # 修复：扫描范围扩展到 [mu0 - std0, mu1 + std1]，覆盖两侧尾部，
+        # 代价只是 linspace 的范围略大，精度不变。
+        scan_lo = mu0 - std0
+        scan_hi = mu1 + std1
+        x_scan = np.linspace(scan_lo, scan_hi, 2000).reshape(-1, 1)
+        proba  = gmm.predict_proba(x_scan)
+        order_idx = order[0]
+        p0 = proba[:, order_idx]
+        cross = np.where(p0 < 0.5)[0]
+        if len(cross) == 0:
+            threshold = float(mu1)
+        else:
+            threshold = float(x_scan[cross[0], 0])
 
         # 验证: 阈值切出的 Zone I 比例应在 [40%, 95%]
         zone1_ratio = (values < threshold).sum() / len(values)
@@ -282,32 +308,40 @@ def compute_centroids_weighted(embeddings, labels, strength, zone_ids):
     """
     Zone I + Zone II 参与, Zone III 不参与
     权重 = Strength, 小簇安全阀触发时 Zone II 权重截断
+
+    [G老师-Bug2-FIX] 用 O(N) 哈希倒排索引替换 O(K×N) 全局扫描。
+    原来对每个簇执行 `labels == k`，K=40000 × N=400万 = 1600亿次布尔比较。
+    现在：一次遍历建好 {label: [indices]} 字典，之后直接用下标取值。
     """
+    from collections import defaultdict
+
     D = embeddings.shape[1]
-    unique_labels = torch.unique(labels)
     centroids = {}
     cluster_sizes = {}
 
-    for k in unique_labels:
-        if k < 0:
+    # O(N) 建立倒排索引：label → 属于该簇的所有 read 下标
+    label_to_idx = defaultdict(list)
+    labels_cpu = labels.cpu().numpy()
+    for i, l in enumerate(labels_cpu):
+        if l >= 0:
+            label_to_idx[int(l)].append(i)
+
+    for k_int, idxs in label_to_idx.items():
+        mask_idx = torch.tensor(idxs, dtype=torch.long, device=embeddings.device)
+
+        z_ids     = zone_ids[mask_idx]
+        zone_mask = (z_ids == 1) | (z_ids == 2)
+        if not zone_mask.any():
             continue
-        k_int = int(k.item())
 
-        mask = (labels == k)
-        zone_mask = (zone_ids == 1) | (zone_ids == 2)
-        valid_mask = mask & zone_mask
-
-        count = valid_mask.sum().item()
-        if count == 0:
-            continue
-
-        emb = embeddings[valid_mask]
-        w = strength[valid_mask].clone()
+        valid_idx = mask_idx[zone_mask]
+        emb = embeddings[valid_idx]
+        w   = strength[valid_idx].clone()
 
         # 安全阀: Zone I < 3 条时, Zone II 权重截断
-        z1_count = (mask & (zone_ids == 1)).sum().item()
+        z1_count = int((z_ids == 1).sum().item())
         if z1_count < MIN_ZONE1_SAFETY:
-            is_z2 = zone_ids[valid_mask] == 2
+            is_z2 = zone_ids[valid_idx] == 2
             w[is_z2] = w[is_z2].clamp(max=ZONE2_WEIGHT_CAP)
 
         w_sum = w.sum()
@@ -316,7 +350,7 @@ def compute_centroids_weighted(embeddings, labels, strength, zone_ids):
         else:
             centroids[k_int] = (emb * w.unsqueeze(1)).sum(dim=0) / w_sum
 
-        cluster_sizes[k_int] = int(mask.sum().item())
+        cluster_sizes[k_int] = len(idxs)   # 全簇 reads 数（含 Zone III）
 
     print(f"   📍 质心: {len(centroids)} 个簇")
     return centroids, cluster_sizes
@@ -326,31 +360,41 @@ def compute_centroids_weighted(embeddings, labels, strength, zone_ids):
 # 3. Global Delta
 # ===========================================================================
 def compute_global_delta(embeddings, labels, zone_ids, centroids):
-    """Zone I reads 到自身质心的距离分布 P95 → delta"""
+    """Zone I reads 到自身质心的距离分布 P95 → delta
+
+    [G老师-Bug3-FIX] 用纯向量化替换 O(K×N) 循环。
+    原来对每个唯一簇执行 `z1_labels == k`，Zone I 有 ~240万 reads，
+    ~40000 个簇，同样是数百亿次布尔比较。
+    修复：提取每条 Zone I read 对应质心的向量，一次性批量计算距离。
+    """
     z1_mask = (zone_ids == 1)
     if z1_mask.sum() == 0:
         print("   ⚠️ Zone I 为空, delta 设为 1.0")
         return 1.0
 
     z1_labels = labels[z1_mask]
-    z1_emb = embeddings[z1_mask]
+    z1_emb    = embeddings[z1_mask]
 
-    distances = []
-    unique = torch.unique(z1_labels)
+    # 过滤掉不在 centroids 里的 reads（极少数边界情况）
+    z1_labels_list = z1_labels.tolist()
+    valid_flags = torch.tensor(
+        [l in centroids for l in z1_labels_list],
+        dtype=torch.bool, device=z1_emb.device
+    )
 
-    for k in unique:
-        k_int = int(k.item())
-        if k_int < 0 or k_int not in centroids:
-            continue
-        km = (z1_labels == k)
-        d = torch.norm(z1_emb[km] - centroids[k_int].unsqueeze(0), dim=1)
-        distances.append(d)
-
-    if len(distances) == 0:
+    if not valid_flags.any():
         print("   ⚠️ 无有效 Zone I 距离, delta 设为 1.0")
         return 1.0
 
-    all_dist = torch.cat(distances)
+    z1_labels_valid = [z1_labels_list[i] for i in range(len(z1_labels_list)) if valid_flags[i]]
+    z1_emb_valid    = z1_emb[valid_flags]
+
+    # 为每条 valid Zone I read 取出其对应质心，堆成 (M, D) 矩阵
+    aligned_centroids = torch.stack([centroids[l] for l in z1_labels_valid])
+
+    # 一次性计算所有 reads 到自身质心的 L2 距离
+    all_dist = torch.norm(z1_emb_valid - aligned_centroids, dim=1)
+
     delta = float(torch.quantile(all_dist, DELTA_P / 100.0).item())
     print(f"   📏 Global Delta = {delta:.4f} (P{DELTA_P} of {len(all_dist)} Zone I distances)")
     return delta
