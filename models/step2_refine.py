@@ -46,7 +46,7 @@ FALLBACK_SAFE_PERCENTILE  = 0.70
 
 MIN_ZONE1_SAFETY   = 3
 ZONE2_WEIGHT_CAP   = 0.30
-DELTA_P            = 95
+DELTA_P            = 75    # [保守复活] 用中位数而非 P95，避免高维空间下半径过大导致"丧尸感染"。v4从50改至75
 # ROUND1_DELTA_SCALE 已删除: refine_reads 被 FIX-ZONE2 废弃, 该常量不再使用
 MAX_ZONE3_RATIO = 0.30   # [FIX-Bug#2] Zone III 绝对上限
 

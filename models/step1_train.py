@@ -132,6 +132,7 @@ def train_step1(args):
         consensus_dict=consensus_dict,              # [FIX-P0]
         cluster_change_info=cluster_change_info,    # [FIX-P0]
         cv_threshold=getattr(args, 'cv_threshold', 0.3),  # 困难簇 CV 阈值，默认0.3可调
+        max_reads_per_cluster=getattr(args, 'max_reads_per_cluster', 30),  # 与 FedDNA 对齐，每簇最多30条
     )
 
     # =====================================================================

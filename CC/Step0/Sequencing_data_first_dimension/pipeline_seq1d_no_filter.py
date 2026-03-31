@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-pipeline_seq1d.py
+pipeline_seq1d_no_filter.py
 =================
 Sequencing_data_first_dimension 专用 Pipeline
 
-  output.txt → 预处理 → Clover聚类 → 小簇过滤 → 统计 → Majority Vote → read.txt + ref.txt
+  output.txt → 预处理 → Clover聚类 → 统计 → Majority Vote → read.txt + ref.txt
 
 用法:
     cd /mnt/st_data/liangxinyi/code/CC/Step0/Sequencing_data_first_dimension
     python pipeline_seq1d.py                    # 完整运行
     python pipeline_seq1d.py --skip_clover      # 跳过 Clover，复用已有结果
-    python pipeline_seq1d.py --skip_clover --min_reads 10  # 自定义最小簇大小
 
 数据集参数:
     ref_len        = 196bp
     长度过滤       = [191, 201]
     引物           = 无（但 Clover 需设 h_index=20, e_index=20 跳过共享前后缀）
-    min_reads/簇   = 5（Clover 聚类后，< 5 条的簇丢弃，与 FedDNA 保持一致）
     Clover 参数    = -D 20 -V 3 -H 3
 
 输出:
@@ -24,7 +22,7 @@ Sequencing_data_first_dimension 专用 Pipeline
     ├── 01_clover_input.txt         ← Clover 输入 (idx read, --no-tag)
     ├── 01_clover_tag_input.txt     ← Clover 验证 (tag read, tag模式)
     ├── 02_clover_result.txt        ← Clover 原始输出
-    ├── 03_stats.txt                ← 聚类统计 (过滤后)
+    ├── 03_stats.txt                ← 聚类统计
     └── 04_FedDNA_In/
         ├── read.txt                ← SSI-EC 输入 (簇间 ===== 分隔)
         └── ref.txt                 ← Majority Vote 伪 ref
@@ -47,7 +45,6 @@ OUTPUT_DIR  = os.path.join(BASE_DIR, 'clover_out')
 REF_LEN     = 196
 LEN_MIN     = REF_LEN - 5   # 191
 LEN_MAX     = REF_LEN + 5   # 201
-MIN_READS_PER_CLUSTER = 5   # Clover 聚类后，小于此值的簇丢弃
 N_GT_TAGS   = 11826          # design 总数
 
 # Clover 参数
@@ -68,6 +65,10 @@ def banner(title):
 # Step 0: 预处理
 # ============================================================
 def step0_preprocess(input_file):
+    """
+    读 output.txt (tag\\tread)，做去N + 长度过滤。
+    不做簇级过滤——所有通过的 reads 都保留给 Clover 参与建树。
+    """
     banner("Step 0  预处理")
 
     total = 0
@@ -116,6 +117,12 @@ def step0_preprocess(input_file):
 # Step 1: 写 Clover 输入
 # ============================================================
 def step1_write_clover_input(cleaned, clover_input_path, clover_tag_path):
+    """
+    写两份输入文件：
+      - --no-tag 模式:  idx read  （实际聚类用）
+      - tag 模式:       tag read  （手动验证 accuracy 用）
+    返回 idx → (tag, read) 映射。
+    """
     banner("Step 1  写 Clover 输入文件")
 
     idx_map = {}
@@ -138,6 +145,7 @@ def step1_write_clover_input(cleaned, clover_input_path, clover_tag_path):
     print(f"  tag 模式输入:   {clover_tag_path}")
     print()
     print(f"  💡 手动验证 accuracy:")
+    print()
     print(f"     cd {CLOVER_DIR}")
     print(f"     python -m clover.main \\")
     print(f"       -I {clover_tag_path} \\")
@@ -151,8 +159,13 @@ def step1_write_clover_input(cleaned, clover_input_path, clover_tag_path):
 # Step 2: 运行 Clover
 # ============================================================
 def step2_run_clover(clover_input_path, clover_output_base):
+    """
+    运行 Clover (--no-tag 模式)。
+    运行前自动修改 load_config.py 确保参数正确。
+    """
     banner("Step 2  运行 Clover")
 
+    # ── 修改 load_config.py ──
     config_path = os.path.join(CLOVER_DIR, 'clover', 'load_config.py')
     with open(config_path, 'r') as f:
         content = f.read()
@@ -177,12 +190,15 @@ def step2_run_clover(clover_input_path, clover_output_base):
         with open(config_path, 'w') as f:
             f.write(content)
         print(f"  ✅ 已更新 load_config.py:")
+        print()
         for k, v in patches.items():
             print(f"     {k:20s} = {v}")
         print()
     else:
-        print(f"  ℹ️  load_config.py 参数已正确\n")
+        print(f"  ℹ️  load_config.py 参数已正确")
+        print()
 
+    # ── 构建命令 ──
     cmd = [
         sys.executable, "-m", "clover.main",
         "-I", clover_input_path,
@@ -198,8 +214,15 @@ def step2_run_clover(clover_input_path, clover_output_base):
     env = os.environ.copy()
     env["PYTHONPATH"] = CLOVER_DIR + os.pathsep + env.get("PYTHONPATH", "")
 
-    print(f"  Clover 参数: -L {REF_LEN} -D {CLOVER_TREE_DEPTH} -V {CLOVER_V_DRIFT} -H {CLOVER_H_DRIFT}")
-    print(f"  运行中 ...\n")
+    print(f"  Clover 参数:")
+    print(f"    -L {REF_LEN}  -D {CLOVER_TREE_DEPTH}  -V {CLOVER_V_DRIFT}  -H {CLOVER_H_DRIFT}")
+    print(f"    h_index = {CLOVER_H_INDEX}")
+    print(f"    e_index = {CLOVER_E_INDEX}")
+    print(f"    thd_tree = 72")
+    print(f"    four_tree = 124")
+    print()
+    print(f"  运行中 ...")
+    print()
 
     t0 = time.time()
     subprocess.run(cmd, check=True, env=env, cwd=CLOVER_DIR)
@@ -212,10 +235,14 @@ def step2_run_clover(clover_input_path, clover_output_base):
         if os.path.exists(alt_path):
             os.rename(alt_path, result_path)
         else:
-            raise FileNotFoundError(f"Clover 输出文件不存在: {result_path}")
+            raise FileNotFoundError(
+                f"Clover 输出文件不存在:\n  尝试1: {result_path}\n  尝试2: {alt_path}")
 
-    print(f"\n  ✅ Clover 完成，耗时 {elapsed:.1f}s")
-    print(f"     输出: {result_path}")
+    print()
+    print(f"  ✅ Clover 完成")
+    print(f"     耗时:  {elapsed:.1f}s")
+    print(f"     输出:  {result_path}")
+
     return result_path
 
 
@@ -223,6 +250,7 @@ def step2_run_clover(clover_input_path, clover_output_base):
 # Step 3: 解析 Clover 输出
 # ============================================================
 def step3_parse_clover(clover_output_path):
+    """解析 Clover 输出的 (idx, cid) 对 → {cid: [idx, ...]}"""
     banner("Step 3  解析 Clover 输出")
 
     with open(clover_output_path, 'r') as f:
@@ -238,47 +266,30 @@ def step3_parse_clover(clover_output_path):
 
     print(f"  文件:      {clover_output_path}")
     print(f"  (idx,cid): {len(pairs):,} 条")
-    print(f"  原始簇数:  {len(cid_to_idxs):,}")
+    print(f"  聚类簇数:  {len(cid_to_idxs):,}")
+    print()
+
     if sizes:
-        print(f"  max={max(sizes)}, med={sorted(sizes)[len(sizes)//2]}, min={min(sizes)}")
+        print(f"  簇大小概览:")
+        print(f"    max = {max(sizes)}")
+        print(f"    med = {sorted(sizes)[len(sizes)//2]}")
+        print(f"    min = {min(sizes)}")
 
     return dict(cid_to_idxs)
 
 
 # ============================================================
-# Step 3.5: 过滤小簇（Clover 聚类后，< min_reads 的簇丢弃）
+# Step 4: 统计
 # ============================================================
-def step3_5_filter_small_clusters(cid_to_idxs, min_reads):
-    banner(f"Step 3.5  过滤小簇 (reads < {min_reads})")
-
-    before_clusters = len(cid_to_idxs)
-    before_reads = sum(len(v) for v in cid_to_idxs.values())
-
-    filtered = {cid: idxs for cid, idxs in cid_to_idxs.items()
-                if len(idxs) >= min_reads}
-
-    after_clusters = len(filtered)
-    after_reads = sum(len(v) for v in filtered.values())
-    dropped_clusters = before_clusters - after_clusters
-    dropped_reads = before_reads - after_reads
-
-    print(f"  过滤前:  {before_clusters:,} 簇,  {before_reads:,} reads")
-    print(f"  过滤后:  {after_clusters:,} 簇,  {after_reads:,} reads")
-    print(f"  丢弃:    {dropped_clusters:,} 个小簇 ({dropped_reads:,} 条 reads)")
-
-    return filtered
-
-
-# ============================================================
-# Step 4: 统计（过滤后）
-# ============================================================
-def step4_statistics(cid_to_idxs, idx_map, min_reads, stats_path):
-    banner("Step 4  聚类统计（过滤后）")
+def step4_statistics(cid_to_idxs, idx_map, stats_path):
+    """计算 Purity / Coverage / 簇大小分布。"""
+    banner("Step 4  聚类统计")
 
     total_reads = sum(len(v) for v in cid_to_idxs.values())
     n_clusters = len(cid_to_idxs)
     sizes = sorted([len(v) for v in cid_to_idxs.values()], reverse=True)
 
+    # Purity
     total_pure = 0
     gt_tags_covered = set()
 
@@ -295,41 +306,46 @@ def step4_statistics(cid_to_idxs, idx_map, min_reads, stats_path):
     coverage = len(gt_tags_covered) / N_GT_TAGS
 
     buckets = [
-        (f'{min_reads} - 10', sum(1 for s in sizes if min_reads <= s <= 10)),
-        ('11 - 30',           sum(1 for s in sizes if 11 <= s <= 30)),
-        ('31 - 100',          sum(1 for s in sizes if 31 <= s <= 100)),
-        ('> 100',             sum(1 for s in sizes if s > 100)),
+        ('size = 1',   sum(1 for s in sizes if s == 1)),
+        ('2 - 5',      sum(1 for s in sizes if 2 <= s <= 5)),
+        ('6 - 10',     sum(1 for s in sizes if 6 <= s <= 10)),
+        ('11 - 30',    sum(1 for s in sizes if 11 <= s <= 30)),
+        ('31 - 100',   sum(1 for s in sizes if 31 <= s <= 100)),
+        ('> 100',      sum(1 for s in sizes if s > 100)),
     ]
 
     print(f"  聚类簇数:              {n_clusters:,}")
     print(f"  GT tag 数 (design):    {N_GT_TAGS:,}")
     print(f"  已聚类 reads:          {total_reads:,}")
-    print(f"  min reads/簇:          {min_reads}")
     print()
     print(f"  Purity:                {purity*100:.2f}%")
     print(f"  Coverage:              {coverage*100:.2f}%  ({len(gt_tags_covered)}/{N_GT_TAGS})")
     print()
     print(f"  簇大小分布:")
-    for label, count in buckets:
-        print(f"    {label:15s}  {count:>7,}")
     print()
-    print(f"  max={sizes[0]}, median={sizes[len(sizes)//2]}, min={sizes[-1]}")
+    for label, count in buckets:
+        bar = '█' * min(count // max(n_clusters // 50, 1), 40)
+        print(f"    {label:15s}  {count:>7,}  {bar}")
+    print()
+    print(f"  max = {sizes[0]},  median = {sizes[len(sizes)//2]},  min = {sizes[-1]}")
 
+    # 保存
     with open(stats_path, 'w') as f:
-        f.write("Seq_1D Clover 聚类统计（小簇已过滤）\n")
+        f.write("Seq_1D Clover 聚类统计\n")
         f.write("=" * 40 + "\n\n")
-        f.write(f"聚类簇数:           {n_clusters:,}\n")
-        f.write(f"GT tag 数:          {N_GT_TAGS:,}\n")
-        f.write(f"reads:              {total_reads:,}\n")
-        f.write(f"min reads/簇:       {min_reads}\n\n")
-        f.write(f"Purity:             {purity*100:.2f}%\n")
-        f.write(f"Coverage:           {coverage*100:.2f}%\n\n")
+        f.write(f"聚类簇数:    {n_clusters:,}\n")
+        f.write(f"GT tag 数:   {N_GT_TAGS:,}\n")
+        f.write(f"reads:       {total_reads:,}\n\n")
+        f.write(f"Purity:      {purity*100:.2f}%\n")
+        f.write(f"Coverage:    {coverage*100:.2f}%\n\n")
         f.write("簇大小分布:\n")
         for label, count in buckets:
             f.write(f"  {label:15s}  {count:,}\n")
         f.write(f"\nmax={sizes[0]}, median={sizes[len(sizes)//2]}, min={sizes[-1]}\n")
 
-    print(f"\n  💾 保存: {stats_path}")
+    print()
+    print(f"  💾 保存: {stats_path}")
+
     return purity, coverage
 
 
@@ -337,12 +353,14 @@ def step4_statistics(cid_to_idxs, idx_map, min_reads, stats_path):
 # Step 5+6: Majority Vote + 写 read.txt / ref.txt
 # ============================================================
 def majority_vote(reads, ref_len):
+    """逐位多数投票生成 pseudo-ref。"""
     vote = [Counter() for _ in range(ref_len)]
     for read in reads:
         for pos in range(min(len(read), ref_len)):
             b = read[pos].upper()
             if b in 'ACGT':
                 vote[pos][b] += 1
+
     result = []
     last = 'A'
     for pos in range(ref_len):
@@ -353,6 +371,10 @@ def majority_vote(reads, ref_len):
 
 
 def step56_write_output(cid_to_idxs, idx_map, read_path, ref_path):
+    """
+    写 read.txt (簇间 ===== 分隔) + ref.txt (每行一条 pseudo-ref)。
+    所有 Clover 输出的簇都保留，不做 min_reads 过滤。
+    """
     banner("Step 5+6  Majority Vote → read.txt + ref.txt")
 
     SEPARATOR = "=====分隔符=====\n"
@@ -383,8 +405,10 @@ def step56_write_output(cid_to_idxs, idx_map, read_path, ref_path):
                 print(f"    已写 {n_clusters:,} 个簇 ...", end='\r')
 
     print(f"  ✅ 写入完成")
+    print()
     print(f"  簇数:      {n_clusters:,}")
     print(f"  reads:     {n_reads:,}")
+    print()
     print(f"  read.txt:  {read_path}")
     print(f"  ref.txt:   {ref_path}")
 
@@ -397,14 +421,13 @@ def main():
     parser = argparse.ArgumentParser(description='Seq_1D Pipeline')
     parser.add_argument('--skip_clover', action='store_true',
                         help='跳过 Clover，复用已有结果')
-    parser.add_argument('--min_reads', type=int, default=MIN_READS_PER_CLUSTER,
-                        help=f'Clover 聚类后簇最少 reads 数（默认 {MIN_READS_PER_CLUSTER}）')
     args = parser.parse_args()
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     feddna_dir = os.path.join(OUTPUT_DIR, '04_FedDNA_In')
     os.makedirs(feddna_dir, exist_ok=True)
 
+    # 路径
     input_file       = os.path.join(BASE_DIR, 'output.txt')
     clover_input     = os.path.join(OUTPUT_DIR, '01_clover_input.txt')
     clover_tag_input = os.path.join(OUTPUT_DIR, '01_clover_tag_input.txt')
@@ -419,23 +442,26 @@ def main():
     print("  🚀  Sequencing_data_first_dimension Pipeline")
     print("=" * 60)
     print()
-    print(f"  数据目录:      {BASE_DIR}")
-    print(f"  输出目录:      {OUTPUT_DIR}")
-    print(f"  ref_len:       {REF_LEN}bp,  范围 [{LEN_MIN}, {LEN_MAX}]")
-    print(f"  min_reads/簇:  {args.min_reads}")
-    print(f"  Clover:        D={CLOVER_TREE_DEPTH} V={CLOVER_V_DRIFT} H={CLOVER_H_DRIFT}")
-    print(f"                 h_index={CLOVER_H_INDEX} e_index={CLOVER_E_INDEX}")
+    print(f"  数据目录:   {BASE_DIR}")
+    print(f"  输出目录:   {OUTPUT_DIR}")
+    print()
+    print(f"  ref_len = {REF_LEN}bp")
+    print(f"  长度范围: [{LEN_MIN}, {LEN_MAX}]")
+    print()
+    print(f"  Clover 参数:")
+    print(f"    D={CLOVER_TREE_DEPTH}  V={CLOVER_V_DRIFT}  H={CLOVER_H_DRIFT}")
+    print(f"    h_index={CLOVER_H_INDEX}  e_index={CLOVER_E_INDEX}")
 
     t_start = time.time()
 
-    # Step 0: 预处理
+    # Step 0
     cleaned = step0_preprocess(input_file)
 
-    # Step 1: 写 Clover 输入
+    # Step 1
     idx_map = step1_write_clover_input(cleaned, clover_input, clover_tag_input)
     del cleaned
 
-    # Step 2: 运行 Clover
+    # Step 2
     if not args.skip_clover:
         clover_out_txt = step2_run_clover(clover_input, clover_out_base)
     else:
@@ -444,18 +470,16 @@ def main():
         if not os.path.exists(clover_out_txt):
             raise FileNotFoundError(f"Clover 输出不存在: {clover_out_txt}")
 
-    # Step 3: 解析 Clover 输出
+    # Step 3
     cid_to_idxs = step3_parse_clover(clover_out_txt)
 
-    # Step 3.5: 过滤小簇（< min_reads 的簇丢弃）
-    cid_to_idxs = step3_5_filter_small_clusters(cid_to_idxs, min_reads=args.min_reads)
+    # Step 4
+    purity, coverage = step4_statistics(cid_to_idxs, idx_map, stats_path)
 
-    # Step 4: 统计
-    purity, coverage = step4_statistics(cid_to_idxs, idx_map, args.min_reads, stats_path)
-
-    # Step 5+6: Majority Vote + 写输出
+    # Step 5+6
     step56_write_output(cid_to_idxs, idx_map, read_path, ref_path)
 
+    # 总结
     elapsed = time.time() - t_start
 
     print()
@@ -464,6 +488,7 @@ def main():
     print("=" * 60)
     print()
     print(f"  总耗时:     {elapsed:.1f}s  ({elapsed/60:.1f} min)")
+    print()
     print(f"  Purity:     {purity*100:.2f}%")
     print(f"  Coverage:   {coverage*100:.2f}%")
     print()

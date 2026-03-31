@@ -301,7 +301,7 @@ class Step1EvidentialModel(nn.Module):
             # proj_emb 已 L2 归一化，matmul 直接得余弦相似度矩阵
             cos_sim_batch   = torch.matmul(proj_emb, proj_emb.T)         # (B, B)
             diff_label_mask = ~pos_mask_inbatch & ~self_mask             # batch 内异簇且非自身
-            high_sim_mask   = (cos_sim_batch > 0.80) & diff_label_mask  # 高相似度的异簇对
+            high_sim_mask   = (cos_sim_batch > 0.98) & diff_label_mask  # 高相似度的异簇对
 
         # [问题2修复] 原来只屏蔽 batch 内列（:B），Queue 列（B:）完全不受影响。
         # 但 Queue 有 8192 条历史 reads，Clover 5.75× 过分割意味着同一分子的碎片
@@ -318,7 +318,7 @@ class Step1EvidentialModel(nn.Module):
                 q_labels_local = self.queue_labels[:q_count].detach().clone()   # (Q,)
                 diff_label_q   = (cluster_labels.unsqueeze(1) !=
                                   q_labels_local.unsqueeze(0))                   # (B, Q)
-                high_sim_q     = (cos_sim_queue > 0.80) & diff_label_q
+                high_sim_q     = (cos_sim_queue > 0.98) & diff_label_q
             neg_mask_full[:, B:] &= ~high_sim_q
             n_soft_masked_q = int(high_sim_q.sum().item())
         else:

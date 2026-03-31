@@ -91,6 +91,11 @@ def main_loop():
                              '与 FedDNA 训练设计一致（FedDNA 用 5-30），'
                              '建议 30（与feddna保持一致）。'
                              '仅影响 Step1 训练，不影响 Step2 推理（全量）。')
+    parser.add_argument('--target_clusters', type=int, default=None,
+                        help='最终目标簇数（先验约束）。系统会自动做课程合并：'
+                             'Round 1 目标 = (初始簇数+target)/2，'
+                             'Round 2 目标 = (Round1结果+target)/2，'
+                             '最后一轮直达 target。不设则无限制。')
     args = parser.parse_args()
 
     os.makedirs(os.path.join(args.experiment_dir, 'results'), exist_ok=True)
@@ -191,6 +196,8 @@ def main_loop():
     for iteration in range(start_iteration, args.max_iterations + 1):
         print(f"\n{'=' * 80}")
         print(f"🔄 Round {iteration} / {args.max_iterations}")
+        if args.target_clusters:
+            print(f"   🎯 最终目标簇数: {args.target_clusters} (动态课程合并，每轮合半)")
         print(f"{'=' * 80}\n")
 
         prev_labels_path = current_labels_path
@@ -228,7 +235,7 @@ def main_loop():
                 cv_threshold=getattr(args, 'cv_threshold', 0.3),
                 consensus_path=current_consensus_path,
                 cluster_change_info=current_cluster_change_info,
-                max_reads_per_cluster=getattr(args, 'max_reads_per_cluster', 50),
+                max_reads_per_cluster=getattr(args, 'max_reads_per_cluster', 30),
             )
             step1_checkpoint = train_step1(step1_args)
             if step1_checkpoint is None:
@@ -253,9 +260,9 @@ def main_loop():
             gt_refs_file=args.gt_refs_file,
             training_cap=args.training_cap,
             consensus_path=current_consensus_path,
-            cv_threshold=getattr(args, 'cv_threshold', 0.3),  # [残留问题2修复]
-            # 原来 step2_args 没有 cv_threshold，step2_runner 用 getattr 取到默认 0.3，
-            # 用户传 --cv_threshold 0.5 时 Step2 日志仍打印 0.3 下的统计，和 Step1 不一致。
+            cv_threshold=getattr(args, 'cv_threshold', 0.3),
+            target_clusters=args.target_clusters,       # 最终目标，step2_runner 内部动态计算本轮目标
+            max_iterations=args.max_iterations,          # step2_runner 需要知道是否为最后一轮
         )
         results = run_step2(step2_args)
 

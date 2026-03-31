@@ -330,14 +330,46 @@ def run_step2(args):
             print(f"   ⚠️ 加载上一轮 consensus 失败: {e}，跳过序列校验")
             prev_consensus_dict = None
 
+    # [Round1-序列防线] Round 1 没有上一轮 consensus，但有 ref.txt（Clover majority vote）
+    # 强制用 ref.txt 构建 consensus_dict，堵住"盲婚哑嫁"漏洞。
+    if prev_consensus_dict is None and round_idx == 1:
+        from models.step1_data import seq_to_onehot
+        print(f"   🛡️ Round 1 序列校验防线: 使用 ref.txt (Clover majority vote)")
+        prev_consensus_dict = {}
+        for cid, seq in data_loader.ref_seqs.items():
+            prev_consensus_dict[int(cid)] = seq_to_onehot(seq, model_max_len)  # 强制 int key
+        print(f"      加载 {len(prev_consensus_dict)} 个簇的初始 consensus")
+
+    # [课程合并] Round 1 特征质量低，收紧 cosine 阈值到 0.99；Round 2+ 用 0.98
+    merge_threshold = 0.99 if round_idx == 1 else 0.98
+
+    # [动态课程合并] 在这里才知道真实簇数 len(centroids)，动态计算本轮目标。
+    # 不能在 main_loop 里算——那时不知道实际簇数，会导致断崖式合并。
+    # 策略：每轮最多合并"当前簇数与最终目标之间差距的一半"，最后一轮直达目标。
+    final_target = getattr(args, 'target_clusters', None)
+    max_iterations = getattr(args, 'max_iterations', 3)
+    if final_target is not None and len(centroids) > final_target:
+        gap = len(centroids) - final_target
+        if round_idx >= max_iterations:
+            # 最后一轮：直达目标
+            round_target = final_target
+        else:
+            # 非最后一轮：只合并一半的差距
+            round_target = final_target + gap // 2
+        print(f"   🎯 课程合并: 当前 {len(centroids)} 簇, "
+              f"本轮目标 ≥{round_target} (最终目标 {final_target})")
+    else:
+        round_target = final_target  # None 或已达标
+
     centroids, labels_tensor, merge_stats, cluster_sizes = merge_close_centroids(
         centroids, labels_tensor, cluster_sizes,
         embeddings_f32, zone_ids, strength,
-        threshold=0.98,
+        threshold=merge_threshold,
         max_cluster_size=2000,
         max_rounds=60,
         consensus_dict=prev_consensus_dict,
-        seq_jaccard_threshold=0.05,   # [问题1修复] 原来硬编码0.5覆盖了函数签名的修复
+        seq_jaccard_threshold=0.15,
+        target_clusters=round_target,
     )
     # [残留问题1修复] cluster_sizes 现在是合并后的新值（来自 merge_close_centroids 返回值），
     # 不再是合并前的旧值。保存到磁盘的元数据和实际质心一致。
@@ -365,7 +397,7 @@ def run_step2(args):
 
     if len(noise_indices) > 0 and len(centroids) > 0:
         print(f"\n   🧟 启动死数据复活判定: 候选 {len(noise_indices)} reads "
-              f"(门限 delta={delta:.4f})")
+              f"(门限 delta={delta:.4f}, P50 中位数)")
         cids           = sorted(centroids.keys())
         centroid_matrix = torch.stack([centroids[c] for c in cids]).cpu()
 

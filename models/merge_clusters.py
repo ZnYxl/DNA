@@ -86,9 +86,10 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
                           chunk_size=2000,
                           consensus_dict=None,
                           seq_jaccard_threshold=0.05,
-                          kmer_k=8):
+                          kmer_k=8,
+                          target_clusters=None):
     """
-    安全版簇合并: MNN + 序列双重校验 + 最大簇大小约束 + 迭代。
+    安全版簇合并: MNN + 序列双重校验 + 最大簇大小约束 + 先验簇数硬停止 + 迭代。
 
     Args:
         centroids:             dict {cluster_id: tensor(D,)}
@@ -103,6 +104,10 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
         chunk_size:            int, 分块大小
         consensus_dict:        dict {cluster_id: tensor(L,4)} 上一轮的 consensus，
                                用于序列双重校验。为 None 时跳过序列校验。
+        target_clusters:       int or None, 目标簇数下限（先验约束）。
+                               MNN 合并按相似度降序执行，一旦簇数降至该值则立即停止。
+                               数学上等价于 HAC dendrogram 在 K 处的贪心最优截断。
+                               None 时不设下限（向后兼容）。
         seq_jaccard_threshold: float, k-mer Jaccard 最低阈值
                                [G老师-Bug1-FIX] 从 0.5 降到 0.05。
                                原设 0.5 假设 consensus 质量好，但 Round2+
@@ -118,8 +123,22 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
     t0 = time.time()
     print(f"\n{'='*60}")
     seq_check_str = f", seq_jaccard≥{seq_jaccard_threshold}" if consensus_dict else ", 无序列校验(Round1)"
-    print(f"🔗 安全簇合并 (MNN, threshold={threshold}, max_size={max_cluster_size}{seq_check_str})")
+    target_str = f", target_K≥{target_clusters}" if target_clusters else ""
+    print(f"🔗 安全簇合并 (MNN, threshold={threshold}, max_size={max_cluster_size}{seq_check_str}{target_str})")
     print(f"{'='*60}")
+
+    # 先验簇数保护：已经不多于目标，不合并
+    if target_clusters is not None and len(centroids) <= target_clusters:
+        print(f"   🛑 当前簇数 {len(centroids)} 已 ≤ 目标 {target_clusters}，跳过合并")
+        early_sizes = {cid: int((labels == cid).sum().item()) for cid in centroids}
+        return centroids, labels, {
+            'clusters_before': len(centroids),
+            'clusters_after':  len(centroids),
+            'n_merges': 0,
+            'time_seconds': 0.0,
+            'threshold': threshold,
+            'max_cluster_size': max_cluster_size,
+        }, early_sizes
 
     if len(centroids) < 2:
         print(f"   ⚠️ 簇数 < 2, 跳过")
@@ -222,6 +241,12 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
         round_merges = 0
 
         for sim_val, cid_a, cid_b in merge_pairs:
+            # 【先验簇数硬停止】贪心最优截断：合并列表按相似度降序排列，
+            # 已执行的都是模型最确信的同源对；一旦簇数触底，后续的都是风险对。
+            if target_clusters is not None and len(centroids) <= target_clusters:
+                print(f"   🛑 先验保护：簇数 {len(centroids)} 已达目标底线 {target_clusters}，停止本轮合并")
+                break
+
             if cid_a in merged_this_round or cid_b in merged_this_round:
                 continue
 
@@ -290,6 +315,11 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
         if round_merges == 0:
             break
 
+        # 先验簇数保护：外层循环也检查，防止下一轮继续合并
+        if target_clusters is not None and len(centroids) <= target_clusters:
+            print(f"   🛑 已达目标簇数底线 {target_clusters}，终止迭代合并")
+            break
+
     t1 = time.time()
 
     final_K = len(centroids)
@@ -305,10 +335,13 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
         'time_seconds': t1 - t0,
         'threshold': threshold,
         'max_cluster_size': max_cluster_size,
+        'target_clusters': target_clusters,
     }
 
     print(f"\n   📊 合并总结:")
     print(f"      簇数: {initial_K} → {final_K} (减少 {initial_K - final_K})")
+    if target_clusters:
+        print(f"      目标底线: {target_clusters} ({'✅ 已触底' if final_K <= target_clusters else f'距目标还差 {final_K - target_clusters}'})")
     print(f"      合并次数: {total_merges}")
     print(f"      耗时: {t1-t0:.1f}s")
 
