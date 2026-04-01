@@ -55,7 +55,9 @@ def ds_fusion_masked(evidence: torch.Tensor, padding_mask: torch.Tensor) -> tupl
     evidence_masked = evidence * mask_f                  # 无效位置 evidence 归零
     count = mask_f.sum(dim=0).clamp(min=1)               # (L, 1) 每位置有效 reads 数
     fused = evidence_masked.sum(dim=0) / count           # (L, 4)
-    has_vote = (mask_f.sum(dim=0).squeeze(-1) > 0)       # (L,) 该位置是否有有效碱基
+    # [Bug1-Fix] 多数投票门限: >= 50% reads 有碱基才保留，防止 1 条 insertion read 拉长序列
+    N = evidence.shape[0]
+    has_vote = (mask_f.sum(dim=0).squeeze(-1) >= max(N * 0.5, 1))  # (L,) bool
     return fused, has_vote
 
 
@@ -182,16 +184,28 @@ def save_consensus_fasta(
     fasta_path: str,
 ):
     """
-    按簇内最大 read 长度截断，去掉尾部 padding（FIX-FASTA）。
+    [Bug1-Fix-B] 用簇内 read 长度众数 (mode) 截断，替代 max(read_len)。
+
+    原 Bug: max(read_len) 让 1 条 insertion read (197bp) 拉长整个簇，
+    尾部全零 → argmax=0 → 多出一个 'A' → ED=1。
+    修复: 长度众数 = "最可能的 reference 长度"，不受 insertion 离群值影响。
     """
-    cluster_actual_len: Dict[int, int] = {}
+    from collections import Counter as _Counter
+
+    # 计算每个簇的 read 长度众数
+    cluster_len_votes: Dict[int, list] = {}
     for didx, label in enumerate(new_labels_np):
         if label >= 0:
             real_idx = flat_real_indices[didx]
             rl = min(len(data_loader.reads[real_idx]), model_max_len)
             cid = int(label)
-            if cid not in cluster_actual_len or rl > cluster_actual_len[cid]:
-                cluster_actual_len[cid] = rl
+            if cid not in cluster_len_votes:
+                cluster_len_votes[cid] = []
+            cluster_len_votes[cid].append(rl)
+
+    cluster_actual_len: Dict[int, int] = {}
+    for cid, lens in cluster_len_votes.items():
+        cluster_actual_len[cid] = _Counter(lens).most_common(1)[0][0]  # mode
 
     os.makedirs(os.path.dirname(fasta_path), exist_ok=True)
     with open(fasta_path, 'w') as ff:

@@ -29,15 +29,15 @@ from collections import Counter, defaultdict
 # ═══════════════════════════════════════════════════════════════
 # 路径配置（按你实际服务器路径修改）
 # ═══════════════════════════════════════════════════════════════
-EXP_DIR      = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/exp_1_NoPrimer"
-GT_TAGS_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/给师妹的clover数据集/exp_1_NoPrimer/exp1_tags_reads.txt"
-GT_REFS_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/给师妹的clover数据集/exp_1_NoPrimer/exp1_refs.fasta"
+EXP_DIR      = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/seq_1d"
+GT_TAGS_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/seq_1d/seq1d_tags_reads.txt"
+GT_REFS_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/seq_1d/seq1d_refs.txt"
 
 # 指定要评估的 refined_labels 文件（按时间戳顺序）
 REFINED_LABELS = [
-    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_002951.txt"),  # Round 1
-    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_031353.txt"),  # Round 2
-    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_050542.txt"),  # Round 3
+    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_002529.txt"),  # Round 1
+    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_014640.txt"),  # Round 2
+    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_030425.txt"),  # Round 3
 ]
 ROUND_NAMES = ["SSI-EC R1", "SSI-EC R2","SSI-EC R3"]
 

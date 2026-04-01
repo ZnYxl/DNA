@@ -63,12 +63,25 @@ def _onehot_to_seq(one_hot: torch.Tensor) -> str:
     return ''.join(_BASE_MAP[i] for i in indices)
 
 
-def _kmer_jaccard(seq_a: str, seq_b: str, k: int = 8) -> float:
+def _kmer_jaccard(seq_a: str, seq_b: str, k: int = 8,
+                  primer_prefix: int = 0, primer_suffix: int = 0) -> float:
     """
-    k-mer Jaccard 相似度。
-    相比编辑距离，对 IDS 错误更鲁棒，且计算复杂度 O(L) 而非 O(L²)。
-    返回 [0, 1]，越高越相似。
+    k-mer Jaccard 相似度，支持引物区域截断。
+
+    [Bug2-Fix] 共享引物 (~20bp 前后缀) 给 Jaccard 白送 ~26 个共享 k-mer，
+    基底 Jaccard ≈ 0.072，加上随机碰撞轻松突破 0.15 门限。
+    截掉引物后只对 payload 计算，异源簇无法伪装过关。
+
+    Args:
+        primer_prefix: 前端引物长度 (截掉前 N bp)，0 = 不截
+        primer_suffix: 后端引物长度 (截掉后 N bp)，0 = 不截
     """
+    if primer_prefix > 0 or primer_suffix > 0:
+        end_a = len(seq_a) - primer_suffix if primer_suffix > 0 else len(seq_a)
+        end_b = len(seq_b) - primer_suffix if primer_suffix > 0 else len(seq_b)
+        seq_a = seq_a[primer_prefix:end_a]
+        seq_b = seq_b[primer_prefix:end_b]
+
     if len(seq_a) < k or len(seq_b) < k:
         return 0.0
     set_a = set(seq_a[i:i+k] for i in range(len(seq_a) - k + 1))
@@ -87,7 +100,9 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
                           consensus_dict=None,
                           seq_jaccard_threshold=0.05,
                           kmer_k=8,
-                          target_clusters=None):
+                          target_clusters=None,
+                          primer_prefix=0,
+                          primer_suffix=0):
     """
     安全版簇合并: MNN + 序列双重校验 + 最大簇大小约束 + 先验簇数硬停止 + 迭代。
 
@@ -219,7 +234,9 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
                             if ca is not None and cb is not None:
                                 seq_a = _onehot_to_seq(ca)
                                 seq_b = _onehot_to_seq(cb)
-                                jaccard = _kmer_jaccard(seq_a, seq_b, k=kmer_k)
+                                jaccard = _kmer_jaccard(seq_a, seq_b, k=kmer_k,
+                                                        primer_prefix=primer_prefix,
+                                                        primer_suffix=primer_suffix)
                                 if jaccard < seq_jaccard_threshold:
                                     seq_rejected += 1
                                     continue  # 序列不相似，拒绝合并

@@ -96,6 +96,10 @@ def main_loop():
                              'Round 1 目标 = (初始簇数+target)/2，'
                              'Round 2 目标 = (Round1结果+target)/2，'
                              '最后一轮直达 target。不设则无限制。')
+    parser.add_argument('--primer_prefix', type=int, default=0,
+                        help='前端引物长度 (bp)，Jaccard 校验时截掉。Seq_1D 设 20')
+    parser.add_argument('--primer_suffix', type=int, default=0,
+                        help='后端引物长度 (bp)，Jaccard 校验时截掉。Seq_1D 设 20')
     args = parser.parse_args()
 
     os.makedirs(os.path.join(args.experiment_dir, 'results'), exist_ok=True)
@@ -263,6 +267,8 @@ def main_loop():
             cv_threshold=getattr(args, 'cv_threshold', 0.3),
             target_clusters=args.target_clusters,       # 最终目标，step2_runner 内部动态计算本轮目标
             max_iterations=args.max_iterations,          # step2_runner 需要知道是否为最后一轮
+            primer_prefix=getattr(args, 'primer_prefix', 0),
+            primer_suffix=getattr(args, 'primer_suffix', 0),
         )
         results = run_step2(step2_args)
 

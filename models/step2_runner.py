@@ -370,6 +370,8 @@ def run_step2(args):
         consensus_dict=prev_consensus_dict,
         seq_jaccard_threshold=0.15,
         target_clusters=round_target,
+        primer_prefix=getattr(args, 'primer_prefix', 0),
+        primer_suffix=getattr(args, 'primer_suffix', 0),
     )
     # [残留问题1修复] cluster_sizes 现在是合并后的新值（来自 merge_close_centroids 返回值），
     # 不再是合并前的旧值。保存到磁盘的元数据和实际质心一致。
