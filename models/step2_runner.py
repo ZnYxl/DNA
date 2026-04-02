@@ -35,6 +35,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Dict, Optional
 from models.merge_clusters import merge_close_centroids
+from models.gt_audit_probe import MergeAuditProbe
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir  = os.path.dirname(current_dir)
@@ -317,6 +318,20 @@ def run_step2(args):
     # 修复：在合并前用原始质心算 delta，保证它是干净的 Zone I 安全半径。
     delta = compute_global_delta(embeddings_f32, labels_tensor, zone_ids, centroids)
 
+    # ★ GT 合并诊断探针（不影响任何计算，只做观测）
+    _probe = None
+    if gt_tags_file and hasattr(data_loader, 'gt_labels') and data_loader.gt_labels is not None:
+        _gt_for_probe = np.array([
+            int(data_loader.gt_labels[flat_real_indices[i]])
+            if flat_real_indices[i] < len(data_loader.gt_labels) else -1
+            for i in range(N)
+        ])
+        _probe = MergeAuditProbe(
+            _gt_for_probe,
+            save_dir=os.path.join(args.output_dir, 'audit')
+        )
+        _probe.snapshot("before_merge", labels_tensor)
+
     # ★ 安全簇合并 (MNN + 序列双重校验 + 最大簇大小约束)
     # 序列校验用上一轮的 consensus_dict（当轮的在 Section 6 才生成）
     prev_consensus_dict = None
@@ -376,6 +391,8 @@ def run_step2(args):
     # [残留问题1修复] cluster_sizes 现在是合并后的新值（来自 merge_close_centroids 返回值），
     # 不再是合并前的旧值。保存到磁盘的元数据和实际质心一致。
 
+    if _probe: _probe.snapshot("after_merge", labels_tensor)
+
     # [FIX-ZONE2] 不再做 Zone II 重分配：Zone I 可能无法覆盖全部 GT，
     #             强制重分配会丢失 Zone II 中的有效 reads。
     new_labels = labels_tensor.clone()  # 合并后的标签直接作为最终标签
@@ -390,6 +407,8 @@ def run_step2(args):
     z3_count = int((zone_ids == 3).sum().item())
     new_labels[zone_ids == 3] = -1
     print(f"   🔒 Zone III 标签隔离: {z3_count} reads → -1")
+
+    if _probe: _probe.snapshot("after_zone3", new_labels)
 
     # =====================================================================
     # [FIX-DEAD-REVIVAL] 死数据复活核心逻辑（补全 EM 闭环）
@@ -427,6 +446,10 @@ def run_step2(args):
         print(f"   ✨ 成功复活: {revived_count} / {len(noise_indices)} reads")
     else:
         print(f"\n   🧟 死数据复活: 无候选数据或无有效质心，跳过")
+
+    if _probe:
+        _probe.snapshot("after_revival", new_labels)
+        _probe.report(round_idx)
     # =====================================================================
     noise_mask = (new_labels < 0)
     refine_stats = {'zone2_reassigned': 0, 'zone2_noise': 0}
