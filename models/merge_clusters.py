@@ -91,6 +91,36 @@ def _kmer_jaccard(seq_a: str, seq_b: str, k: int = 8,
     return inter / union if union > 0 else 0.0
 
 
+def _edit_distance(seq_a: str, seq_b: str) -> int:
+    """
+    两条 consensus 之间的编辑距离 (ED)。
+    
+    [新增] 用于拦截 GT ID 差 377 的近似重复分子对。
+    这些分子对的 k-mer Jaccard 能通过 0.15 门限，但 ED 通常在 5-15，
+    而真正同源碎片的 consensus ED 应 ≤ 3。
+    
+    用 edlib（O(NM) 但 SIMD 加速，~196bp 约 2μs/对），
+    回退到简单 DP 实现。
+    """
+    if not seq_a or not seq_b:
+        return max(len(seq_a), len(seq_b))
+    try:
+        import edlib
+        result = edlib.align(seq_a, seq_b, mode="NW", task="distance")
+        return result['editDistance']
+    except ImportError:
+        # 简单 DP fallback（~196bp 仍然很快）
+        m, n = len(seq_a), len(seq_b)
+        prev = list(range(n + 1))
+        for i in range(1, m + 1):
+            curr = [i] + [0] * n
+            for j in range(1, n + 1):
+                cost = 0 if seq_a[i-1] == seq_b[j-1] else 1
+                curr[j] = min(curr[j-1] + 1, prev[j] + 1, prev[j-1] + cost)
+            prev = curr
+        return prev[n]
+
+
 def merge_close_centroids(centroids, labels, cluster_sizes,
                           embeddings, zone_ids, strength,
                           threshold=0.98,
@@ -102,7 +132,8 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
                           kmer_k=8,
                           target_clusters=None,
                           primer_prefix=0,
-                          primer_suffix=0):
+                          primer_suffix=0,
+                          max_consensus_ed=5):
     """
     安全版簇合并: MNN + 序列双重校验 + 最大簇大小约束 + 先验簇数硬停止 + 迭代。
 
@@ -137,7 +168,7 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
     """
     t0 = time.time()
     print(f"\n{'='*60}")
-    seq_check_str = f", seq_jaccard≥{seq_jaccard_threshold}" if consensus_dict else ", 无序列校验(Round1)"
+    seq_check_str = f", seq_jaccard≥{seq_jaccard_threshold}, ED≤{max_consensus_ed}" if consensus_dict else ", 无序列校验(Round1)"
     target_str = f", target_K≥{target_clusters}" if target_clusters else ""
     print(f"🔗 安全簇合并 (MNN, threshold={threshold}, max_size={max_cluster_size}{seq_check_str}{target_str})")
     print(f"{'='*60}")
@@ -145,7 +176,9 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
     # 先验簇数保护：已经不多于目标，不合并
     if target_clusters is not None and len(centroids) <= target_clusters:
         print(f"   🛑 当前簇数 {len(centroids)} 已 ≤ 目标 {target_clusters}，跳过合并")
-        early_sizes = {cid: int((labels == cid).sum().item()) for cid in centroids}
+        from collections import Counter as _C
+        _lc = _C(labels.tolist())
+        early_sizes = {cid: _lc.get(cid, 0) for cid in centroids}
         return centroids, labels, {
             'clusters_before': len(centroids),
             'clusters_after':  len(centroids),
@@ -157,9 +190,9 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
 
     if len(centroids) < 2:
         print(f"   ⚠️ 簇数 < 2, 跳过")
-        # [问题1修复] 早返回路径补上 new_cluster_sizes，与正常路径返回值数量一致（4个）。
-        # 原来只返回3个值，调用方解包4个值时直接 crash。
-        early_sizes = {cid: int((labels == cid).sum().item()) for cid in centroids}
+        from collections import Counter as _C
+        _lc = _C(labels.tolist())
+        early_sizes = {cid: _lc.get(cid, 0) for cid in centroids}
         return centroids, labels, {
             'clusters_before': len(centroids),
             'clusters_after':  len(centroids),
@@ -213,6 +246,7 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
         # ── 3. 找 Mutual Nearest Neighbor 对 + 序列双重校验 ──
         merge_pairs = []
         seq_rejected = 0
+        ed_rejected = 0
         for i in range(K):
             j = nn_idx[i].item()
             if j < 0:
@@ -240,10 +274,20 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
                                 if jaccard < seq_jaccard_threshold:
                                     seq_rejected += 1
                                     continue  # 序列不相似，拒绝合并
+                                # [新增] ED 校验：拦截 GT ID 差 377 的近似重复分子对
+                                # 这些对通过 Jaccard ≥ 0.15，但 ED 通常在 5-15
+                                # 真正同源碎片 ED ≤ 3
+                                if max_consensus_ed is not None and max_consensus_ed > 0:
+                                    ed = _edit_distance(seq_a, seq_b)
+                                    if ed > max_consensus_ed:
+                                        ed_rejected += 1
+                                        continue  # ED 过大，疑似近似重复分子
                         merge_pairs.append((nn_sim[i].item(), cid_a, cid_b))
 
         if seq_rejected > 0:
             print(f"   🔒 序列校验拒绝: {seq_rejected} 对 (Jaccard<{seq_jaccard_threshold})")
+        if ed_rejected > 0:
+            print(f"   🔒 ED 校验拒绝: {ed_rejected} 对 (ED>{max_consensus_ed})")
 
         if len(merge_pairs) == 0:
             print(f"   Round {round_idx+1}: 无可合并的 MNN 对, 终止")
@@ -294,30 +338,36 @@ def merge_close_centroids(centroids, labels, cluster_sizes,
         total_merges += round_merges
 
         # ── 5. 重算合并后的质心 ──
-        # [G老师-Bug2-FIX] 只重算本轮吸收了新成员的 keep 簇，不遍历全部 K 个簇。
-        # 原来 for cid in centroids.keys() 在 K=40000, N=400万 时会产生
-        # 40000 × 400万 = 1600亿次布尔比较，是严重的算力黑洞。
-        # 只有 keep 簇的成员发生了变化，其他簇质心完全没变，不需要重算。
+        # [G老师-Bug3-FIX-v2] 用倒排索引替换 O(N) 布尔掩码。
+        # 原来 `mask = (labels == cid)` 对每个 keep 簇扫描全量 N=273万 的 labels，
+        # 几百个 keep 簇 × N = 数十亿次比较。
+        # 修复：O(N) 建索引一次，O(k_i) 取值，数学等价。
+        _inv_idx = defaultdict(list)
+        _labels_list = labels.tolist()
+        for _i, _l in enumerate(_labels_list):
+            if _l >= 0:
+                _inv_idx[_l].append(_i)
+
         for cid in keep_cids_this_round:
             if cid not in centroids:
                 continue
-            mask = (labels == cid)
-            zone_mask = (zone_ids == 1) | (zone_ids == 2)
-            valid_mask = mask & zone_mask
-            count = valid_mask.sum().item()
+            indices = _inv_idx.get(cid, [])
+            if not indices:
+                continue
+            idx_t = torch.tensor(indices, dtype=torch.long)
+            zone_valid = (zone_ids[idx_t] == 1) | (zone_ids[idx_t] == 2)
+            valid_idx = idx_t[zone_valid]
+            count = len(valid_idx)
             if count == 0:
                 continue
-            emb = embeddings[valid_mask]
-            w = strength[valid_mask].clone()
+            emb = embeddings[valid_idx]
+            w = strength[valid_idx].clone()
 
-            # [G老师-Bug3-FIX] 补上遗失的 Zone II 安全阀，与 step2_refine.py 保持一致。
-            # 原来直接用全部 strength，碎片簇合并后 Zone II 的异常高 strength
-            # 会直接主导新质心方向，引发质心漂移。
-            # 安全阀：Zone I reads < 3 条时，Zone II 的 strength 截断到 0.30。
-            z1_count = int((mask & (zone_ids == 1)).sum().item())
+            # [G老师-Bug3-FIX] Zone II 安全阀（与 step2_refine.py 一致）
+            z1_count = int((zone_ids[idx_t] == 1).sum().item())
             if z1_count < 3:
-                is_z2 = zone_ids[valid_mask] == 2
-                w[is_z2] = w[is_z2].clamp(max=0.30)   # ZONE2_WEIGHT_CAP
+                is_z2 = zone_ids[valid_idx] == 2
+                w[is_z2] = w[is_z2].clamp(max=0.30)
 
             w_sum = w.sum()
             if w_sum < 1e-10:

@@ -100,6 +100,9 @@ def main_loop():
                         help='前端引物长度 (bp)，Jaccard 校验时截掉。Seq_1D 设 20')
     parser.add_argument('--primer_suffix', type=int, default=0,
                         help='后端引物长度 (bp)，Jaccard 校验时截掉。Seq_1D 设 20')
+    parser.add_argument('--freeze_consensus', action='store_true', default=False,
+                        help='[实验2] 所有轮次的 Step1 训练目标始终用 ref.txt，'
+                             '不用上一轮 Step2 产出的 consensus。用于诊断 B 层毒化。')
     args = parser.parse_args()
 
     os.makedirs(os.path.join(args.experiment_dir, 'results'), exist_ok=True)
@@ -163,7 +166,7 @@ def main_loop():
             current_centroids_path  = centroid_files[-1] if centroid_files else None
 
             # [FIX-P0] 加载 consensus_path 和 cluster_change_info
-            if consensus_files:
+            if consensus_files and not getattr(args, 'freeze_consensus', False):
                 current_consensus_path = consensus_files[-1]
             if change_files:
                 try:
@@ -196,6 +199,8 @@ def main_loop():
     print(f"🔋 预训练:   {os.path.basename(args.feddna_checkpoint)}")
     if args.gt_tags_file:
         print(f"📋 GT 评估:  {os.path.basename(args.gt_tags_file)}")
+    if args.freeze_consensus:
+        print(f"🧊 [实验2] freeze_consensus=True: 所有轮次 Step1 训练目标固定为 ref.txt")
 
     for iteration in range(start_iteration, args.max_iterations + 1):
         print(f"\n{'=' * 80}")
@@ -281,7 +286,11 @@ def main_loop():
             current_checkpoint_path = step1_checkpoint
 
             # [FIX-P0] 更新 consensus_path 和 cluster_change_info
-            current_consensus_path = nrf.get('consensus')
+            if not getattr(args, 'freeze_consensus', False):
+                current_consensus_path = nrf.get('consensus')
+            else:
+                # [实验2] freeze_consensus: Step1 始终用 ref.txt，不更新 consensus_path
+                pass
             change_info_path = nrf.get('cluster_change_info')
             if change_info_path and os.path.exists(change_info_path):
                 try:

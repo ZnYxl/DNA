@@ -118,7 +118,7 @@ class Step1EvidentialModel(nn.Module):
         self.cl_mode    = cl_mode    # 消融实验模式: 'standard'|'ale_only'|'epi_only'|'ours'
 
         # Memory Queue
-        emb_dim = 128
+        emb_dim = dim
         self.queue_size = queue_size
 
         self.register_buffer('queue_z',     torch.randn(queue_size, emb_dim))
@@ -230,7 +230,7 @@ class Step1EvidentialModel(nn.Module):
                   / (exp(s_{i,pos}/τ) + Σ_{k∈N_i} w_{ik}·exp(s_{ik}/τ))
               ]
         """
-        proj_emb = F.normalize(self.projection_head(pooled_emb), dim=-1)
+        proj_emb = F.normalize(pooled_emb, dim=-1)
         B = proj_emb.shape[0]
 
         # ── In-batch 相似度 + mask ─────────────────────────────────────────
@@ -301,7 +301,7 @@ class Step1EvidentialModel(nn.Module):
             # proj_emb 已 L2 归一化，matmul 直接得余弦相似度矩阵
             cos_sim_batch   = torch.matmul(proj_emb, proj_emb.T)         # (B, B)
             diff_label_mask = ~pos_mask_inbatch & ~self_mask             # batch 内异簇且非自身
-            high_sim_mask   = (cos_sim_batch > 0.98) & diff_label_mask  # 高相似度的异簇对
+            high_sim_mask   = (cos_sim_batch > 0.80) & diff_label_mask  # 高相似度的异簇对
 
         # [问题2修复] 原来只屏蔽 batch 内列（:B），Queue 列（B:）完全不受影响。
         # 但 Queue 有 8192 条历史 reads，Clover 5.75× 过分割意味着同一分子的碎片
@@ -318,7 +318,7 @@ class Step1EvidentialModel(nn.Module):
                 q_labels_local = self.queue_labels[:q_count].detach().clone()   # (Q,)
                 diff_label_q   = (cluster_labels.unsqueeze(1) !=
                                   q_labels_local.unsqueeze(0))                   # (B, Q)
-                high_sim_q     = (cos_sim_queue > 0.98) & diff_label_q
+                high_sim_q     = (cos_sim_queue > 0.80) & diff_label_q
             neg_mask_full[:, B:] &= ~high_sim_q
             n_soft_masked_q = int(high_sim_q.sum().item())
         else:
@@ -413,6 +413,20 @@ class Step1EvidentialModel(nn.Module):
             target_one_hot = F.one_hot(
                 fused_evidence.argmax(dim=-1), num_classes=4
             ).float().expand(mask.sum(), -1, -1)
+
+            # [G老师-Bug1-FIX] KL Padding mask：防止 Padding 位置的梯度毒化。
+            # 问题：Padding 位置 evidence≈0，argmax 默认返回 0（='A'），
+            # KL 强制模型在空白区域输出确定的 'A'，扭曲隐空间流形。
+            # 修复：Padding 位置 evidence 清零（→ alpha=[1,1,1,1] 即先验），
+            # target 设为均匀分布（0.25），KL(先验 || 先验)=0，无梯度。
+            cluster_consensus = consensus_target[mask]
+            valid_pos = cluster_consensus[0].sum(dim=-1) > 0  # (L,)
+            padding_mask = ~valid_pos
+            if padding_mask.any():
+                cluster_evidence = cluster_evidence.clone()
+                cluster_evidence[:, padding_mask, :] = 0.0
+                target_one_hot = target_one_hot.clone()
+                target_one_hot[:, padding_mask, :] = 0.25
 
             total_kl_loss = total_kl_loss + kld_loss_fn(cluster_evidence, target_one_hot)
             processed_clusters += 1
