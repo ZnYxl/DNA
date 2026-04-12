@@ -100,6 +100,10 @@ def main_loop():
                         help='前端引物长度 (bp)，Jaccard 校验时截掉。Seq_1D 设 20')
     parser.add_argument('--primer_suffix', type=int, default=0,
                         help='后端引物长度 (bp)，Jaccard 校验时截掉。Seq_1D 设 20')
+    parser.add_argument('--ref_length', type=int, default=None,
+                        help='[v5] 参考序列长度 (bp)，decode 截断用。Seq_1D 设 196')
+    parser.add_argument('--disable_merge', action='store_true', default=False,
+                        help='[v2] 跳过 MNN 合并 (打薄数据推荐开启)')
     parser.add_argument('--freeze_consensus', action='store_true', default=False,
                         help='[实验2] 所有轮次的 Step1 训练目标始终用 ref.txt，'
                              '不用上一轮 Step2 产出的 consensus。用于诊断 B 层毒化。')
@@ -274,6 +278,8 @@ def main_loop():
             max_iterations=args.max_iterations,          # step2_runner 需要知道是否为最后一轮
             primer_prefix=getattr(args, 'primer_prefix', 0),
             primer_suffix=getattr(args, 'primer_suffix', 0),
+            disable_merge=getattr(args, 'disable_merge', False),
+            ref_length=getattr(args, 'ref_length', None),
         )
         results = run_step2(step2_args)
 

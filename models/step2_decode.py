@@ -73,6 +73,7 @@ def run_feddna_decode(
     model_max_len: int,
     device: torch.device,
     batch_size: int = 512,
+    ref_length: int = None,      # [v5] 先验参考序列长度，截断 consensus
 ) -> Dict[int, torch.Tensor]:
     """
     FedDNA 式 Evidence Fusion。

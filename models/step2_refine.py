@@ -46,9 +46,11 @@ FALLBACK_SAFE_PERCENTILE  = 0.70
 
 MIN_ZONE1_SAFETY   = 3
 ZONE2_WEIGHT_CAP   = 0.30
-DELTA_P            = 75    # [保守复活] 用中位数而非 P95，避免高维空间下半径过大导致"丧尸感染"。v4从50改至75
+DELTA_P            = 75    # [v2] 提升到 P95，配合小簇保护提高复活率
 # ROUND1_DELTA_SCALE 已删除: refine_reads 被 FIX-ZONE2 废弃, 该常量不再使用
-MAX_ZONE3_RATIO = 0.30   # [FIX-Bug#2] Zone III 绝对上限
+MAX_ZONE3_RATIO = 0.15   # [FIX-Bug#2] Zone III 绝对上限
+SMALL_CLUSTER_THRESHOLD = 5    # [v2-策略一] 小簇保护: <5 reads 的簇免疫 Zone III v4改为10了
+
 
 
 # ===========================================================================
@@ -264,6 +266,20 @@ def split_confidence_by_zone(u_epi, u_ale, labels):
     print(f"      Zone III 实际比例 = {actual_zone3_ratio:.1%}")
 
     is_dirty = valid & (u_ale >= ale_threshold)
+
+    # ── [v2-策略一] 小簇保护 ──
+    # 簇大小 < SMALL_CLUSTER_THRESHOLD 的 reads 免疫 Zone III，降级为 Zone II。
+    # 打薄后每簇仅 ~30 reads，Zone III 切掉 5-7% 就可能让小簇跌破
+    # consensus 多数投票的最低法定人数。保护底线：5 条 reads。
+    label_counts = torch.bincount(labels.clamp(min=0).long())
+    read_cluster_sizes = label_counts[labels.clamp(min=0).long()]
+    protected_mask = (read_cluster_sizes < SMALL_CLUSTER_THRESHOLD) & valid
+    n_protected = int((is_dirty & protected_mask).sum().item())
+    if n_protected > 0:
+        is_dirty = is_dirty & (~protected_mask)
+        print(f"      🛡️ 小簇保护: {n_protected} reads 从 Zone III 降级为 Zone II "
+              f"(簇大小 < {SMALL_CLUSTER_THRESHOLD})")
+
     zone_ids[is_dirty] = 3
 
     # ===== 第二刀: U_epi → Zone I / Zone II =====

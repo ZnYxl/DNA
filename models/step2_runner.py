@@ -332,9 +332,14 @@ def run_step2(args):
         )
         _probe.snapshot("before_merge", labels_tensor)
 
+    # ── [v2-策略二] disable_merge 开关 ──
+    disable_merge = getattr(args, 'disable_merge', False)
+
     # ★ 安全簇合并 (MNN + 序列双重校验 + 最大簇大小约束)
     # 序列校验用上一轮的 consensus_dict（当轮的在 Section 6 才生成）
     prev_consensus_dict = None
+    if disable_merge:
+        print(f"   🚫 [v2] --disable_merge 已开启，跳过 MNN 合并")
     prev_consensus_path = getattr(args, 'consensus_path', None)
     if prev_consensus_path and os.path.exists(prev_consensus_path):
         try:
@@ -405,8 +410,11 @@ def run_step2(args):
     # 修复：先隔离 Zone III（无论旧标签是什么都置为 -1），
     # 再对剩余 label=-1 的 reads 做复活，日志数字才真实反映有效复活量。
     z3_count = int((zone_ids == 3).sum().item())
+    # [v2-策略三] 记录 Zone III reads 的索引和原始标签，consensus 时临时恢复
+    z3_indices = torch.where(zone_ids == 3)[0]
+    z3_original_labels = labels_tensor[z3_indices].clone()
     new_labels[zone_ids == 3] = -1
-    print(f"   🔒 Zone III 标签隔离: {z3_count} reads → -1")
+    print(f"   🔒 Zone III 标签隔离: {z3_count} reads → -1 (保留原始标签供 consensus 软参与)")
 
     if _probe: _probe.snapshot("after_zone3", new_labels)
 
@@ -474,7 +482,19 @@ def run_step2(args):
     print("🧬 [FIX] Consensus 计算（CPU only，利用已有 strength）")
     print("=" * 60)
 
-    new_labels_np = new_labels.cpu().numpy()
+    # ── [v2-策略三] Zone III 软隔离: consensus 前临时恢复标签 ──
+    # Zone III reads 的 label=-1 导致它们完全不参与 consensus。
+    # 但 FedDNA ds_fusion 内部本身就按 evidence 加权，噪声 reads 天然低权。
+    # 策略: 临时恢复 Zone III 的原始簇标签让它们参与 consensus 投票。
+    # new_labels 本身不变（Zone III 仍为 -1），训练时不受影响。
+    labels_for_consensus = new_labels.clone()
+    if z3_indices is not None and len(z3_indices) > 0:
+        valid_z3 = (z3_original_labels >= 0)
+        labels_for_consensus[z3_indices[valid_z3]] = z3_original_labels[valid_z3]
+        print(f"   🔄 Zone III 软参与 consensus: {int(valid_z3.sum())}/{len(z3_indices)} reads 临时恢复标签")
+
+    new_labels_np_for_consensus = new_labels.cpu().numpy()
+    new_labels_np = new_labels.cpu().numpy()  # 严格版: 训练/评估/保存用
 
     # [FIX-DECODE] 用 FedDNA ds_fusion 替换 majority-vote consensus
     from models.step2_decode import run_feddna_decode
@@ -483,11 +503,12 @@ def run_step2(args):
     consensus_dict = run_feddna_decode(
         model=model,
         data_loader=data_loader,
-        new_labels_np=new_labels_np,
+        new_labels_np=new_labels_np_for_consensus,  # [v2] 含 Zone III 软参与
         flat_real_indices=flat_real_indices,
         model_max_len=model_max_len,
         device=device,
         batch_size=getattr(args, 'batch_size', 512),
+        ref_length=getattr(args, 'ref_length', None),   # [v5] 先验长度
     )
     model.cpu()
     torch.cuda.empty_cache()

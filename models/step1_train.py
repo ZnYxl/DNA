@@ -47,8 +47,8 @@ from models.step1_visualizer import Step1Visualizer
 # ---------------------------------------------------------------------------
 _DEFAULT_ROUND1_EPOCHS = 10
 _DEFAULT_ROUND1_LR     = 1e-4
-_DEFAULT_ROUND2_EPOCHS = 5
-_DEFAULT_ROUND2_LR     = 1e-5
+_DEFAULT_ROUND2_EPOCHS = 10   # [v4] 从5增加到10，解决R2/R3不收敛
+_DEFAULT_ROUND2_LR     = 5e-5  # [v4] Decoder lr，Encoder 用 5e-6 差异化
 
 
 class ListBatchSampler:
@@ -200,11 +200,12 @@ def train_step1(args):
                 # [FREEZE-ENC] Round 2+: 冻结 Encoder，只微调 Decoder + 投影头
                 # 原因: Encoder 在 Round 1 已收敛，轮间 Strength 崩塌的主因是
                 #       Encoder 参数被新的 consensus 目标剧烈扰动
-                model.encoder.requires_grad_(False)
-                frozen_params = sum(p.numel() for p in model.encoder.parameters())
-                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                print(f"   🔒 Encoder 已冻结 ({frozen_params:,} 参数)")
-                print(f"   🔓 可训练参数: {trainable_params:,} (Decoder + 投影头)")
+                # [v4] 不再冻结 Encoder，改用差异化学习率（Encoder 5e-6, Decoder 5e-5）
+                # 原来冻结 Encoder 导致 R2/R3 训练完全不收敛（Loss/Margin 5个epoch纹丝不动）
+                total_params = sum(p.numel() for p in model.parameters())
+                enc_params = sum(p.numel() for p in model.encoder.parameters())
+                print(f"   🔓 [v4] Encoder 已解冻 (差异化学习率)")
+                print(f"   📊 总参数: {total_params:,}, Encoder: {enc_params:,}, Decoder: {total_params - enc_params:,}")
             except Exception as e:
                 print(f"   ⚠️ 加载失败: {e}，使用随机初始化")
         else:
@@ -218,12 +219,23 @@ def train_step1(args):
 
     print(f"\n   📐 训练超参: epochs={epochs}, lr={lr}")
 
-    # [FIX-OPT][G老师-陷阱1-FIX] 只传可训练参数
-    # 原来传 model.parameters()（全量）：即使 Encoder requires_grad=False，
-    # AdamW 依然为它分配 Momentum + Variance 矩阵，80% 显存节省完全落空。
-    # 修复：传 trainable_params，optimizer 只管理真正需要更新的参数。
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer  = optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
+    # [v4] 差异化学习率：Encoder 用极小 lr 微调，Decoder 用正常 lr 适应新 consensus
+    if round_idx <= 1:
+        # Round 1: 全部用同一个 lr
+        trainable_params = list(model.parameters())
+        optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
+    else:
+        # Round 2+: Encoder 5e-6, Decoder 5e-5
+        encoder_params = list(model.encoder.parameters())
+        decoder_params = [p for n, p in model.named_parameters() if 'encoder' not in n]
+        enc_lr = 5e-6
+        dec_lr = lr  # 即 _DEFAULT_ROUND2_LR = 5e-5
+        trainable_params = encoder_params + decoder_params  # 用于 clip_grad_norm
+        optimizer = optim.AdamW([
+            {'params': encoder_params, 'lr': enc_lr},
+            {'params': decoder_params, 'lr': dec_lr},
+        ], weight_decay=args.weight_decay)
+        print(f"   📐 差异化学习率: Encoder={enc_lr}, Decoder={dec_lr}")
     scheduler  = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     # =====================================================================
@@ -235,16 +247,9 @@ def train_step1(args):
 
     model.train()
 
-    # [G老师-陷阱2-FIX] Round 2+ 将冻结的 Encoder 强制拨回 eval 模式
-    # 问题根因：model.train() 递归设置所有子模块为 Train 模式，
-    #   包括刚刚冻结的 Encoder。虽然没有梯度反传，但 Train 模式下：
-    #   - BatchNorm 会用当前 batch 数据更新 running_mean / running_var（污染特征空间）
-    #   - Dropout 会随机丢弃神经元（引起特征提取不稳定）
-    # 修复：model.train() 之后立即把 Encoder 按回 eval 模式，
-    #   锁定其统计量，关闭 Dropout，保证特征提取的绝对稳定。
-    if round_idx >= 2:
-        model.encoder.eval()
-        print("   🔒 Encoder 已设为 eval 模式（BatchNorm统计量锁定，Dropout关闭）")
+    # [v4] Encoder 已解冻，全部子模块均为 train 模式
+    # BatchNorm 会更新统计量，Dropout 正常启用
+    # 这是差异化学习率方案的正确配置
 
     training_history = {
         'total_loss': [], 'avg_strength': [], 'high_conf_ratio': [],
