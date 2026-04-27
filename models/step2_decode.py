@@ -173,6 +173,101 @@ def run_feddna_decode(
     return consensus_dict
 
 
+
+# ---------------------------------------------------------------------------
+# [v16 路径B] MV Consensus: pure majority vote, 不跑 encoder
+# ---------------------------------------------------------------------------
+def compute_mv_consensus(
+    data_loader,
+    new_labels_np,
+    flat_real_indices,
+    model_max_len: int,
+    ref_length: int = None,
+) -> Dict[int, torch.Tensor]:
+    """
+    Pure majority-vote consensus, 用于 Round 2+ 的 Step1 训练靶子.
+
+    与 run_feddna_decode 的区别:
+      - 不跑 encoder/decoder, 纯统计投票
+      - 不受 encoder 状态影响 -> 打破 encoder 自污染闭环
+      - 输出格式完全一致 (Dict[int, Tensor(L, 4)] one-hot), step1_train.py 零改动
+
+    逻辑:
+      对每个簇 (只处理 label >= 0 的 reads):
+        counts[L, 4] = sum over reads of one_hot(seq)
+        has_vote[L]  = (有效 read 数 >= 50% * N)      # 与 ds_fusion_masked 一致
+        indices[L]   = counts.argmax(dim=-1)
+        one_hot[L,4] = F.one_hot(indices, 4); one_hot[~has_vote] = 0
+
+    Args:
+        data_loader:       CloverDataLoader, 提供 data_loader.reads[real_idx]
+        new_labels_np:     严格版 labels (numpy, -1 会被自动跳过)
+        flat_real_indices: data_loader.reads 的真实索引映射
+        model_max_len:     序列 one-hot 长度 (与 fusion 版对齐, 通常 201)
+        ref_length:        先验长度, 仅用于日志提示, 实际形状仍为 model_max_len
+                           (与 run_feddna_decode 的 consensus_dict 对齐)
+
+    Returns:
+        consensus_dict: {cluster_id: Tensor(model_max_len, 4)} one-hot
+    """
+    from models.step1_data import seq_to_onehot
+
+    # 1. cluster_id -> real_idx 列表 (只收集 label >= 0)
+    cluster_to_ridx: Dict[int, list] = defaultdict(list)
+    for didx, label in enumerate(new_labels_np):
+        if label >= 0:
+            real_idx = flat_real_indices[didx]
+            cluster_to_ridx[int(label)].append(real_idx)
+
+    print(f"\n🗳️  [v16 路径B] MV Consensus: {len(cluster_to_ridx)} 个簇")
+    if ref_length is not None:
+        print(f"   📏 ref_length={ref_length} (one-hot 形状仍为 L={model_max_len}, "
+              f"截断在 save_consensus_fasta 处理)")
+
+    consensus_dict: Dict[int, torch.Tensor] = {}
+    skipped = 0
+
+    # 2. 逐簇统计投票
+    for cluster_id, ridx_list in cluster_to_ridx.items():
+        n_reads = len(ridx_list)
+        if n_reads < 1:
+            skipped += 1
+            continue
+
+        # 收集 one-hot encoding + padding mask
+        encodings = []
+        padding_masks = []
+        for ridx in ridx_list:
+            seq = data_loader.reads[ridx]
+            enc = seq_to_onehot(seq, model_max_len)   # (L, 4)
+            encodings.append(enc)
+            pmask = enc.sum(dim=-1) > 0               # (L,) bool
+            padding_masks.append(pmask)
+
+        enc_tensor   = torch.stack(encodings)          # (N, L, 4)
+        pmask_tensor = torch.stack(padding_masks)      # (N, L)
+
+        # 3. 统计投票
+        counts   = enc_tensor.sum(dim=0)               # (L, 4)  每位置4碱基计数
+        n_valid  = pmask_tensor.sum(dim=0).float()     # (L,)    每位置有效 read 数
+        # has_vote: 投票门限与 ds_fusion_masked 一致 (防 1 条 insertion read 拉长)
+        has_vote = (n_valid >= max(n_reads * 0.5, 1))  # (L,) bool
+
+        # 4. argmax -> one_hot, padding 位置清零
+        indices = counts.argmax(dim=-1)                # (L,)
+        one_hot = F.one_hot(indices, num_classes=4).float()  # (L, 4)
+        one_hot[~has_vote] = 0.0
+
+        consensus_dict[cluster_id] = one_hot
+
+        # 释放本簇的中间 tensor
+        del enc_tensor, pmask_tensor, counts, n_valid, has_vote, indices, one_hot
+
+    print(f"   ✅ 生成 {len(consensus_dict)} 个簇的 MV consensus "
+          f"(跳过 {skipped} 个空簇)")
+    return consensus_dict
+
+
 # ---------------------------------------------------------------------------
 # 工具: 将 consensus_dict 保存为 FASTA
 # ---------------------------------------------------------------------------
@@ -183,6 +278,7 @@ def save_consensus_fasta(
     data_loader,
     model_max_len: int,
     fasta_path: str,
+    ref_length: int = None,
 ):
     """
     [Bug1-Fix-B] 用簇内 read 长度众数 (mode) 截断，替代 max(read_len)。
@@ -208,10 +304,20 @@ def save_consensus_fasta(
     for cid, lens in cluster_len_votes.items():
         cluster_actual_len[cid] = _Counter(lens).most_common(1)[0][0]  # mode
 
+    # [ref_length-FIX] 有先验时统一用先验长度，没有时退回众数
+    if ref_length is not None:
+        print(f"   📏 使用先验 ref_length={ref_length} 截断 (覆盖 read 众数)")
+        mode_mismatch = sum(1 for cid, ml in cluster_actual_len.items() if ml != ref_length)
+        if mode_mismatch > 0:
+            print(f"   ⚠️ {mode_mismatch} 个簇的 read 众数 ≠ ref_length (将被先验覆盖)")
+
     os.makedirs(os.path.dirname(fasta_path), exist_ok=True)
     with open(fasta_path, 'w') as ff:
         for cluster_id, one_hot in sorted(consensus_dict.items()):
-            actual_len = cluster_actual_len.get(cluster_id, model_max_len)
+            if ref_length is not None:
+                actual_len = ref_length
+            else:
+                actual_len = cluster_actual_len.get(cluster_id, model_max_len)
             indices = one_hot[:actual_len].argmax(dim=-1).numpy()
             seq = ''.join(BASE_MAP[i] for i in indices)
             ff.write(f">cluster_{cluster_id}\n{seq}\n")

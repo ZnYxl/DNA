@@ -294,7 +294,17 @@ def run_step2(args):
         dtype=torch.long
     )
 
-    zone_ids, zone_stats = split_confidence_by_zone(u_epi, u_ale, labels_tensor)
+    # ══════════════════════════════════════════════════════════════
+    # [v18 Zone 全量判定] 让 -1 reads 也参与 Zone 判定, 打破 -1 累积
+    # ══════════════════════════════════════════════════════════════
+    _zone_include_noise = getattr(args, 'zone_include_noise', True)
+    if _zone_include_noise:
+        _n_negone_pre = int((labels_tensor < 0).sum())
+        print(f"   🔄 [v18] Zone 全量判定: {_n_negone_pre} 个 -1 reads 参与本轮 Zone 审判")
+    zone_ids, zone_stats = split_confidence_by_zone(
+        u_epi, u_ale, labels_tensor,
+        include_noise=_zone_include_noise,
+    )
     _np_zone_ids = zone_ids.numpy().copy()
 
     # =====================================================================
@@ -409,6 +419,57 @@ def run_step2(args):
     # 包含了这些马上会被杀掉的 Zone III reads，数字虚高。
     # 修复：先隔离 Zone III（无论旧标签是什么都置为 -1），
     # 再对剩余 label=-1 的 reads 做复活，日志数字才真实反映有效复活量。
+    # ══════════════════════════════════════════════════════════════════
+    # [v19 Rebirth] -1 reads 在 Zone I/II 通过最近邻重获 label
+    # ══════════════════════════════════════════════════════════════════
+    # 背景: v18 让 -1 reads 参与 Zone 判定, 诊断显示 ~40% 被判为 Zone I/II.
+    # 但 new_labels = labels_tensor.clone() 只是保持原 label, 所以这些 reads
+    # 仍然是 -1. 死数据复活门限太严 (delta=0.16), 只救回 <1%.
+    # v19 在 Zone III 隔离之前, 给这批"已被 encoder 重新信任"的 -1 reads
+    # 一次最近邻赋 label 的机会.
+    _rebirth_mode = getattr(args, 'rebirth_mode', 'nearest')
+    if _rebirth_mode != 'off' and len(centroids) > 0:
+        reborn_mask = (labels_tensor < 0) & ((zone_ids == 1) | (zone_ids == 2))
+        n_candidates = int(reborn_mask.sum().item())
+        if n_candidates > 0:
+            reborn_idx = torch.where(reborn_mask)[0]
+            _cids_sorted = sorted(centroids.keys())
+            _centroid_mat = torch.stack([centroids[c] for c in _cids_sorted]).cpu()
+
+            # 分块算距离 (防 OOM)
+            n_reborn_success = 0
+            _chunk = 5000
+            for _s in range(0, len(reborn_idx), _chunk):
+                _e = min(_s + _chunk, len(reborn_idx))
+                _batch_idx = reborn_idx[_s:_e]
+                _batch_emb = embeddings_f32[_batch_idx]
+                _dists = torch.cdist(_batch_emb, _centroid_mat)
+                _min_d, _min_id = _dists.min(dim=1)
+
+                if _rebirth_mode == 'bounded':
+                    REBIRTH_BOUNDED_SCALE = 1.5
+                    _hit = _min_d < delta * REBIRTH_BOUNDED_SCALE
+                else:
+                    # 'nearest' - 无门限, 无条件赋最近质心
+                    _hit = torch.ones_like(_min_d, dtype=torch.bool)
+
+                _positions = _batch_idx[_hit]
+                _cluster_ids = torch.tensor(
+                    [_cids_sorted[j] for j in _min_id[_hit].tolist()],
+                    dtype=torch.long
+                )
+                new_labels[_positions] = _cluster_ids
+                n_reborn_success += int(_hit.sum().item())
+
+            print(f"   🌱 [v19 Rebirth] -1 reads 在 Zone I/II 重生 "
+                  f"(mode={_rebirth_mode}): "
+                  f"{n_reborn_success:,}/{n_candidates:,} 成功")
+            del _centroid_mat
+        else:
+            print(f"   🌱 [v19 Rebirth] 无候选 (label=-1 且在 Zone I/II 的 reads: 0)")
+    elif _rebirth_mode == 'off':
+        print(f"   🌱 [v19 Rebirth] 已禁用 (--rebirth_mode off, 退回 v18 行为)")
+
     z3_count = int((zone_ids == 3).sum().item())
     # [v2-策略三] 记录 Zone III reads 的索引和原始标签，consensus 时临时恢复
     z3_indices = torch.where(zone_ids == 3)[0]
@@ -455,6 +516,55 @@ def run_step2(args):
     else:
         print(f"\n   🧟 死数据复活: 无候选数据或无有效质心，跳过")
 
+    # ══════════════════════════════════════════════════════════════
+    # [zone3_precise_reassign] G老师杀手锏: 残留 -1 精准归巢到大簇
+    # ══════════════════════════════════════════════════════════════
+    # 严格双轨隔离:
+    #   - new_labels (保持 -1): 训练轨道, 纯净靶点
+    #   - eval_labels (全量归巢): 评估轨道, 最大化重建
+    # 归巢策略: 按 embedding 欧氏距离分配到当前大簇, 享受 MNN 合并红利
+    # 避免继承 Clover 过分割错误（不用 Clover 标签回填）
+    eval_labels = new_labels.clone()
+    final_noise_mask = (eval_labels == -1)
+    final_noise_indices = torch.where(final_noise_mask)[0]
+
+    if len(final_noise_indices) > 0 and len(centroids) > 0:
+        MIN_LARGE_SIZE = 10
+        large_cids = [cid for cid, sz in cluster_sizes.items() if sz >= MIN_LARGE_SIZE]
+        if len(large_cids) == 0:
+            large_cids = sorted(centroids.keys())
+            print(f"\n   🏠 Zone III 归巢: 无 size>={MIN_LARGE_SIZE} 大簇, "
+                  f"回退到全簇 ({len(large_cids)})")
+        else:
+            print(f"\n   🏠 Zone III 精准归巢: {len(final_noise_indices):,} 残留 -1 reads "
+                  f"→ {len(large_cids):,} 大簇 (size>={MIN_LARGE_SIZE})")
+
+        large_cids_sorted = sorted(large_cids)
+        large_centroid_matrix = torch.stack(
+            [centroids[c] for c in large_cids_sorted]
+        ).cpu()
+
+        reassigned_count = 0
+        ed_chunk_size = 5000
+        for start in range(0, len(final_noise_indices), ed_chunk_size):
+            end       = min(start + ed_chunk_size, len(final_noise_indices))
+            batch_idx = final_noise_indices[start:end]
+            batch_emb = embeddings_f32[batch_idx]
+
+            dists              = torch.cdist(batch_emb, large_centroid_matrix)
+            min_dists, min_idx = dists.min(dim=1)
+
+            reassign_cluster_ids = torch.tensor(
+                [large_cids_sorted[j] for j in min_idx.tolist()],
+                dtype=torch.long
+            )
+            eval_labels[batch_idx] = reassign_cluster_ids
+            reassigned_count += len(batch_idx)
+
+        print(f"   ✅ 归巢完成: {reassigned_count:,} reads → 大簇")
+    else:
+        print(f"\n   🏠 Zone III 归巢: 无残留 -1 或无质心，跳过")
+
     if _probe:
         _probe.snapshot("after_revival", new_labels)
         _probe.report(round_idx)
@@ -482,37 +592,82 @@ def run_step2(args):
     print("🧬 [FIX] Consensus 计算（CPU only，利用已有 strength）")
     print("=" * 60)
 
-    # ── [v2-策略三] Zone III 软隔离: consensus 前临时恢复标签 ──
-    # Zone III reads 的 label=-1 导致它们完全不参与 consensus。
-    # 但 FedDNA ds_fusion 内部本身就按 evidence 加权，噪声 reads 天然低权。
-    # 策略: 临时恢复 Zone III 的原始簇标签让它们参与 consensus 投票。
-    # new_labels 本身不变（Zone III 仍为 -1），训练时不受影响。
-    labels_for_consensus = new_labels.clone()
-    if z3_indices is not None and len(z3_indices) > 0:
-        valid_z3 = (z3_original_labels >= 0)
-        labels_for_consensus[z3_indices[valid_z3]] = z3_original_labels[valid_z3]
-        print(f"   🔄 Zone III 软参与 consensus: {int(valid_z3.sum())}/{len(z3_indices)} reads 临时恢复标签")
+    # ══════════════════════════════════════════════════════════════
+    # [G老师双轨制 + 终极诊断] Consensus 物理隔离, 统一用 SSI-EC model
+    # ══════════════════════════════════════════════════════════════
+    # 核心: 不加载 FedDNA 原生 epoch1_I.pth (它是 ID20 150bp 语言,
+    #        与 Seq_1D 201bp 不兼容, 会导致 SR=0)
+    # 正确: 用 Step 1 训练后的 model, 它的 RNNBlock 已适应 201 长度
+    #
+    # 轨道一: 纯净版 (排除 -1) → .pt → 下一轮训练靶点
+    # 轨道二: 全量版 (eval_labels, 已归巢) → .fasta → 评估 SR
+    # ══════════════════════════════════════════════════════════════
 
-    new_labels_np_for_consensus = new_labels.cpu().numpy()
-    new_labels_np = new_labels.cpu().numpy()  # 严格版: 训练/评估/保存用
+    new_labels_np = new_labels.cpu().numpy()  # 严格版: 训练/聚类评估/保存用
 
-    # [FIX-DECODE] 用 FedDNA ds_fusion 替换 majority-vote consensus
     from models.step2_decode import run_feddna_decode
     # 模型已在 model.cpu() 后，需要重新上 GPU
     model.to(device)
-    consensus_dict = run_feddna_decode(
+
+    # ── 轨道一: 纯净版 Consensus (训练专用, 神圣不可侵犯) ──
+    print(f"\n   🔒 轨道一: 纯净版 Consensus (排除 -1, 用于下一轮训练)")
+    consensus_dict_for_train = run_feddna_decode(
         model=model,
         data_loader=data_loader,
-        new_labels_np=new_labels_np_for_consensus,  # [v2] 含 Zone III 软参与
+        new_labels_np=new_labels_np,  # 严格版, step2_decode 自动跳过 -1
         flat_real_indices=flat_real_indices,
         model_max_len=model_max_len,
         device=device,
         batch_size=getattr(args, 'batch_size', 512),
-        ref_length=getattr(args, 'ref_length', None),   # [v5] 先验长度
+        ref_length=getattr(args, 'ref_length', None),
     )
+    print(f"   ✅ 纯净版: {len(consensus_dict_for_train)} 个簇")
+
+    # ── 轨道二: 全量版 Consensus (评估专用, 应收尽收) ──
+    # eval_labels 来自精准归巢段 (死数据复活之后):
+    #   - P75 阈值内的 reads 已复活归簇
+    #   - 残留 -1 已按 embedding 距离归巢到大簇
+    # 无需额外 Clover 回填
+    labels_for_eval_np = eval_labels.cpu().numpy()
+    n_still_noise = int((eval_labels == -1).sum().item())
+    print(f"\n   🔓 轨道二: 全量版 Consensus (归巢结果, 残留 -1: {n_still_noise})")
+    consensus_dict_for_eval = run_feddna_decode(
+        model=model,
+        data_loader=data_loader,
+        new_labels_np=labels_for_eval_np,
+        flat_real_indices=flat_real_indices,
+        model_max_len=model_max_len,
+        device=device,
+        batch_size=getattr(args, 'batch_size', 512),
+        ref_length=getattr(args, 'ref_length', None),
+    )
+    print(f"   ✅ 全量版: {len(consensus_dict_for_eval)} 个簇")
+
     model.cpu()
     torch.cuda.empty_cache()
-    print(f"   ✅ 生成 {len(consensus_dict)} 个簇的 consensus")
+
+    # ══════════════════════════════════════════════════════════════
+    # [v16 路径B] 训练靶子切换: fusion vs MV
+    # ══════════════════════════════════════════════════════════════
+    # G老师钦点改动: 把 R2+ 的 consensus_dict (训练靶子) 从 evidence
+    # fusion 换成 majority vote, 打破 encoder 自污染闭环.
+    # FASTA 轨道 (consensus_dict_for_eval) 完全不动, 确保 v15→v16 只有
+    # "训练 target" 这一个变量改动, 因果辨识干净.
+    _consensus_source = getattr(args, 'consensus_source', 'mv')
+    if _consensus_source == 'mv':
+        print(f"\n   🗳️  [v16 路径B] 训练靶子: MV consensus "
+              f"(打破 encoder 自污染闭环)")
+        from models.step2_decode import compute_mv_consensus
+        consensus_dict = compute_mv_consensus(
+            data_loader=data_loader,
+            new_labels_np=new_labels_np,
+            flat_real_indices=flat_real_indices,
+            model_max_len=model_max_len,
+            ref_length=getattr(args, 'ref_length', None),
+        )
+    else:
+        print(f"\n   🧬 [v15 fallback] 训练靶子: Evidence fusion consensus")
+        consensus_dict = consensus_dict_for_train
 
     cluster_change_info = compute_cluster_difficulty(
         new_labels_np, flat_real_indices, _np_strength
@@ -577,16 +732,49 @@ def run_step2(args):
     torch.save(cluster_change_info, change_info_path)
     print(f"   💾 Cluster Change Info: {change_info_path}")
 
-    # [FIX-DECODE] 用 save_consensus_fasta 替换原 FASTA 保存逻辑
+    # ══════════════════════════════════════════════════════════════════
+    # [v17 FASTA 纯净轨道] 方案 B: FASTA 的 consensus 与 labels 可选择
+    # ══════════════════════════════════════════════════════════════════
+    # v15/v16 的 FASTA 一直用 consensus_dict_for_eval (fusion on 归巢后
+    # eval_labels), 后者含 R1=15K / R2=31K / R3=47K 条 backfill 脏 reads,
+    # 越滚越脏, 是 EER 逐轮上升 & R0→R1 SR 倒退的直接原因.
+    #
+    # v17 新建轨道三: MV on new_labels_np (严格 labels, 零 backfill), 与 v16
+    # 训练 target 同源 (都是 MV), 对 encoder 状态免疫, 不受 FedDNA
+    # checkpoint 迁移不良影响.
+    #
+    # 默认 mv_strict (v17 行为), fusion_eval 退回 v16 行为做 A/B 对照.
     from models.step2_decode import save_consensus_fasta
     fasta_dir = os.path.join(args.output_dir, "consensus")
     os.makedirs(fasta_dir, exist_ok=True)
     fasta_path = os.path.join(fasta_dir, f"consensus_{ts}.fasta")
+
+    _fasta_source = getattr(args, 'fasta_source', 'mv_strict')
     try:
-        save_consensus_fasta(
-            consensus_dict, new_labels_np, flat_real_indices,
-            data_loader, model_max_len, fasta_path
-        )
+        if _fasta_source == 'mv_strict':
+            print(f"\n   🧼 [v17] FASTA 纯净轨道: MV on 严格 labels "
+                  f"(零 backfill 污染)")
+            from models.step2_decode import compute_mv_consensus
+            consensus_dict_for_fasta = compute_mv_consensus(
+                data_loader=data_loader,
+                new_labels_np=new_labels_np,
+                flat_real_indices=flat_real_indices,
+                model_max_len=model_max_len,
+                ref_length=getattr(args, 'ref_length', None),
+            )
+            save_consensus_fasta(
+                consensus_dict_for_fasta, new_labels_np, flat_real_indices,
+                data_loader, model_max_len, fasta_path,
+                ref_length=getattr(args, 'ref_length', None),
+            )
+        else:
+            print(f"\n   🩹 [v16 fallback] FASTA: fusion on 归巢 labels "
+                  f"(backfill 污染)")
+            save_consensus_fasta(
+                consensus_dict_for_eval, labels_for_eval_np, flat_real_indices,
+                data_loader, model_max_len, fasta_path,
+                ref_length=getattr(args, 'ref_length', None),
+            )
         print(f"   💾 Fasta: {fasta_path}")
     except Exception as e:
         print(f"   ⚠️ Fasta 保存失败: {e}")

@@ -203,7 +203,7 @@ def _find_gmm_threshold(values, fallback_percentile=0.70):
 # ===========================================================================
 # 1. 三区制划分 (自适应版)
 # ===========================================================================
-def split_confidence_by_zone(u_epi, u_ale, labels):
+def split_confidence_by_zone(u_epi, u_ale, labels, include_noise=False):
     """
     自适应三区制划分:
       第一刀: CDF 拐点 (Kneedle) → Zone III (U_ale 长尾噪声)
@@ -211,12 +211,26 @@ def split_confidence_by_zone(u_epi, u_ale, labels):
 
     [FIX-Bug#2] 新增安全阀: Zone III 实际比例超过 30% 时强制回退
     [FIX-Bug#6] 打印实际比例而非硬编码 "≈10%"
+
+    [v18 Zone 全量判定]
+      include_noise=False (默认, v17 及以前行为):
+          Zone 判定只看 labels >= 0 的 reads.
+          问题: -1 reads 被排除, 一旦标 -1 就失去被重新评估的机会,
+                导致每轮 5% 的 reads 单向流失到 -1, 累积到 R3 时占 14%.
+      include_noise=True (v18 行为):
+          labels=-1 的 reads 也参与 Zone 判定. 它们的 u_ale 可能不长尾
+          (不是 Zone III), 应该分到 Zone I/II 并通过质心匹配重获 label.
     """
     N      = len(labels)
     device = labels.device
     zone_ids = torch.zeros(N, dtype=torch.long, device=device)
 
-    valid   = (labels >= 0)
+    if include_noise:
+        # [v18] 全量参与 Zone 判定, -1 reads 也能被重新审判
+        valid = torch.ones(N, dtype=torch.bool, device=device)
+    else:
+        # [v17] 只看正常 label reads (会导致 -1 累积)
+        valid = (labels >= 0)
     n_valid = valid.sum().item()
     if n_valid == 0:
         return zone_ids, {'zone1': 0, 'zone2': 0, 'zone3': 0, 'noise': N}

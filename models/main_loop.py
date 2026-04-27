@@ -107,6 +107,27 @@ def main_loop():
     parser.add_argument('--freeze_consensus', action='store_true', default=False,
                         help='[实验2] 所有轮次的 Step1 训练目标始终用 ref.txt，'
                              '不用上一轮 Step2 产出的 consensus。用于诊断 B 层毒化。')
+    parser.add_argument('--consensus_source', type=str, default='mv',
+                        choices=['mv', 'fusion'],
+                        help='[v16 路径B] Round 2+ 训练靶子来源. '
+                             'mv (默认) = majority vote (打破 encoder 自污染), '
+                             'fusion = evidence fusion (v15 行为, 用于对照).')
+    parser.add_argument('--fasta_source', type=str, default='mv_strict',
+                        choices=['mv_strict', 'fusion_eval'],
+                        help='[v17 FASTA 纯净轨道] 导出 FASTA 的 consensus 来源. '
+                             'mv_strict (默认) = MV on 严格 labels (零 backfill 污染), '
+                             'fusion_eval = fusion on 归巢 labels (v16 行为, 用于对照).')
+    parser.add_argument('--zone_include_noise', type=lambda x: str(x).lower() == 'true',
+                        default=True,
+                        help='[v18 Zone 全量判定] 让 label=-1 reads 也参与 Zone 判定. '
+                             'True (默认) = 全量 (打破 -1 单向流失), '
+                             'False = 仅 label>=0 (v17 行为, 用于对照).')
+    parser.add_argument('--rebirth_mode', type=str, default='nearest',
+                        choices=['off', 'nearest', 'bounded'],
+                        help='[v19 Rebirth] -1 reads 在 Zone I/II 重获 label 的方式. '
+                             'nearest (默认) = 无门限最近邻, '
+                             'bounded = 用 delta*1.5 作门限, '
+                             'off = 禁用 (v18 行为, 用于对照).')
     args = parser.parse_args()
 
     os.makedirs(os.path.join(args.experiment_dir, 'results'), exist_ok=True)
@@ -280,6 +301,11 @@ def main_loop():
             primer_suffix=getattr(args, 'primer_suffix', 0),
             disable_merge=getattr(args, 'disable_merge', False),
             ref_length=getattr(args, 'ref_length', None),
+            feddna_checkpoint=args.feddna_checkpoint,
+            consensus_source=getattr(args, 'consensus_source', 'mv'),
+            fasta_source=getattr(args, 'fasta_source', 'mv_strict'),
+            zone_include_noise=getattr(args, 'zone_include_noise', True),
+            rebirth_mode=getattr(args, 'rebirth_mode', 'nearest'),
         )
         results = run_step2(step2_args)
 

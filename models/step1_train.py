@@ -37,7 +37,7 @@ parent_dir  = os.path.dirname(current_dir)
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from models.step1_model import Step1EvidentialModel, load_pretrained_feddna
+from models.step1_model import Step1EvidentialModel, load_pretrained_feddna, masked_bayes_risk
 from models.step1_data  import CloverDataLoader, Step1Dataset, create_dynamic_sampler, seq_to_onehot
 from models.step1_visualizer import Step1Visualizer
 
@@ -362,6 +362,103 @@ def train_step1(args):
         if epoch_cos_pos_cnt > 0 or epoch_cos_neg_cnt > 0:
             margin_s = f"{avg_cp - avg_cn:.4f}" if (epoch_cos_pos_cnt > 0 and epoch_cos_neg_cnt > 0) else "nan"
             print(f"   🔬 探针 B | cos_pos: {cp_s}  cos_neg: {cn_s}  margin: {margin_s}")
+
+    # =====================================================================
+    # 8.5 Calibration Phase: rnnblock 校准
+    # =====================================================================
+    # 原理: 对比训练把 encoder 特征空间彻底重组 (cos_neg 0.98→0.04),
+    # rnnblock 来不及完全适应最终特征空间。冻结 encoder, 只用 recon_loss
+    # 微调 rnnblock, 让它在静止空间里专心学解码。
+    # 类似 SimCLR/MoCo 做完预训练后 fine-tune linear probe 的标准做法。
+    calib_epochs = getattr(args, 'calib_epochs', 3)
+    calib_lr     = getattr(args, 'calib_lr', 2e-5)
+
+    if calib_epochs > 0:
+        print("\n" + "=" * 60)
+        print(f"🎯 Calibration Phase: rnnblock 校准 ({calib_epochs} epochs, lr={calib_lr})")
+        print("=" * 60)
+
+        # ── 冻结 Encoder + Length Adapter ──
+        for p in model.encoder.parameters():
+            p.requires_grad = False
+        if model.length_adapter is not None:
+            for p in model.length_adapter.parameters():
+                p.requires_grad = False
+
+        # ── 确保 rnnblock 可训练 ──
+        calib_params = list(model.rnnblock.parameters())
+        for p in calib_params:
+            p.requires_grad = True
+
+        trainable_count = sum(p.numel() for p in calib_params if p.requires_grad)
+        frozen_count    = sum(p.numel() for p in model.parameters()) - trainable_count
+        print(f"   🔒 冻结: {frozen_count:,} 参数 (Encoder + Length Adapter)")
+        print(f"   🔓 可训练: {trainable_count:,} 参数 (RNNBlock)")
+
+        # ── 全新 optimizer (丢弃主训练阶段的动量污染) ──
+        calib_optimizer = optim.AdamW(calib_params, lr=calib_lr, weight_decay=1e-4)
+
+        model.train()
+        model.encoder.eval()  # BN 统计量不动, Dropout 关闭
+
+        for calib_epoch in range(calib_epochs):
+            calib_start = time.time()
+
+            # 复用主训练的动态采样器
+            calib_batches = create_dynamic_sampler(
+                dataset,
+                batch_size=args.batch_size,
+                max_clusters_per_batch=args.max_clusters_per_batch,
+                state_path=prev_state,
+                round_idx=round_idx
+            )
+            calib_sampler = ListBatchSampler(calib_batches)
+            calib_loader  = torch.utils.data.DataLoader(
+                dataset,
+                batch_sampler=calib_sampler,
+                num_workers=4,
+                pin_memory=True
+            )
+
+            calib_loss_sum = 0
+            calib_str_sum  = 0
+            calib_n        = 0
+
+            for i, batch_data in enumerate(calib_loader):
+                reads_batch     = batch_data['encoding'].to(device)
+                consensus_batch = batch_data['consensus_target'].to(device)
+
+                # ── 只走 encoder → decoder → recon_loss ──
+                embeddings, _ = model.encode_reads(reads_batch)
+                evidence, strength, alpha = model.decode_to_evidence(embeddings)
+
+                recon_loss = masked_bayes_risk(evidence, consensus_batch)
+
+                calib_optimizer.zero_grad()
+                recon_loss.backward()
+                torch.nn.utils.clip_grad_norm_(calib_params, max_norm=1.0)
+                calib_optimizer.step()
+
+                calib_loss_sum += recon_loss.item()
+                calib_str_sum  += strength.mean().item()
+                calib_n        += 1
+
+                if (i + 1) % 100 == 0:
+                    print(f"   [Calib Batch {i+1}/{len(calib_batches)}] "
+                          f"Recon: {recon_loss.item():.4f} | "
+                          f"Str: {strength.mean().item():.1f}", end='\r')
+
+            calib_time = time.time() - calib_start
+            avg_loss = calib_loss_sum / max(calib_n, 1)
+            avg_str  = calib_str_sum / max(calib_n, 1)
+            print(f"\n   ✅ Calib Epoch {calib_epoch+1}/{calib_epochs} ({calib_time:.1f}s) | "
+                  f"Recon: {avg_loss:.4f} | Str: {avg_str:.1f}")
+
+        # ── 恢复全部参数为可训练状态 (不影响后续保存) ──
+        for p in model.parameters():
+            p.requires_grad = True
+
+        print(f"   🎯 Calibration 完成")
 
     # =====================================================================
     # 9. 保存 checkpoint

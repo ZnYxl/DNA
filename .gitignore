@@ -36,6 +36,8 @@ __pycache__/
 .ipynb_checkpoints/
 venv/
 CC/Step0/给师妹的clover数据集
+*.py.bak
+*.py.bak_*
 
 #忽略真实数据和压缩包
 *.gz
