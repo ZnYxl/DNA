@@ -391,18 +391,30 @@ def run_step2(args):
     else:
         round_target = final_target  # None 或已达标
 
-    centroids, labels_tensor, merge_stats, cluster_sizes = merge_close_centroids(
-        centroids, labels_tensor, cluster_sizes,
-        embeddings_f32, zone_ids, strength,
-        threshold=merge_threshold,
-        max_cluster_size=2000,
-        max_rounds=60,
-        consensus_dict=prev_consensus_dict,
-        seq_jaccard_threshold=0.15,
-        target_clusters=round_target,
-        primer_prefix=getattr(args, 'primer_prefix', 0),
-        primer_suffix=getattr(args, 'primer_suffix', 0),
-    )
+    # [v21-MERGEFIX] disable_merge 时真正跳过合并(堵死拆分触发课程合并污染)
+    if getattr(args, 'disable_merge', False):
+        print(f"   🚫 [v21-MERGEFIX] disable_merge 生效: 真正跳过 MNN 合并, "
+              f"保留拆分后 {len(centroids)} 簇不被合并污染")
+        from collections import Counter as _Cmf
+        _lc = _Cmf(labels_tensor.tolist())
+        cluster_sizes = {cid: _lc.get(cid, 0) for cid in centroids}
+        merge_stats = {'clusters_before': len(centroids),
+                       'clusters_after': len(centroids),
+                       'n_merges': 0, 'time_seconds': 0.0,
+                       'threshold': merge_threshold, 'max_cluster_size': 2000}
+    else:
+        centroids, labels_tensor, merge_stats, cluster_sizes = merge_close_centroids(
+            centroids, labels_tensor, cluster_sizes,
+            embeddings_f32, zone_ids, strength,
+            threshold=merge_threshold,
+            max_cluster_size=2000,
+            max_rounds=60,
+            consensus_dict=prev_consensus_dict,
+            seq_jaccard_threshold=0.15,
+            target_clusters=round_target,
+            primer_prefix=getattr(args, 'primer_prefix', 0),
+            primer_suffix=getattr(args, 'primer_suffix', 0),
+        )
     # [残留问题1修复] cluster_sizes 现在是合并后的新值（来自 merge_close_centroids 返回值），
     # 不再是合并前的旧值。保存到磁盘的元数据和实际质心一致。
 
@@ -474,7 +486,8 @@ def run_step2(args):
     # [v2-策略三] 记录 Zone III reads 的索引和原始标签，consensus 时临时恢复
     z3_indices = torch.where(zone_ids == 3)[0]
     z3_original_labels = labels_tensor[z3_indices].clone()
-    new_labels[zone_ids == 3] = -1
+    # [DISABLE-ZONE3] 关闭隔离以验证覆盖率假设: 原行 new_labels[zone_ids == 3] = -1
+    pass  # Zone III read 保留原簇标签, 不隔离成 -1, 防止簇被蚕食空
     print(f"   🔒 Zone III 标签隔离: {z3_count} reads → -1 (保留原始标签供 consensus 软参与)")
 
     if _probe: _probe.snapshot("after_zone3", new_labels)
@@ -604,6 +617,33 @@ def run_step2(args):
     # ══════════════════════════════════════════════════════════════
 
     new_labels_np = new_labels.cpu().numpy()  # 严格版: 训练/聚类评估/保存用
+
+    # [v21-SPLIT-INJECT] 簇内拆分引擎 (唯一的真实迭代机制)
+    # 在 new_labels_np 生成后、consensus 解码前, 对 new_labels_np 原地拆分。
+    # 默认关 (enable_split=False), 开启后净 +518 success(τ=5, spike 实测)。
+    if getattr(args, 'enable_split', False):
+        from models.cluster_split import split_clusters
+        from models.eval_reconstruction import levenshtein as _split_ed
+        _split_tau      = getattr(args, 'split_tau', 5)
+        _split_min_size = getattr(args, 'split_min_size', 6)
+        _split_ref_len  = getattr(args, 'ref_length', None) or 196
+        new_labels_np, _split_stats = split_clusters(
+            new_labels_np=new_labels_np,
+            flat_real_indices=flat_real_indices,
+            data_loader=data_loader,
+            levenshtein=_split_ed,
+            ref_length=_split_ref_len,
+            tau=_split_tau,
+            min_split_size=_split_min_size,
+            verbose=True,
+        )
+        try:
+            import torch as _torch
+            new_labels = _torch.from_numpy(new_labels_np).to(new_labels.device)
+            eval_labels = new_labels.clone()
+        except Exception as _e:
+            print(f"   ⚠️ 拆分后同步 eval_labels 失败(不影响训练轨): {_e}")
+
 
     from models.step2_decode import run_feddna_decode
     # 模型已在 model.cpu() 后，需要重新上 GPU

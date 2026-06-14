@@ -128,6 +128,16 @@ def main_loop():
                              'nearest (默认) = 无门限最近邻, '
                              'bounded = 用 delta*1.5 作门限, '
                              'off = 禁用 (v18 行为, 用于对照).')
+    # [v21-SPLIT-ARGS] 簇内拆分引擎开关(透传到 run_step2)
+    parser.add_argument('--enable_split', action='store_true', default=False,
+                        help='[v21] 开启簇内拆分(edit层次聚类二分+consensus门控). '
+                             '唯一的真实迭代机制. 默认关=当前行为.')
+    parser.add_argument('--split_tau', type=int, default=5,
+                        help='[v21] 拆分门控阈值: 两子簇consensus edit>=tau才拆. '
+                             'spike实测 tau=5 净+518, 在近似重复间距2之上留安全垫.')
+    parser.add_argument('--split_min_size', type=int, default=6,
+                        help='[v21] 簇read数<此值不尝试拆.')
+
     args = parser.parse_args()
 
     os.makedirs(os.path.join(args.experiment_dir, 'results'), exist_ok=True)
@@ -306,6 +316,10 @@ def main_loop():
             fasta_source=getattr(args, 'fasta_source', 'mv_strict'),
             zone_include_noise=getattr(args, 'zone_include_noise', True),
             rebirth_mode=getattr(args, 'rebirth_mode', 'nearest'),
+            # [v21-SPLIT-STEP2ARGS] 透传拆分开关到 run_step2
+            enable_split=getattr(args, 'enable_split', False),
+            split_tau=getattr(args, 'split_tau', 5),
+            split_min_size=getattr(args, 'split_min_size', 6),
         )
         results = run_step2(step2_args)
 
