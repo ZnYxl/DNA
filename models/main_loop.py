@@ -128,6 +128,12 @@ def main_loop():
                              'nearest (默认) = 无门限最近邻, '
                              'bounded = 用 delta*1.5 作门限, '
                              'off = 禁用 (v18 行为, 用于对照).')
+    # [v22-CLEANMODE-MAINLOOP] 大扫除总开关: 显式关闭所有已退役机制, 使拆分成为唯一改 label 的引擎
+    parser.add_argument('--clean_mode', action='store_true', default=False,
+                        help='[v22 大扫除] 关闭死数据复活/归巢/Rebirth 等已退役机制, '
+                             '使簇内拆分成为唯一改变 label 的迭代引擎. 用于消融: '
+                             '开启后 SR 应与默认行为一致, 证明其余机制零贡献.')
+
     # [v21-SPLIT-ARGS] 簇内拆分引擎开关(透传到 run_step2)
     parser.add_argument('--enable_split', action='store_true', default=False,
                         help='[v21] 开启簇内拆分(edit层次聚类二分+consensus门控). '
@@ -316,6 +322,9 @@ def main_loop():
             fasta_source=getattr(args, 'fasta_source', 'mv_strict'),
             zone_include_noise=getattr(args, 'zone_include_noise', True),
             rebirth_mode=getattr(args, 'rebirth_mode', 'nearest'),
+            # [v22-CLEANMODE-MAINLOOP] 透传大扫除总开关到 run_step2
+            clean_mode=getattr(args, 'clean_mode', False),
+
             # [v21-SPLIT-STEP2ARGS] 透传拆分开关到 run_step2
             enable_split=getattr(args, 'enable_split', False),
             split_tau=getattr(args, 'split_tau', 5),

@@ -440,6 +440,8 @@ def run_step2(args):
     # v19 在 Zone III 隔离之前, 给这批"已被 encoder 重新信任"的 -1 reads
     # 一次最近邻赋 label 的机会.
     _rebirth_mode = getattr(args, 'rebirth_mode', 'nearest')
+    if getattr(args, 'clean_mode', False):  # [v22-CLEANMODE-2] clean_mode 下强制关闭 Rebirth (复用 off 分支)
+        _rebirth_mode = 'off'
     if _rebirth_mode != 'off' and len(centroids) > 0:
         reborn_mask = (labels_tensor < 0) & ((zone_ids == 1) | (zone_ids == 2))
         n_candidates = int(reborn_mask.sum().item())
@@ -488,7 +490,7 @@ def run_step2(args):
     z3_original_labels = labels_tensor[z3_indices].clone()
     # [DISABLE-ZONE3] 关闭隔离以验证覆盖率假设: 原行 new_labels[zone_ids == 3] = -1
     pass  # Zone III read 保留原簇标签, 不隔离成 -1, 防止簇被蚕食空
-    print(f"   🔒 Zone III 标签隔离: {z3_count} reads → -1 (保留原始标签供 consensus 软参与)")
+    print(f"   🔓 Zone III 隔离已禁用 (终态): {z3_count} reads 保留原簇标签, 不隔离为 -1")  # [v22-CLEANMODE-3]
 
     if _probe: _probe.snapshot("after_zone3", new_labels)
 
@@ -498,7 +500,7 @@ def run_step2(args):
     noise_mask    = (new_labels == -1)
     noise_indices = torch.where(noise_mask)[0]
 
-    if len(noise_indices) > 0 and len(centroids) > 0:
+    if (not getattr(args, 'clean_mode', False)) and len(noise_indices) > 0 and len(centroids) > 0:  # [v22-CLEANMODE-1] 死数据复活
         print(f"\n   🧟 启动死数据复活判定: 候选 {len(noise_indices)} reads "
               f"(门限 delta={delta:.4f}, P50 中位数)")
         cids           = sorted(centroids.keys())
@@ -541,7 +543,7 @@ def run_step2(args):
     final_noise_mask = (eval_labels == -1)
     final_noise_indices = torch.where(final_noise_mask)[0]
 
-    if len(final_noise_indices) > 0 and len(centroids) > 0:
+    if (not getattr(args, 'clean_mode', False)) and len(final_noise_indices) > 0 and len(centroids) > 0:  # [v22-CLEANMODE-1] Zone III 归巢
         MIN_LARGE_SIZE = 10
         large_cids = [cid for cid, sz in cluster_sizes.items() if sz >= MIN_LARGE_SIZE]
         if len(large_cids) == 0:

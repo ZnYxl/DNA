@@ -250,26 +250,53 @@ def match_reads_to_gt(reads: list, seq_to_tag: dict, tag_to_ref: dict) -> np.nda
 
 
 def load_gt_refs_fasta(path: str) -> dict:
-    """从 FASTA 加载 GT references: {int_id: sequence}。"""
-    refs = {}
-    cur_id = None
-    cur_seq = []
+    # [GTREFS-BARESEQ] 自动兼容两种格式:
+    #   1. 标准 FASTA(含 '>' 头): 按头解析 ID
+    #   2. 裸序列(无 '>' 头, 每行一条序列): 行号(从1)当 ID
+    # eval 用序列做 key 对齐, ID 仅作标识, 故裸序列按行号编号不影响 SR/EER。
+    """从 FASTA 或裸序列文件加载 GT references: {int_id: sequence}。"""
+    # 先探测是否含 '>' 头
+    has_header = False
     with open(path) as f:
         for line in f:
-            line = line.strip()
-            if line.startswith('>'):
-                if cur_id is not None:
-                    refs[cur_id] = ''.join(cur_seq).upper()
-                try:
-                    cur_id = int(line[1:].split()[0])
-                except ValueError:
-                    cur_id = line[1:].strip()
-                cur_seq = []
-            elif line:
-                cur_seq.append(line)
-    if cur_id is not None:
-        refs[cur_id] = ''.join(cur_seq).upper()
-    print(f"   GT references: {len(refs):,}")
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith('>'):
+                has_header = True
+            break  # 只看第一条非空行
+
+    refs = {}
+    if has_header:
+        # ---- 标准 FASTA 解析(原逻辑) ----
+        cur_id = None
+        cur_seq = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('>'):
+                    if cur_id is not None:
+                        refs[cur_id] = ''.join(cur_seq).upper()
+                    try:
+                        cur_id = int(line[1:].split()[0])
+                    except ValueError:
+                        cur_id = line[1:].strip()
+                    cur_seq = []
+                elif line:
+                    cur_seq.append(line)
+        if cur_id is not None:
+            refs[cur_id] = ''.join(cur_seq).upper()
+        print(f"   GT references: {len(refs):,}  (FASTA 格式)")
+    else:
+        # ---- 裸序列解析: 每行一条, 行号(从1)当 ID ----
+        with open(path) as f:
+            idx = 1
+            for line in f:
+                seq = line.strip().upper()
+                if seq:
+                    refs[idx] = seq
+                    idx += 1
+        print(f"   GT references: {len(refs):,}  (裸序列格式, 行号当 ID)")
     return refs
 
 
@@ -578,6 +605,8 @@ def main():
                         help='输出 TSV 文件 (可选)')
     parser.add_argument('--skip_round0', action='store_true',
                         help='跳过 Round 0 (Clover MV baseline)')
+    parser.add_argument('--consensus_override', nargs='+', default=None,
+                        help='额外评估的 baseline consensus fasta(可多个), 复用 Clover labels, 同口径')
     args = parser.parse_args()
 
     exp_dir = args.experiment_dir
@@ -655,6 +684,19 @@ def main():
             all_results.append(r0)
         else:
             print(f"  ⚠️  找不到 ref.txt, 跳过 Round 0")
+
+    # Baseline consensus override (Iter/Div/BMA), 复用 Clover labels
+    if args.consensus_override:
+        c2g_bl, _ = build_cluster_to_gt(clover_labels, gt_ref_ids)
+        for bl_path in args.consensus_override:
+            import os as _os
+            tag = _os.path.basename(bl_path).replace('consensus_','').replace('.fasta','')
+            print(f"\n  📦 Baseline: {tag}")
+            print(f"     Consensus: {bl_path}")
+            bl_cons = parse_consensus_fasta(bl_path)
+            print(f"     Consensus 簇数: {len(bl_cons):,}")
+            r_bl = evaluate_reconstruction(bl_cons, c2g_bl, gt_refs, name=f'BL:{tag}')
+            all_results.append(r_bl)
 
     # Round 1, 2, 3, ...
     discovered = discover_rounds(exp_dir)
