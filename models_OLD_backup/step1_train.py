@@ -1,0 +1,489 @@
+# models/step1_train.py
+"""
+Step1 训练主程 (Universal Edition)
+
+修复清单:
+  [FIX-P0]  训练前预计算 consensus_dict (majority vote / 从 Step2 加载)
+  [FIX-P0]  训练循环: 从 batch_data 取 consensus_target，传给 model.forward
+  [FIX-P0]  Round 2+: 读取 cluster_change_info，传给 Step1Dataset 实现簇级采样
+  [FIX-#7]  epoch 数量: R1=10, R2+=5 (与实际测试一致)
+  [FIX-#6]  Visualizer args 安全获取 (getattr)
+  [NEW]     training_cap / round_idx 传递给 Dataset
+  [FIX-G1]  超参改为 getattr，支持外部命令行传参覆盖
+  [FIX-G3]  forward 传入 round_idx，修复 Round2+ KL Loss 全为0 的问题
+  [FIX-KEY] consensus_dict 加载后强制 int key，防止 str/int 类型不匹配静默失效
+  [G老师-陷阱1] optimizer 传入 trainable_params 而非 model.parameters()
+               原来全量传入导致 AdamW 为冻结 Encoder 分配 Momentum/Variance 矩阵，
+               显存节省完全落空；修复后 Round2+ 节省约 80% optimizer 显存
+  [G老师-陷阱2] model.train() 后立即 model.encoder.eval()（Round 2+）
+               原来 model.train() 递归覆盖冻结 Encoder，导致：
+               - BatchNorm running_mean/var 被当前 batch 污染
+               - Dropout 随机丢弃特征，引起特征提取不稳定
+               修复后锁定统计量，特征提取绝对稳定
+"""
+import torch
+import torch.optim as optim
+import argparse
+import os
+import sys
+import time
+from datetime import datetime
+import numpy as np
+from collections import defaultdict
+from typing import Dict, Optional
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir  = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+from models.step1_model import Step1EvidentialModel, load_pretrained_feddna, masked_bayes_risk
+from models.step1_data  import CloverDataLoader, Step1Dataset, create_dynamic_sampler, seq_to_onehot
+from models.step1_visualizer import Step1Visualizer
+
+
+# ---------------------------------------------------------------------------
+# Hot Start 超参默认值（可通过 args 从 main_loop.py 外部覆盖）
+# ---------------------------------------------------------------------------
+_DEFAULT_ROUND1_EPOCHS = 10
+_DEFAULT_ROUND1_LR     = 1e-4
+_DEFAULT_ROUND2_EPOCHS = 10   # [v4] 从5增加到10，解决R2/R3不收敛
+_DEFAULT_ROUND2_LR     = 5e-5  # [v4] Decoder lr，Encoder 用 5e-6 差异化
+
+
+class ListBatchSampler:
+    def __init__(self, batches):
+        self.batches = batches
+    def __iter__(self):
+        return iter(self.batches)
+    def __len__(self):
+        return len(self.batches)
+
+
+def train_step1(args):
+    """步骤一训练主函数"""
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    print(f"🖥️ 使用设备: {device}")
+
+    round_idx    = getattr(args, 'round_idx', 1)
+    prev_state   = getattr(args, 'prev_state', None)
+    training_cap = getattr(args, 'training_cap', 2000000)
+
+    # =====================================================================
+    # 1. 加载数据
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("📂 数据加载")
+    print("=" * 60)
+
+    labels_path = getattr(args, 'refined_labels', None)
+    data_loader = CloverDataLoader(args.experiment_dir, labels_path=labels_path)
+
+    # =====================================================================
+    # 2. [FIX-P0] 计算或加载 consensus_dict
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("🧬 Consensus 计算")
+    print("=" * 60)
+
+    consensus_path = getattr(args, 'consensus_path', None)
+    consensus_dict: Dict[int, torch.Tensor] = {}
+
+    if consensus_path and os.path.exists(consensus_path):
+        # Round 2+: 从 Step 2 输出加载（strength 加权 consensus）
+        print(f"   📂 加载 consensus from: {consensus_path}")
+        consensus_dict = torch.load(consensus_path, map_location='cpu')
+        consensus_dict = {int(k): v for k, v in consensus_dict.items()}  # [FIX-KEY] 强制int key
+        print(f"   ✅ 加载 {len(consensus_dict)} 个簇的 consensus")
+    else:
+        # Round 1: 直接从 ref.txt 读（预处理脚本已做 Clover majority vote）
+        # data_loader.ref_seqs = {cluster_id: ref_seq_str}，在 _load_all_data 里加载
+        print(f"   📖 Round {round_idx}: 从 ref.txt 构建 consensus_dict ...")
+        if not data_loader.ref_seqs:
+            raise RuntimeError(
+                "ref.txt 未加载！请检查 CloverDataLoader._load_all_data 是否正确读取 ref.txt"
+            )
+        for cid, seq in data_loader.ref_seqs.items():
+            consensus_dict[cid] = seq_to_onehot(seq, args.max_length)  # (L, 4)
+        print(f"   ✅ consensus_dict: {len(consensus_dict)} 个簇")
+
+    # =====================================================================
+    # 3. [FIX-P0] 读取 cluster_change_info（Round 2+ 簇级采样依据）
+    # =====================================================================
+    cluster_change_info = getattr(args, 'cluster_change_info', None)
+    if cluster_change_info is not None:
+        hard_count = sum(1 for v in cluster_change_info.values() if v >= 0.05)
+        easy_count = len(cluster_change_info) - hard_count
+        print(f"   📊 cluster_change_info: 困难簇={hard_count}, 完美簇={easy_count}")
+
+    # =====================================================================
+    # 4. 创建 Dataset（携带 consensus_dict + cluster_change_info）
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("📦 Dataset 创建")
+    print("=" * 60)
+
+    dataset = Step1Dataset(
+        data_loader,
+        max_len=args.max_length,
+        training_cap=training_cap,
+        inference_mode=False,
+        round_idx=round_idx,
+        consensus_dict=consensus_dict,              # [FIX-P0]
+        cluster_change_info=cluster_change_info,    # [FIX-P0]
+        cv_threshold=getattr(args, 'cv_threshold', 0.3),  # 困难簇 CV 阈值，默认0.3可调
+        max_reads_per_cluster=getattr(args, 'max_reads_per_cluster', 30),  # 与 FedDNA 对齐，每簇最多30条
+    )
+
+    # =====================================================================
+    # 5. 创建模型
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("🧠 模型创建")
+    print("=" * 60)
+
+    num_clover_clusters = len(set(l for l in data_loader.clover_labels if l >= 0))
+    num_gt_clusters = len(getattr(data_loader, 'gt_cluster_seqs', {}))
+    num_clusters    = max(num_clover_clusters, num_gt_clusters, args.min_clusters)
+
+    model = Step1EvidentialModel(
+        dim=args.dim,
+        max_length=args.max_length,
+        num_clusters=num_clusters,
+        device=str(device),
+        cl_mode=getattr(args, 'cl_mode', 'ours'),   # 消融实验 flag
+    ).to(device)
+
+    print(f"   模型参数: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"   当前簇数: {num_clover_clusters}")
+    print(f"   对比学习模式: {getattr(args, 'cl_mode', 'ours')}")
+
+    # =====================================================================
+    # 6. Hot Start 权重加载
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print(f"🔋 Hot Start (Round {round_idx})")
+    print("=" * 60)
+
+    if round_idx <= 1:
+        feddna_ckpt = getattr(args, 'feddna_checkpoint', None)
+        if feddna_ckpt and os.path.exists(feddna_ckpt):
+            model = load_pretrained_feddna(model, feddna_ckpt, device,
+                                           max_length=args.max_length)
+        else:
+            print(f"   ⚠️ 未找到预训练权重，使用随机初始化")
+    else:
+        prev_ckpt = getattr(args, 'prev_checkpoint', None)
+        if prev_ckpt and os.path.exists(prev_ckpt):
+            try:
+                import torch.nn as nn_
+                ckpt = torch.load(prev_ckpt, map_location=device)
+                sd   = ckpt.get('model_state_dict', ckpt)
+
+                if 'length_adapter.weight' in sd:
+                    sh = sd['length_adapter.weight'].shape
+                    # [致命缺陷2修复] 必须检查输入和输出两个维度都匹配。
+                    # 原来只查 sh[0](输出) == max_length，如果 checkpoint 来自
+                    # FedDNA 且 noise_length != label_length（如 155→150），
+                    # 会创建 nn.Linear(155, 150)，但 encoder 输出长度是 150，
+                    # 导致 PyTorch matmul 维度不匹配 crash。
+                    if sh[1] == args.max_length and sh[0] == args.max_length:
+                        model.length_adapter = nn_.Linear(sh[1], sh[0]).to(device)
+                        print(f"   🔧 预初始化 length_adapter: Linear({sh[1]}, {sh[0]})")
+                    elif sh[1] != args.max_length or sh[0] != args.max_length:
+                        print(f"   ⚠️ checkpoint 的 length_adapter 维度 {sh} "
+                              f"与 max_length={args.max_length} 不兼容，已跳过")
+
+                model.load_state_dict(sd, strict=False)
+                print(f"   ✅ 加载上一轮权重成功")
+
+                # [FREEZE-ENC] Round 2+: 冻结 Encoder，只微调 Decoder + 投影头
+                # 原因: Encoder 在 Round 1 已收敛，轮间 Strength 崩塌的主因是
+                #       Encoder 参数被新的 consensus 目标剧烈扰动
+                # [v4] 不再冻结 Encoder，改用差异化学习率（Encoder 5e-6, Decoder 5e-5）
+                # 原来冻结 Encoder 导致 R2/R3 训练完全不收敛（Loss/Margin 5个epoch纹丝不动）
+                total_params = sum(p.numel() for p in model.parameters())
+                enc_params = sum(p.numel() for p in model.encoder.parameters())
+                print(f"   🔓 [v4] Encoder 已解冻 (差异化学习率)")
+                print(f"   📊 总参数: {total_params:,}, Encoder: {enc_params:,}, Decoder: {total_params - enc_params:,}")
+            except Exception as e:
+                print(f"   ⚠️ 加载失败: {e}，使用随机初始化")
+        else:
+            print(f"   ⚠️ 无上一轮 checkpoint，随机初始化")
+
+    # =====================================================================
+    # 7. 优化器 + 调度器
+    # =====================================================================
+    epochs = getattr(args, 'round1_epochs', _DEFAULT_ROUND1_EPOCHS) if round_idx <= 1 else getattr(args, 'round2_epochs', _DEFAULT_ROUND2_EPOCHS)
+    lr     = getattr(args, 'round1_lr',     _DEFAULT_ROUND1_LR)     if round_idx <= 1 else getattr(args, 'round2_lr',     _DEFAULT_ROUND2_LR)
+
+    print(f"\n   📐 训练超参: epochs={epochs}, lr={lr}")
+
+    # [v4] 差异化学习率：Encoder 用极小 lr 微调，Decoder 用正常 lr 适应新 consensus
+    if round_idx <= 1:
+        # Round 1: 全部用同一个 lr
+        trainable_params = list(model.parameters())
+        optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
+    else:
+        # Round 2+: Encoder 5e-6, Decoder 5e-5
+        encoder_params = list(model.encoder.parameters())
+        decoder_params = [p for n, p in model.named_parameters() if 'encoder' not in n]
+        enc_lr = 5e-6
+        dec_lr = lr  # 即 _DEFAULT_ROUND2_LR = 5e-5
+        trainable_params = encoder_params + decoder_params  # 用于 clip_grad_norm
+        optimizer = optim.AdamW([
+            {'params': encoder_params, 'lr': enc_lr},
+            {'params': decoder_params, 'lr': dec_lr},
+        ], weight_decay=args.weight_decay)
+        print(f"   📐 差异化学习率: Encoder={enc_lr}, Decoder={dec_lr}")
+    scheduler  = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    # =====================================================================
+    # 8. 训练循环
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("🚀 开始训练")
+    print("=" * 60)
+
+    model.train()
+
+    # [v4] Encoder 已解冻，全部子模块均为 train 模式
+    # BatchNorm 会更新统计量，Dropout 正常启用
+    # 这是差异化学习率方案的正确配置
+
+    training_history = {
+        'total_loss': [], 'avg_strength': [], 'high_conf_ratio': [],
+        'contrastive_loss': [], 'reconstruction_loss': [], 'kl_loss': [],
+        'u_epi_mean': [], 'u_ale_mean': [], 'queue_count': []
+    }
+
+    for epoch in range(epochs):
+        start_time = time.time()
+
+        batch_indices_list = create_dynamic_sampler(
+            dataset,
+            batch_size=args.batch_size,
+            max_clusters_per_batch=args.max_clusters_per_batch,
+            state_path=prev_state,
+            round_idx=round_idx
+        )
+
+        batch_sampler = ListBatchSampler(batch_indices_list)
+        train_loader  = torch.utils.data.DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=4,
+            pin_memory=True
+        )
+
+        epoch_loss  = epoch_con = epoch_rec = epoch_kl = 0
+        epoch_str   = epoch_hc = epoch_u_epi = epoch_u_ale = epoch_qc = 0
+        epoch_w_cc = epoch_w_da = epoch_cos_pos = epoch_cos_neg = 0
+        epoch_w_cc_cnt = epoch_w_da_cnt = epoch_cos_pos_cnt = epoch_cos_neg_cnt = 0
+        num_batches = 0
+        total_batches = len(batch_indices_list)
+
+        print(f"\n🔄 Epoch {epoch + 1}/{epochs} (共 {total_batches} Batches)")
+
+        for i, batch_data in enumerate(train_loader):
+            reads_batch      = batch_data['encoding'].to(device)
+            labels_batch     = batch_data['clover_label'].to(device)
+            # [FIX-P0] 从 dataset 取 consensus_target 并送到 GPU
+            consensus_batch  = batch_data['consensus_target'].to(device)
+
+            # [FIX-P0] 传入 consensus_target
+            loss_dict, outputs = model(reads_batch, labels_batch, consensus_batch, epoch=epoch, round_idx=round_idx)
+
+            optimizer.zero_grad()
+            loss_dict['total'].backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            optimizer.step()
+
+            epoch_loss  += loss_dict['total'].item()
+            epoch_con   += loss_dict['contrastive'].item()
+            epoch_rec   += loss_dict['reconstruction'].item()
+            epoch_kl    += loss_dict['kl_divergence'].item()
+            epoch_str   += outputs['avg_strength']
+            epoch_hc    += outputs['high_conf_ratio']
+            epoch_u_epi += outputs.get('u_epi_mean', 0.0)
+            epoch_u_ale += outputs.get('u_ale_mean', 0.0)
+            epoch_qc    += outputs.get('queue_count', 0)
+
+            # [FIX-Bug#4] 四个探针独立累积，避免 nan 交叉污染
+            wcc = outputs.get('w_clean_clean', float('nan'))
+            wda = outputs.get('w_dirty_any',   float('nan'))
+            cp  = outputs.get('cos_sim_pos',   float('nan'))
+            cn  = outputs.get('cos_sim_neg',   float('nan'))
+            if wcc == wcc: epoch_w_cc += wcc; epoch_w_cc_cnt += 1
+            if wda == wda: epoch_w_da += wda; epoch_w_da_cnt += 1
+            if cp == cp:   epoch_cos_pos += cp; epoch_cos_pos_cnt += 1
+            if cn == cn:   epoch_cos_neg += cn; epoch_cos_neg_cnt += 1
+
+            num_batches += 1
+
+            if (i + 1) % 50 == 0:
+                print(f"   [Batch {i+1}/{total_batches}] "
+                      f"Loss: {loss_dict['total'].item():.4f} | "
+                      f"Str: {outputs['avg_strength']:.1f} | "
+                      f"U_epi: {outputs.get('u_epi_mean',0):.4f}",
+                      end='\r')
+
+        scheduler.step()
+        epoch_time = time.time() - start_time
+        avg = lambda x: x / max(num_batches, 1)
+
+        training_history['total_loss'].append(avg(epoch_loss))
+        training_history['contrastive_loss'].append(avg(epoch_con))
+        training_history['reconstruction_loss'].append(avg(epoch_rec))
+        training_history['kl_loss'].append(avg(epoch_kl))
+        training_history['avg_strength'].append(avg(epoch_str))
+        training_history['high_conf_ratio'].append(avg(epoch_hc))
+        training_history['u_epi_mean'].append(avg(epoch_u_epi))
+        training_history['u_ale_mean'].append(avg(epoch_u_ale))
+        training_history['queue_count'].append(avg(epoch_qc))
+
+        print(f"\n   ✅ Epoch {epoch+1} ({epoch_time:.1f}s) | "
+              f"Loss: {avg(epoch_loss):.4f} | Str: {avg(epoch_str):.1f} | "
+              f"Recon: {avg(epoch_rec):.4f} | U_epi: {avg(epoch_u_epi):.4f}")
+
+        # [FIX-Bug#4] 四个探针独立汇报
+        avg_wcc = epoch_w_cc / max(epoch_w_cc_cnt, 1)
+        avg_wda = epoch_w_da / max(epoch_w_da_cnt, 1)
+        avg_cp  = epoch_cos_pos / max(epoch_cos_pos_cnt, 1)
+        avg_cn  = epoch_cos_neg / max(epoch_cos_neg_cnt, 1)
+        wcc_s = f"{avg_wcc:.4f}" if epoch_w_cc_cnt > 0 else "nan"
+        wda_s = f"{avg_wda:.4f}" if epoch_w_da_cnt > 0 else "nan"
+        cp_s  = f"{avg_cp:.4f}"  if epoch_cos_pos_cnt > 0 else "nan"
+        cn_s  = f"{avg_cn:.4f}"  if epoch_cos_neg_cnt > 0 else "nan"
+        if epoch_w_cc_cnt > 0 or epoch_w_da_cnt > 0:
+            ratio_s = f"{avg_wcc / max(avg_wda, 1e-6):.1f}x" if epoch_w_da_cnt > 0 else "nan"
+            print(f"   🔬 探针 A | w(干净-干净): {wcc_s}  "
+                  f"w(含脏-任意): {wda_s}  比值: {ratio_s}")
+        if epoch_cos_pos_cnt > 0 or epoch_cos_neg_cnt > 0:
+            margin_s = f"{avg_cp - avg_cn:.4f}" if (epoch_cos_pos_cnt > 0 and epoch_cos_neg_cnt > 0) else "nan"
+            print(f"   🔬 探针 B | cos_pos: {cp_s}  cos_neg: {cn_s}  margin: {margin_s}")
+
+    # =====================================================================
+    # 8.5 Calibration Phase: rnnblock 校准
+    # =====================================================================
+    # 原理: 对比训练把 encoder 特征空间彻底重组 (cos_neg 0.98→0.04),
+    # rnnblock 来不及完全适应最终特征空间。冻结 encoder, 只用 recon_loss
+    # 微调 rnnblock, 让它在静止空间里专心学解码。
+    # 类似 SimCLR/MoCo 做完预训练后 fine-tune linear probe 的标准做法。
+    calib_epochs = getattr(args, 'calib_epochs', 3)
+    calib_lr     = getattr(args, 'calib_lr', 2e-5)
+
+    if calib_epochs > 0:
+        print("\n" + "=" * 60)
+        print(f"🎯 Calibration Phase: rnnblock 校准 ({calib_epochs} epochs, lr={calib_lr})")
+        print("=" * 60)
+
+        # ── 冻结 Encoder + Length Adapter ──
+        for p in model.encoder.parameters():
+            p.requires_grad = False
+        if model.length_adapter is not None:
+            for p in model.length_adapter.parameters():
+                p.requires_grad = False
+
+        # ── 确保 rnnblock 可训练 ──
+        calib_params = list(model.rnnblock.parameters())
+        for p in calib_params:
+            p.requires_grad = True
+
+        trainable_count = sum(p.numel() for p in calib_params if p.requires_grad)
+        frozen_count    = sum(p.numel() for p in model.parameters()) - trainable_count
+        print(f"   🔒 冻结: {frozen_count:,} 参数 (Encoder + Length Adapter)")
+        print(f"   🔓 可训练: {trainable_count:,} 参数 (RNNBlock)")
+
+        # ── 全新 optimizer (丢弃主训练阶段的动量污染) ──
+        calib_optimizer = optim.AdamW(calib_params, lr=calib_lr, weight_decay=1e-4)
+
+        model.train()
+        model.encoder.eval()  # BN 统计量不动, Dropout 关闭
+
+        for calib_epoch in range(calib_epochs):
+            calib_start = time.time()
+
+            # 复用主训练的动态采样器
+            calib_batches = create_dynamic_sampler(
+                dataset,
+                batch_size=args.batch_size,
+                max_clusters_per_batch=args.max_clusters_per_batch,
+                state_path=prev_state,
+                round_idx=round_idx
+            )
+            calib_sampler = ListBatchSampler(calib_batches)
+            calib_loader  = torch.utils.data.DataLoader(
+                dataset,
+                batch_sampler=calib_sampler,
+                num_workers=4,
+                pin_memory=True
+            )
+
+            calib_loss_sum = 0
+            calib_str_sum  = 0
+            calib_n        = 0
+
+            for i, batch_data in enumerate(calib_loader):
+                reads_batch     = batch_data['encoding'].to(device)
+                consensus_batch = batch_data['consensus_target'].to(device)
+
+                # ── 只走 encoder → decoder → recon_loss ──
+                embeddings, _ = model.encode_reads(reads_batch)
+                evidence, strength, alpha = model.decode_to_evidence(embeddings)
+
+                recon_loss = masked_bayes_risk(evidence, consensus_batch)
+
+                calib_optimizer.zero_grad()
+                recon_loss.backward()
+                torch.nn.utils.clip_grad_norm_(calib_params, max_norm=1.0)
+                calib_optimizer.step()
+
+                calib_loss_sum += recon_loss.item()
+                calib_str_sum  += strength.mean().item()
+                calib_n        += 1
+
+                if (i + 1) % 100 == 0:
+                    print(f"   [Calib Batch {i+1}/{len(calib_batches)}] "
+                          f"Recon: {recon_loss.item():.4f} | "
+                          f"Str: {strength.mean().item():.1f}", end='\r')
+
+            calib_time = time.time() - calib_start
+            avg_loss = calib_loss_sum / max(calib_n, 1)
+            avg_str  = calib_str_sum / max(calib_n, 1)
+            print(f"\n   ✅ Calib Epoch {calib_epoch+1}/{calib_epochs} ({calib_time:.1f}s) | "
+                  f"Recon: {avg_loss:.4f} | Str: {avg_str:.1f}")
+
+        # ── 恢复全部参数为可训练状态 (不影响后续保存) ──
+        for p in model.parameters():
+            p.requires_grad = True
+
+        print(f"   🎯 Calibration 完成")
+
+    # =====================================================================
+    # 9. 保存 checkpoint
+    # =====================================================================
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    models_dir = os.path.join(output_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+
+    checkpoint_path = os.path.join(models_dir, "step1_final_model.pth")
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'args': vars(args),
+        'training_history': training_history,
+        'round_idx': round_idx,
+    }, checkpoint_path)
+    print(f"\n💾 Checkpoint 保存: {checkpoint_path}")
+
+    # 可视化
+    try:
+        viz = Step1Visualizer(output_dir)
+        viz.plot_training_losses(training_history)
+        viz.plot_evidence_stats(training_history)
+        viz.save_config(args)
+    except Exception as e:
+        print(f"   ⚠️ 可视化跳过: {e}")
+
+    return checkpoint_path

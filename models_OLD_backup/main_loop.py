@@ -2,10 +2,29 @@
 """
 SSI-EC 主循环控制
 
-迭代流程: 每轮 Step1 (evidential 训练) → Step2 (簇内拆分 + consensus),
-consensus 与 refined labels 喂回下一轮。共 max_iterations 轮。
+修复清单:
+  [FIX-P0]  在 Round 间传递 consensus_path 和 cluster_change_info
+             - step1_args 新增 consensus_path, cluster_change_info
+             - 从 results['next_round_files'] 提取两个新键
+  [v2]      断点续跑支持
+  [v2]      收敛性追踪
 
-支持断点续跑 (按文件修改时间排序定位最新产物) 与收敛性追踪 (标签变化率)。
+G老师审查修复清单:
+  [G老师-Bug1-FIX] 断点续跑时 Step1 未被真正跳过
+    原来：break 前没有设置 args.skip_step1_round，注释说"会被跳过"但条件永远为 False，
+          重启程序后 Step1 照常执行，checkpoint 被覆盖。
+    修复：检测到 Step1 完成 Step2 未跑时，自动执行
+          args.skip_step1_round = check_round，强制触发跳过逻辑。
+
+  [G老师-Bug2-FIX] 跨天运行时文件排序错乱（Time Bomb）
+    原来：sorted() 字典序排序，时间戳格式 "%H%M%S" 跨天后
+          001000 < 235500，断点续跑拿到旧文件，EM 迭代回滚。
+    修复：改用 key=os.path.getmtime 按实际修改时间排序。
+
+  [G老师-Bug3-FIX] 断点续跑路径的异常静默吞掉
+    原来：except Exception: current_cluster_change_info = None，
+          文件损坏时无任何提示，Curriculum Learning 悄悄失效。
+    修复：except Exception as e: print(...)，日志留下痕迹。
 """
 import argparse
 import os
@@ -24,7 +43,7 @@ from models.step2_runner import run_step2
 
 
 def compute_label_change_rate(prev_labels_path, curr_labels_path):
-    """计算两轮间的标签变化率 (收敛性指标)。"""
+    """计算两轮间的标签变化率"""
     if prev_labels_path is None or not os.path.exists(prev_labels_path):
         return None
     if not os.path.exists(curr_labels_path):
@@ -68,21 +87,62 @@ def main_loop():
                         help='对比学习消融模式: standard=标准InfoNCE, ale_only=只用U_ale, '
                              'epi_only=只用U_epi, ours=完整设计(默认)')
     parser.add_argument('--max_reads_per_cluster', type=int, default=30,
-                        help='训练时每簇最多采样的 reads 数 (与 FedDNA 一致, 建议 30)。'
-                             '仅影响 Step1 训练, 不影响 Step2 推理 (全量)。')
+                        help='训练时每簇最多采样的 reads 数，0=不限制。'
+                             '与 FedDNA 训练设计一致（FedDNA 用 5-30），'
+                             '建议 30（与feddna保持一致）。'
+                             '仅影响 Step1 训练，不影响 Step2 推理（全量）。')
     parser.add_argument('--target_clusters', type=int, default=None,
-                        help='最终目标簇数 (先验约束, 可选)。')
+                        help='最终目标簇数（先验约束）。系统会自动做课程合并：'
+                             'Round 1 目标 = (初始簇数+target)/2，'
+                             'Round 2 目标 = (Round1结果+target)/2，'
+                             '最后一轮直达 target。不设则无限制。')
     parser.add_argument('--primer_prefix', type=int, default=0,
-                        help='前端引物长度 (bp)。Seq_1D 设 20')
+                        help='前端引物长度 (bp)，Jaccard 校验时截掉。Seq_1D 设 20')
     parser.add_argument('--primer_suffix', type=int, default=0,
-                        help='后端引物长度 (bp)。Seq_1D 设 20')
+                        help='后端引物长度 (bp)，Jaccard 校验时截掉。Seq_1D 设 20')
     parser.add_argument('--ref_length', type=int, default=None,
-                        help='参考序列长度 (bp), consensus 截断用。Seq_1D 设 196')
-    # 簇内拆分引擎参数 (唯一迭代机制)
+                        help='[v5] 参考序列长度 (bp)，decode 截断用。Seq_1D 设 196')
+    parser.add_argument('--disable_merge', action='store_true', default=False,
+                        help='[v2] 跳过 MNN 合并 (打薄数据推荐开启)')
+    parser.add_argument('--freeze_consensus', action='store_true', default=False,
+                        help='[实验2] 所有轮次的 Step1 训练目标始终用 ref.txt，'
+                             '不用上一轮 Step2 产出的 consensus。用于诊断 B 层毒化。')
+    parser.add_argument('--consensus_source', type=str, default='mv',
+                        choices=['mv', 'fusion'],
+                        help='[v16 路径B] Round 2+ 训练靶子来源. '
+                             'mv (默认) = majority vote (打破 encoder 自污染), '
+                             'fusion = evidence fusion (v15 行为, 用于对照).')
+    parser.add_argument('--fasta_source', type=str, default='mv_strict',
+                        choices=['mv_strict', 'fusion_eval'],
+                        help='[v17 FASTA 纯净轨道] 导出 FASTA 的 consensus 来源. '
+                             'mv_strict (默认) = MV on 严格 labels (零 backfill 污染), '
+                             'fusion_eval = fusion on 归巢 labels (v16 行为, 用于对照).')
+    parser.add_argument('--zone_include_noise', type=lambda x: str(x).lower() == 'true',
+                        default=True,
+                        help='[v18 Zone 全量判定] 让 label=-1 reads 也参与 Zone 判定. '
+                             'True (默认) = 全量 (打破 -1 单向流失), '
+                             'False = 仅 label>=0 (v17 行为, 用于对照).')
+    parser.add_argument('--rebirth_mode', type=str, default='nearest',
+                        choices=['off', 'nearest', 'bounded'],
+                        help='[v19 Rebirth] -1 reads 在 Zone I/II 重获 label 的方式. '
+                             'nearest (默认) = 无门限最近邻, '
+                             'bounded = 用 delta*1.5 作门限, '
+                             'off = 禁用 (v18 行为, 用于对照).')
+    # [v22-CLEANMODE-MAINLOOP] 大扫除总开关: 显式关闭所有已退役机制, 使拆分成为唯一改 label 的引擎
+    parser.add_argument('--clean_mode', action='store_true', default=False,
+                        help='[v22 大扫除] 关闭死数据复活/归巢/Rebirth 等已退役机制, '
+                             '使簇内拆分成为唯一改变 label 的迭代引擎. 用于消融: '
+                             '开启后 SR 应与默认行为一致, 证明其余机制零贡献.')
+
+    # [v21-SPLIT-ARGS] 簇内拆分引擎开关(透传到 run_step2)
+    parser.add_argument('--enable_split', action='store_true', default=False,
+                        help='[v21] 开启簇内拆分(edit层次聚类二分+consensus门控). '
+                             '唯一的真实迭代机制. 默认关=当前行为.')
     parser.add_argument('--split_tau', type=int, default=5,
-                        help='拆分门控阈值: 两子簇 consensus edit >= tau 才拆。')
+                        help='[v21] 拆分门控阈值: 两子簇consensus edit>=tau才拆. '
+                             'spike实测 tau=5 净+518, 在近似重复间距2之上留安全垫.')
     parser.add_argument('--split_min_size', type=int, default=6,
-                        help='簇 read 数 < 此值不尝试拆。')
+                        help='[v21] 簇read数<此值不尝试拆.')
 
     args = parser.parse_args()
 
@@ -94,11 +154,12 @@ def main_loop():
     results_dir = os.path.join(args.experiment_dir, 'results')
     labels_dir  = os.path.join(args.experiment_dir, '04_Iterative_Labels')
 
-    current_checkpoint_path     = None
-    current_labels_path         = None
-    current_state_path          = None
-    current_consensus_path      = None
-    current_cluster_change_info = None
+    current_checkpoint_path    = None
+    current_labels_path        = None
+    current_state_path         = None
+    current_centroids_path     = None
+    current_consensus_path     = None        # [FIX-P0] 新增
+    current_cluster_change_info = None       # [FIX-P0] 新增（内存中的 dict，不是路径）
     start_iteration = 1
 
     if os.path.exists(results_dir):
@@ -108,24 +169,34 @@ def main_loop():
 
             ckpt_path = os.path.join(step1_dir, "models", "step1_final_model.pth")
             if not os.path.exists(ckpt_path):
+                # 兼容旧路径格式
                 ckpt_path = os.path.join(step1_dir, "step1_final_model.pth")
                 if not os.path.exists(ckpt_path):
                     break
 
             if not os.path.exists(step2_dir):
-                # step1 完成但 step2 未跑: 强制跳过该轮 step1, 直接续跑 step2
+                # step1 完成但 step2 未跑（典型：中断后重跑场景）
                 current_checkpoint_path = ckpt_path
                 start_iteration = check_round
+                # [G老师-Bug1-FIX] 原注释写"step1 会被 skip_step1_round 跳过"，
+                # 但 args.skip_step1_round 默认值是 0，不加命令行参数时
+                # 条件 args.skip_step1_round == check_round 永远 False，
+                # Step1 照常执行，辛苦跑好的 checkpoint 被无声覆盖。
+                # 修复：断点续跑检测到此情况时直接修改 args，强制触发跳过逻辑。
                 args.skip_step1_round = check_round
                 print(f"   ✅ 检测到 Round {check_round} Step1 已完成，Step2 未跑")
                 print(f"   ⚡ 自动设置 skip_step1_round={check_round}，将直接运行 Step2")
                 break
 
-            # 按文件修改时间排序 (避免 %H%M%S 跨天字典序错乱)
-            label_files     = sorted(glob.glob(os.path.join(labels_dir, "refined_labels_*.txt")),     key=os.path.getmtime)
-            state_files     = sorted(glob.glob(os.path.join(labels_dir, "read_state_*.pt")),          key=os.path.getmtime)
-            consensus_files = sorted(glob.glob(os.path.join(labels_dir, "consensus_dict_*.pt")),      key=os.path.getmtime)
-            change_files    = sorted(glob.glob(os.path.join(labels_dir, "cluster_change_info_*.pt")), key=os.path.getmtime)
+            # [G老师-Bug2-FIX] 原来用 sorted() 字典序排序，但时间戳格式是 "%H%M%S"
+            # （只有时分秒，无日期）。跨天运行时 001000 < 235500，导致断点续跑
+            # 拿到的是上一轮的旧文件，EM 迭代回滚。
+            # 修复：改用 os.path.getmtime 按文件实际修改时间排序，与文件名无关。
+            label_files    = sorted(glob.glob(os.path.join(labels_dir, "refined_labels_*.txt")),    key=os.path.getmtime)
+            state_files    = sorted(glob.glob(os.path.join(labels_dir, "read_state_*.pt")),         key=os.path.getmtime)
+            centroid_files = sorted(glob.glob(os.path.join(labels_dir, "centroids_*.pt")),          key=os.path.getmtime)
+            consensus_files= sorted(glob.glob(os.path.join(labels_dir, "consensus_dict_*.pt")),     key=os.path.getmtime)
+            change_files   = sorted(glob.glob(os.path.join(labels_dir, "cluster_change_info_*.pt")),key=os.path.getmtime)
 
             if not label_files:
                 break
@@ -133,11 +204,18 @@ def main_loop():
             current_checkpoint_path = ckpt_path
             current_labels_path     = label_files[-1]
             current_state_path      = state_files[-1] if state_files else None
-            current_consensus_path  = consensus_files[-1] if consensus_files else None
+            current_centroids_path  = centroid_files[-1] if centroid_files else None
+
+            # [FIX-P0] 加载 consensus_path 和 cluster_change_info
+            if consensus_files and not getattr(args, 'freeze_consensus', False):
+                current_consensus_path = consensus_files[-1]
             if change_files:
                 try:
                     current_cluster_change_info = torch.load(change_files[-1], map_location='cpu')
                 except Exception as e:
+                    # [G老师-Bug3-FIX] 原来静默吞掉异常，文件损坏时程序不报错，
+                    # 悄悄回退到全量采样，破坏 Curriculum Learning 策略。
+                    # 修复：至少打印异常，让日志留下痕迹。
                     print(f"   ⚠️ 加载 cluster_change_info 失败 ({e})，将回退到无难度采样模式")
                     current_cluster_change_info = None
 
@@ -155,19 +233,21 @@ def main_loop():
 
     convergence_log = []
 
-    print(f"🚀 SSI-EC 闭环迭代启动")
+    print(f"🚀 SSI-EC 闭环迭代启动 (v2)")
     print(f"📂 实验目录: {args.experiment_dir}")
     print(f"📏 序列长度: {args.max_length} bp")
     print(f"🔁 迭代轮数: {args.max_iterations}")
     print(f"🔋 预训练:   {os.path.basename(args.feddna_checkpoint)}")
     if args.gt_tags_file:
         print(f"📋 GT 评估:  {os.path.basename(args.gt_tags_file)}")
+    if args.freeze_consensus:
+        print(f"🧊 [实验2] freeze_consensus=True: 所有轮次 Step1 训练目标固定为 ref.txt")
 
     for iteration in range(start_iteration, args.max_iterations + 1):
         print(f"\n{'=' * 80}")
         print(f"🔄 Round {iteration} / {args.max_iterations}")
         if args.target_clusters:
-            print(f"   🎯 最终目标簇数: {args.target_clusters}")
+            print(f"   🎯 最终目标簇数: {args.target_clusters} (动态课程合并，每轮合半)")
         print(f"{'=' * 80}\n")
 
         prev_labels_path = current_labels_path
@@ -176,6 +256,7 @@ def main_loop():
         if args.skip_step1_round == iteration:
             ckpt_name = os.path.basename(current_checkpoint_path) if current_checkpoint_path else "未找到模型(None)"
             print(f"[Step 1] 跳过 Round {iteration} Step 1（使用已有 checkpoint: {ckpt_name}）")
+            
             step1_checkpoint = current_checkpoint_path
             if step1_checkpoint is None:
                 print("❌ skip_step1_round 指定跳过，但 current_checkpoint_path 为空，请检查路径")
@@ -230,12 +311,22 @@ def main_loop():
             training_cap=args.training_cap,
             consensus_path=current_consensus_path,
             cv_threshold=getattr(args, 'cv_threshold', 0.3),
-            target_clusters=args.target_clusters,
-            max_iterations=args.max_iterations,
+            target_clusters=args.target_clusters,       # 最终目标，step2_runner 内部动态计算本轮目标
+            max_iterations=args.max_iterations,          # step2_runner 需要知道是否为最后一轮
             primer_prefix=getattr(args, 'primer_prefix', 0),
             primer_suffix=getattr(args, 'primer_suffix', 0),
+            disable_merge=getattr(args, 'disable_merge', False),
             ref_length=getattr(args, 'ref_length', None),
             feddna_checkpoint=args.feddna_checkpoint,
+            consensus_source=getattr(args, 'consensus_source', 'mv'),
+            fasta_source=getattr(args, 'fasta_source', 'mv_strict'),
+            zone_include_noise=getattr(args, 'zone_include_noise', True),
+            rebirth_mode=getattr(args, 'rebirth_mode', 'nearest'),
+            # [v22-CLEANMODE-MAINLOOP] 透传大扫除总开关到 run_step2
+            clean_mode=getattr(args, 'clean_mode', False),
+
+            # [v21-SPLIT-STEP2ARGS] 透传拆分开关到 run_step2
+            enable_split=getattr(args, 'enable_split', False),
             split_tau=getattr(args, 'split_tau', 5),
             split_min_size=getattr(args, 'split_min_size', 6),
         )
@@ -244,11 +335,17 @@ def main_loop():
         # ============== 状态更新 ==============
         if results and 'next_round_files' in results:
             nrf = results['next_round_files']
-            current_labels_path     = nrf['labels']
-            current_state_path      = nrf.get('state')
-            current_consensus_path  = nrf.get('consensus')
+            current_labels_path    = nrf['labels']
+            current_state_path     = nrf.get('state')
+            current_centroids_path = nrf.get('centroids')
             current_checkpoint_path = step1_checkpoint
 
+            # [FIX-P0] 更新 consensus_path 和 cluster_change_info
+            if not getattr(args, 'freeze_consensus', False):
+                current_consensus_path = nrf.get('consensus')
+            else:
+                # [实验2] freeze_consensus: Step1 始终用 ref.txt，不更新 consensus_path
+                pass
             change_info_path = nrf.get('cluster_change_info')
             if change_info_path and os.path.exists(change_info_path):
                 try:
@@ -274,6 +371,35 @@ def main_loop():
             print("❌ Step 2 失败"); break
 
     # =====================================================================
+    # Post-processing: 全量距离分配
+    # =====================================================================
+    if current_labels_path and current_centroids_path and current_checkpoint_path:
+        print(f"\n{'=' * 80}")
+        print(f"🔧 Post-processing: 全量距离分配")
+        print(f"{'=' * 80}")
+
+        try:
+            from models.post_process import post_process_final_assignment
+
+            pp_output_dir = os.path.join(args.experiment_dir, "results", "final")
+            final_labels_path = post_process_final_assignment(
+                experiment_dir=args.experiment_dir,
+                final_checkpoint_path=current_checkpoint_path,
+                final_labels_path=current_labels_path,
+                centroids_path=current_centroids_path,
+                output_dir=pp_output_dir,
+                device=args.device,
+                dim=args.dim,
+                max_length=args.max_length,
+                gt_tags_file=args.gt_tags_file,
+            )
+            print(f"\n✅ 最终标签: {final_labels_path}")
+        except Exception as e:
+            print(f"❌ Post-processing 失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # =====================================================================
     # 收敛性报告
     # =====================================================================
     if convergence_log:
@@ -285,6 +411,7 @@ def main_loop():
             cr = entry['label_change_rate']
             bar = '█' * min(50, int(cr * 100)) + '░' * max(0, 50 - int(cr * 100))
             print(f"   Round {r}: {cr:.4f} ({cr*100:.2f}%) {bar}")
+
         try:
             conv_path = os.path.join(args.experiment_dir, "results", "convergence_log.txt")
             os.makedirs(os.path.dirname(conv_path), exist_ok=True)

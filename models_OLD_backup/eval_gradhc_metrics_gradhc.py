@@ -14,7 +14,7 @@ SSI-EC 论文指标全口径评估 — GradHC 同口径版
   7. Over-segmentation    n_pred / n_gt
 
 评估对象:
-  - CLOVER 基线         (read.txt)
+  - GradHC 基线         (read.txt)
   - SSI-EC Round 1      (refined_labels_084145.txt)
   - SSI-EC Round 2      (refined_labels_110601.txt)
 
@@ -29,15 +29,15 @@ from collections import Counter, defaultdict
 # ═══════════════════════════════════════════════════════════════
 # 路径配置（按你实际服务器路径修改）
 # ═══════════════════════════════════════════════════════════════
-EXP_DIR      = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/pe_ayb"
-GT_TAGS_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/pe_ayb/pe_ayb_tags_reads.txt"
-GT_REFS_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/pe_ayb/pe_ayb_refs.txt"
+EXP_DIR      = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/seq_1d_gradhc"
+GT_TAGS_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/seq_1d_gradhc/seq1d_tags_reads.txt"
+GT_REFS_FILE = "/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/seq_1d_gradhc/seq1d_refs.txt"
 
 # 指定要评估的 refined_labels 文件（按时间戳顺序）
 REFINED_LABELS = [
-    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_005939.txt"),  # Round 1
-    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_063153.txt"),  # Round 2
-    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_104409.txt"),  # Round 3
+    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_190249.txt"),  # Round 1
+    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_200642.txt"),  # Round 2
+    os.path.join(EXP_DIR, "04_Iterative_Labels", "refined_labels_210200.txt"),  # Round 3
 ]
 ROUND_NAMES = ["SSI-EC R1","SSI-EC R2","SSI-EC R3"]
 
@@ -440,8 +440,8 @@ def main():
 
     # ─── 评估 0: CLOVER 基线 ─────────────────────────────────
     print(f"\n\n{'═'*68}")
-    print(f"  🔵  CLOVER 基线评估")
-    r = evaluate_all(clover_labels, gt, "CLOVER (基线)", compute_ari_nmi_flag=True)
+    print(f"  🔵  GradHC 基线评估")
+    r = evaluate_all(clover_labels, gt, "GradHC (基线)", compute_ari_nmi_flag=True)
     all_results.append(r)
 
     # ─── 评估 1-N: SSI-EC 每轮 ──────────────────────────────
