@@ -1,11 +1,13 @@
 # models/main_loop.py
 """
-SSI-EC 主循环控制
+SSI-EC main loop controller.
 
-迭代流程: 每轮 Step1 (evidential 训练) → Step2 (簇内拆分 + consensus),
-consensus 与 refined labels 喂回下一轮。共 max_iterations 轮。
+Iterative flow: each round runs Step1 (evidential training) -> Step2 (intra-cluster
+split + consensus); consensus and refined labels are fed back into the next round,
+for max_iterations rounds.
 
-支持断点续跑 (按文件修改时间排序定位最新产物) 与收敛性追踪 (标签变化率)。
+Supports resume-from-checkpoint (locating the latest artifacts by file mtime) and
+convergence tracking (label change rate).
 """
 import argparse
 import os
@@ -24,7 +26,7 @@ from models.step2_runner import run_step2
 
 
 def compute_label_change_rate(prev_labels_path, curr_labels_path):
-    """计算两轮间的标签变化率 (收敛性指标)。"""
+    """Compute the label change rate between two rounds (convergence metric)."""
     if prev_labels_path is None or not os.path.exists(prev_labels_path):
         return None
     if not os.path.exists(curr_labels_path):
@@ -38,12 +40,12 @@ def compute_label_change_rate(prev_labels_path, curr_labels_path):
         changed = (prev[valid] != curr[valid]).sum()
         return float(changed) / float(valid.sum())
     except Exception as e:
-        print(f"   ⚠️ 变化率计算失败: {e}")
+        print(f"   [warn] failed to compute change rate: {e}")
         return None
 
 
 def main_loop():
-    parser = argparse.ArgumentParser(description='SSI-EC 主循环')
+    parser = argparse.ArgumentParser(description='SSI-EC main loop')
     parser.add_argument('--experiment_dir',     type=str, required=True)
     parser.add_argument('--feddna_checkpoint',  type=str, required=True)
     parser.add_argument('--max_iterations',     type=int, default=3)
@@ -56,40 +58,47 @@ def main_loop():
     parser.add_argument('--device',             type=str, default='cuda')
     parser.add_argument('--training_cap',       type=int, default=9999000000)
     parser.add_argument('--gt_tags_file',       type=str, default=None)
-    parser.add_argument('--gt_refs_file',       type=str, default=None)
     parser.add_argument('--cv_threshold',       type=float, default=0.3,
-                        help='困难簇 CV 阈值，默认 0.3')
+                        help='hard-cluster CV threshold, default 0.3')
     parser.add_argument('--skip_step1_round',   type=int,   default=0,
-                        help='跳过指定轮次的 Step 1，直接从 Step 2 开始')
+                        help='skip Step 1 for the given round, start directly from Step 2')
     parser.add_argument('--prev_checkpoint',    type=str,   default=None,
-                        help='手动指定第一轮跳过 Step 1 时的 checkpoint 路径')
+                        help='manually specify the checkpoint path when skipping Step 1 in round 1')
     parser.add_argument('--cl_mode',            type=str,   default='ours',
                         choices=['standard', 'ale_only', 'epi_only', 'ours'],
-                        help='对比学习消融模式: standard=标准InfoNCE, ale_only=只用U_ale, '
-                             'epi_only=只用U_epi, ours=完整设计(默认)')
+                        help='contrastive-learning ablation mode: standard=plain InfoNCE, '
+                             'ale_only=U_ale only, epi_only=U_epi only, ours=full design (default)')
     parser.add_argument('--max_reads_per_cluster', type=int, default=30,
-                        help='训练时每簇最多采样的 reads 数 (与 FedDNA 一致, 建议 30)。'
-                             '仅影响 Step1 训练, 不影响 Step2 推理 (全量)。')
-    parser.add_argument('--target_clusters', type=int, default=None,
-                        help='最终目标簇数 (先验约束, 可选)。')
-    parser.add_argument('--primer_prefix', type=int, default=0,
-                        help='前端引物长度 (bp)。Seq_1D 设 20')
-    parser.add_argument('--primer_suffix', type=int, default=0,
-                        help='后端引物长度 (bp)。Seq_1D 设 20')
+                        help='max reads sampled per cluster during training (consistent with '
+                             'FedDNA, recommended 30). Affects Step1 training only, not Step2 '
+                             'inference (which is full-scale).')
     parser.add_argument('--ref_length', type=int, default=None,
-                        help='参考序列长度 (bp), consensus 截断用。Seq_1D 设 196')
-    # 簇内拆分引擎参数 (唯一迭代机制)
+                        help='reference sequence length (bp), for consensus truncation. Set 196 for Seq_1D')
+    # Intra-cluster split engine parameters (the only iterative mechanism)
     parser.add_argument('--split_tau', type=int, default=5,
-                        help='拆分门控阈值: 两子簇 consensus edit >= tau 才拆。')
+                        help='split gate threshold: split only when the two sub-cluster consensuses have edit distance >= tau.')
     parser.add_argument('--split_min_size', type=int, default=6,
-                        help='簇 read 数 < 此值不尝试拆。')
+                        help='do not attempt to split clusters with fewer reads than this.')
+    # Evidential multiplicative split criterion (DEFAULT = ON; this is the paper's
+    # main method). Use --no_split_evidential to fall back to the pure-edit baseline
+    # (dAB>=tau), which is the ablation in the paper.
+    parser.add_argument('--split_evidential', dest='split_evidential',
+                        action='store_true', default=True,
+                        help='[default] use the multiplicative evidential split '
+                             'criterion dAB*min(S_A,S_B)/S_ref>=tau (paper main method).')
+    parser.add_argument('--no_split_evidential', dest='split_evidential',
+                        action='store_false',
+                        help='fall back to the pure-edit split criterion dAB>=tau '
+                             '(ablation baseline).')
+    parser.add_argument('--split_tau_evidential', type=int, default=5,
+                        help='gate threshold for the multiplicative evidential criterion (default 5).')
 
     args = parser.parse_args()
 
     os.makedirs(os.path.join(args.experiment_dir, 'results'), exist_ok=True)
 
     # =====================================================================
-    # 断点续跑检测
+    # Resume-from-checkpoint detection
     # =====================================================================
     results_dir = os.path.join(args.experiment_dir, 'results')
     labels_dir  = os.path.join(args.experiment_dir, '04_Iterative_Labels')
@@ -113,15 +122,15 @@ def main_loop():
                     break
 
             if not os.path.exists(step2_dir):
-                # step1 完成但 step2 未跑: 强制跳过该轮 step1, 直接续跑 step2
+                # Step1 done but Step2 not run: force-skip this round's Step1, resume at Step2
                 current_checkpoint_path = ckpt_path
                 start_iteration = check_round
                 args.skip_step1_round = check_round
-                print(f"   ✅ 检测到 Round {check_round} Step1 已完成，Step2 未跑")
-                print(f"   ⚡ 自动设置 skip_step1_round={check_round}，将直接运行 Step2")
+                print(f"   [resume] Round {check_round} Step1 complete, Step2 not yet run")
+                print(f"   [resume] auto-setting skip_step1_round={check_round}, will run Step2 directly")
                 break
 
-            # 按文件修改时间排序 (避免 %H%M%S 跨天字典序错乱)
+            # Sort by file mtime (avoids %H%M%S lexicographic disorder across days)
             label_files     = sorted(glob.glob(os.path.join(labels_dir, "refined_labels_*.txt")),     key=os.path.getmtime)
             state_files     = sorted(glob.glob(os.path.join(labels_dir, "read_state_*.pt")),          key=os.path.getmtime)
             consensus_files = sorted(glob.glob(os.path.join(labels_dir, "consensus_dict_*.pt")),      key=os.path.getmtime)
@@ -138,47 +147,45 @@ def main_loop():
                 try:
                     current_cluster_change_info = torch.load(change_files[-1], map_location='cpu')
                 except Exception as e:
-                    print(f"   ⚠️ 加载 cluster_change_info 失败 ({e})，将回退到无难度采样模式")
+                    print(f"   [warn] failed to load cluster_change_info ({e}), falling back to no-difficulty sampling")
                     current_cluster_change_info = None
 
             start_iteration = check_round + 1
-            print(f"   ✅ 检测到 Round {check_round} 已完成")
+            print(f"   [resume] Round {check_round} complete")
 
             if args.prev_checkpoint and os.path.exists(args.prev_checkpoint):
                 current_checkpoint_path = args.prev_checkpoint
-                print(f"   ⚡ 已捕获手动指定的 checkpoint: {current_checkpoint_path}")
+                print(f"   [resume] using manually specified checkpoint: {current_checkpoint_path}")
 
     if start_iteration > 1:
-        print(f"\n⏩ 从 Round {start_iteration} 继续 (跳过已完成的 {start_iteration - 1} 轮)")
+        print(f"\n[resume] continuing from Round {start_iteration} (skipping {start_iteration - 1} completed round(s))")
     else:
-        print(f"\n🆕 从 Round 1 开始 (无已有结果)")
+        print(f"\n[start] beginning from Round 1 (no existing results)")
 
     convergence_log = []
 
-    print(f"🚀 SSI-EC 闭环迭代启动")
-    print(f"📂 实验目录: {args.experiment_dir}")
-    print(f"📏 序列长度: {args.max_length} bp")
-    print(f"🔁 迭代轮数: {args.max_iterations}")
-    print(f"🔋 预训练:   {os.path.basename(args.feddna_checkpoint)}")
+    print(f"SSI-EC closed-loop iteration starting")
+    print(f"  experiment dir: {args.experiment_dir}")
+    print(f"  sequence length: {args.max_length} bp")
+    print(f"  iterations: {args.max_iterations}")
+    print(f"  pretrained: {os.path.basename(args.feddna_checkpoint)}")
     if args.gt_tags_file:
-        print(f"📋 GT 评估:  {os.path.basename(args.gt_tags_file)}")
+        print(f"  GT eval: {os.path.basename(args.gt_tags_file)}")
 
     for iteration in range(start_iteration, args.max_iterations + 1):
         print(f"\n{'=' * 80}")
-        print(f"🔄 Round {iteration} / {args.max_iterations}")
-        if args.target_clusters:
-            print(f"   🎯 最终目标簇数: {args.target_clusters}")
+        print(f"Round {iteration} / {args.max_iterations}")
         print(f"{'=' * 80}\n")
 
         prev_labels_path = current_labels_path
 
         # ============== Step 1 ==============
         if args.skip_step1_round == iteration:
-            ckpt_name = os.path.basename(current_checkpoint_path) if current_checkpoint_path else "未找到模型(None)"
-            print(f"[Step 1] 跳过 Round {iteration} Step 1（使用已有 checkpoint: {ckpt_name}）")
+            ckpt_name = os.path.basename(current_checkpoint_path) if current_checkpoint_path else "model not found (None)"
+            print(f"[Step 1] skipping Round {iteration} Step 1 (using existing checkpoint: {ckpt_name})")
             step1_checkpoint = current_checkpoint_path
             if step1_checkpoint is None:
-                print("❌ skip_step1_round 指定跳过，但 current_checkpoint_path 为空，请检查路径")
+                print("[error] skip_step1_round set but current_checkpoint_path is empty, check the path")
                 break
         else:
             print(f"[Step 1] Evidence Learning...")
@@ -208,7 +215,7 @@ def main_loop():
             )
             step1_checkpoint = train_step1(step1_args)
             if step1_checkpoint is None:
-                print("❌ Step 1 失败"); break
+                print("[error] Step 1 failed"); break
 
         # ============== Step 2 ==============
         print(f"\n[Step 2] Refine & Decode...")
@@ -226,22 +233,18 @@ def main_loop():
             refined_labels=current_labels_path,
             prev_state=current_state_path,
             gt_tags_file=args.gt_tags_file,
-            gt_refs_file=args.gt_refs_file,
-            training_cap=args.training_cap,
             consensus_path=current_consensus_path,
             cv_threshold=getattr(args, 'cv_threshold', 0.3),
-            target_clusters=args.target_clusters,
-            max_iterations=args.max_iterations,
-            primer_prefix=getattr(args, 'primer_prefix', 0),
-            primer_suffix=getattr(args, 'primer_suffix', 0),
             ref_length=getattr(args, 'ref_length', None),
-            feddna_checkpoint=args.feddna_checkpoint,
             split_tau=getattr(args, 'split_tau', 5),
             split_min_size=getattr(args, 'split_min_size', 6),
+            # Evidential multiplicative criterion passthrough (default ON = paper main method)
+            split_evidential=getattr(args, 'split_evidential', True),
+            split_tau_evidential=getattr(args, 'split_tau_evidential', 5),
         )
         results = run_step2(step2_args)
 
-        # ============== 状态更新 ==============
+        # ============== State update ==============
         if results and 'next_round_files' in results:
             nrf = results['next_round_files']
             current_labels_path     = nrf['labels']
@@ -254,36 +257,36 @@ def main_loop():
                 try:
                     current_cluster_change_info = torch.load(change_info_path, map_location='cpu')
                 except Exception as e:
-                    print(f"   ⚠️ 加载 cluster_change_info 失败: {e}")
+                    print(f"   [warn] failed to load cluster_change_info: {e}")
                     current_cluster_change_info = None
             else:
                 current_cluster_change_info = None
 
-            print(f"\n✅ Round {iteration} 完成.")
-            print(f"   标签: {os.path.basename(current_labels_path)}")
+            print(f"\n[done] Round {iteration} complete.")
+            print(f"   labels: {os.path.basename(current_labels_path)}")
             if current_consensus_path:
-                print(f"   Consensus: {os.path.basename(current_consensus_path)}")
+                print(f"   consensus: {os.path.basename(current_consensus_path)}")
 
             change_rate = compute_label_change_rate(prev_labels_path, current_labels_path)
             if change_rate is not None:
                 convergence_log.append({'round': iteration, 'label_change_rate': change_rate})
-                print(f"   📈 标签变化率: {change_rate:.4f} ({change_rate*100:.2f}%)")
+                print(f"   label change rate: {change_rate:.4f} ({change_rate*100:.2f}%)")
             else:
-                print(f"   📈 标签变化率: N/A (首轮)")
+                print(f"   label change rate: N/A (first round)")
         else:
-            print("❌ Step 2 失败"); break
+            print("[error] Step 2 failed"); break
 
     # =====================================================================
-    # 收敛性报告
+    # Convergence report
     # =====================================================================
     if convergence_log:
         print(f"\n{'=' * 60}")
-        print(f"📈 收敛性报告")
+        print(f"Convergence report")
         print(f"{'=' * 60}")
         for entry in convergence_log:
             r = entry['round']
             cr = entry['label_change_rate']
-            bar = '█' * min(50, int(cr * 100)) + '░' * max(0, 50 - int(cr * 100))
+            bar = '#' * min(50, int(cr * 100)) + '.' * max(0, 50 - int(cr * 100))
             print(f"   Round {r}: {cr:.4f} ({cr*100:.2f}%) {bar}")
         try:
             conv_path = os.path.join(args.experiment_dir, "results", "convergence_log.txt")
@@ -292,11 +295,11 @@ def main_loop():
                 f.write("Round,Label_Change_Rate\n")
                 for entry in convergence_log:
                     f.write(f"{entry['round']},{entry['label_change_rate']:.6f}\n")
-            print(f"   💾 收敛性日志: {conv_path}")
+            print(f"   convergence log: {conv_path}")
         except Exception as e:
-            print(f"   ⚠️ 保存收敛性日志失败: {e}")
+            print(f"   [warn] failed to save convergence log: {e}")
 
-    print(f"\n🎉 实验完成！结果: {args.experiment_dir}/results/")
+    print(f"\n[complete] experiment finished. results: {args.experiment_dir}/results/")
 
 
 if __name__ == "__main__":

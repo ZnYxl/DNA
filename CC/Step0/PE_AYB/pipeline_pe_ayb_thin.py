@@ -2,9 +2,14 @@
 """
 pipeline_pe_ayb_thin.py
 =======================
-PE_AYB 数据集 Pipeline（打薄版）
+PE_AYB 数据集 Pipeline（全局随机打薄版）
 
-  output.txt → 预处理 → 打薄 → Clover 聚类 → 小簇过滤 → 统计 → read.txt + ref.txt
+  output.txt → 预处理 → 全局随机打薄(keep_ratio) → 分布保持验证 → Clover 聚类 → 小簇过滤 → 统计 → read.txt + ref.txt
+
+打薄策略（全局随机采样，无 GT 先验）:
+  对过滤后的全体 reads 做一次全局随机采样，精确保留 keep_ratio 比例。
+  不按 tag/簇分组、不设保底、不看任何 label —— 与真实"无 GT 测序数据"场景一致。
+  打薄后整体冗余分布形状保持不变（仅整体缩放），由 thinning_verify 模块量化验证。
 
 数据集差异 (vs Seq_1D):
   REF_LEN:        196 → 117      reads 主流长度（无 adapter）
@@ -20,16 +25,12 @@ PE_AYB 数据集 Pipeline（打薄版）
 ★ 关键差异: reads 是 ref payload (33:150) 的测序读，不是 ref 完整 183bp。
   Step 7 生成 GT refs 时必须抽取 ref[33:150]，否则 SSI-EC SR 评估会全错。
 
-注意:
-  ‣ reads 没有 primer/adapter 锚点，Clover 难度比 Seq_1D/P10_5 大
-  ‣ 这正是 SSI-EC 能体现优势的场景（Coverage 预期 < P10_5）
-  ‣ SSI-EC 主代码: --max_length 201 --ref_length 117
-
 用法:
     cd /mnt/st_data/liangxinyi/code/CC/Step0/PE_AYB
-    python pipeline_pe_ayb_thin.py                          # 完整运行
-    python pipeline_pe_ayb_thin.py --max_reads_per_tag 15   # 更激进打薄
-    python pipeline_pe_ayb_thin.py --skip_clover            # 跳过 Clover
+    python pipeline_pe_ayb_thin.py --keep_ratio 0.1     # 默认 1/10
+    python pipeline_pe_ayb_thin.py --keep_ratio 0.05
+    python pipeline_pe_ayb_thin.py --keep_ratio 0.025
+    python pipeline_pe_ayb_thin.py --skip_clover        # 跳过 Clover
 """
 
 import os
@@ -40,25 +41,45 @@ import time
 import random
 from collections import defaultdict, Counter
 
+# 分布保持验证模块（公共模块，位于 CC/Step0/）
+sys.path.insert(0, '/mnt/st_data/liangxinyi/code/CC/Step0')
+from thinning_verify import verify_distribution_preserved
+
+
+class _Tee:
+    """把 stdout 同时写到屏幕和日志文件。"""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
 # ============================================================
 # 配置
 # ============================================================
 BASE_DIR    = '/mnt/st_data/liangxinyi/code/CC/Step0/PE_AYB'
 CLOVER_DIR  = '/mnt/st_data/liangxinyi/code/CC/Step0/Clover'
-OUTPUT_DIR  = os.path.join(BASE_DIR, 'clover_out')
-EXPERIMENT_DIR = '/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/pe_ayb'
+OUTPUT_DIR  = None   # 运行时根据 keep_ratio 设置
+EXPERIMENT_DIR = None  # 运行时根据 keep_ratio 设置
 
 # ── 数据集核心常量 ──
 REF_LEN     = 117            # reads 主流长度（无 adapter）
-LEN_MIN     = 115            # 覆盖 95%+ reads
+LEN_MIN     = 115
 LEN_MAX     = 120
 GT_REF_LEN  = 117            # ref payload 抽取后长度
 RAW_REF_LEN = 183            # ref.fasta 原始长度
 PAYLOAD_START = 33           # Illumina adapter 长度
 
 MIN_READS_PER_CLUSTER = 5
-N_GT_TAGS   = 153331         # PE_AYB mapped refs (Seq_1D: 11826)
-MAX_READS_PER_TAG = 30
+N_GT_TAGS   = 153331         # PE_AYB mapped refs
+KEEP_RATIO  = 0.1            # 全局随机打薄：保留比例（默认 1/10）
 RANDOM_SEED = 42
 
 # Clover 参数
@@ -78,15 +99,19 @@ def banner(title):
 
 
 # ============================================================
-# Step 0: 预处理 + 打薄
+# Step 0: 预处理 + 全局随机打薄 + 分布保持验证
 # ============================================================
-def step0_preprocess_and_thin(input_file, max_reads_per_tag):
-    banner("Step 0  预处理 + 打薄")
+def step0_preprocess_and_thin(input_file, keep_ratio, png_path):
+    """
+    去N + 长度过滤 → 对全体 reads 做一次全局随机采样，精确保留 keep_ratio。
+    不分组、不保底、不看任何 label。tag 随 read 保留（仅供下游写 GT 文件 / 验证用）。
+    """
+    banner("Step 0  预处理 + 全局随机打薄")
 
     total = 0
     n_dropped = 0
     len_dropped = 0
-    tag_to_reads = defaultdict(list)
+    all_reads = []  # [(tag, seq), ...] 过滤后全体（不分组）
 
     with open(input_file, 'r') as f:
         for line in f:
@@ -107,23 +132,16 @@ def step0_preprocess_and_thin(input_file, max_reads_per_tag):
                 len_dropped += 1
                 continue
 
-            tag_to_reads[tag].append((tag, seq))
+            all_reads.append((tag, seq))
 
-    after_filter = sum(len(v) for v in tag_to_reads.values())
-    n_tags_before = len(tag_to_reads)
+    after_filter = len(all_reads)
+    n_tags_before = len(set(t for t, _ in all_reads))
 
+    # ── 全局随机打薄：精确保留 keep_ratio ──
     rng = random.Random(RANDOM_SEED)
-    cleaned = []
-    thinned_reads = 0
-    for tag in sorted(tag_to_reads.keys(), key=lambda x: int(x)):
-        reads = tag_to_reads[tag]
-        if len(reads) > max_reads_per_tag:
-            sampled = rng.sample(reads, max_reads_per_tag)
-            thinned_reads += len(reads) - max_reads_per_tag
-        else:
-            sampled = reads
-        cleaned.extend(sampled)
-
+    n_keep = int(round(after_filter * keep_ratio))
+    cleaned = rng.sample(all_reads, n_keep)
+    thinned_reads = after_filter - n_keep
     n_tags_after = len(set(t for t, _ in cleaned))
 
     print(f"  输入文件:            {input_file}")
@@ -135,21 +153,19 @@ def step0_preprocess_and_thin(input_file, max_reads_per_tag):
     print(f"  因长度不合格剔除:    {len_dropped:,}")
     print(f"  过滤后 reads:        {after_filter:,}  ({n_tags_before:,} tags)")
     print()
-    print(f"  ── 打薄 ──")
-    print(f"  max_reads_per_tag:   {max_reads_per_tag}")
+    print(f"  ── 全局随机打薄 ──")
+    print(f"  keep_ratio:          {keep_ratio}  (1/{1/keep_ratio:.1f})")
+    print(f"  random_seed:         {RANDOM_SEED}")
     print(f"  打薄丢弃:            {thinned_reads:,} 条 reads")
     print(f"  打薄后 reads:        {len(cleaned):,}  ({n_tags_after:,} tags)")
-    print()
+    lost_tags = n_tags_before - n_tags_after
+    print(f"  随机抽稀导致 {lost_tags:,} 个低冗余 tag 完全丢失（真实低采样的自然结果）")
 
-    if tag_to_reads:
-        before_sizes = [len(v) for v in tag_to_reads.values()]
-        after_tag_counts = Counter(t for t, _ in cleaned)
-        after_sizes = list(after_tag_counts.values())
-        print(f"  每 tag reads 数变化:")
-        print(f"    打薄前:  avg={sum(before_sizes)/len(before_sizes):.1f}, "
-              f"max={max(before_sizes)}, med={sorted(before_sizes)[len(before_sizes)//2]}")
-        print(f"    打薄后:  avg={sum(after_sizes)/len(after_sizes):.1f}, "
-              f"max={max(after_sizes)}, med={sorted(after_sizes)[len(after_sizes)//2]}")
+    # ── 分布保持验证（五项证据 + PNG）──
+    verify_distribution_preserved(
+        all_reads, cleaned, keep_ratio,
+        dataset_name="PE_AYB", png_path=png_path,
+    )
 
     return cleaned
 
@@ -345,7 +361,7 @@ def step4_statistics(cid_to_idxs, idx_map, min_reads, stats_path):
         print(f"\n  max={sizes[0]}, median={sizes[len(sizes)//2]}, min={sizes[-1]}")
 
     with open(stats_path, 'w') as f:
-        f.write(f"PE_AYB 聚类统计（打薄 + 小簇过滤）\n{'='*40}\n\n")
+        f.write(f"PE_AYB 聚类统计（全局随机打薄 + 小簇过滤）\n{'='*40}\n\n")
         f.write(f"聚类簇数:      {n_clusters:,}\nGT tag 数:     {N_GT_TAGS:,}\n")
         f.write(f"reads:         {total_reads:,}\nmin reads/簇:  {min_reads}\n\n")
         f.write(f"Purity:        {purity*100:.2f}%\nCoverage:      {coverage*100:.2f}%\n\n")
@@ -404,7 +420,7 @@ def step56_write_output(cid_to_idxs, idx_map, read_path, ref_path):
 # ============================================================
 # Step 7: 部署到实验目录（★ 关键：抽取 ref payload）
 # ============================================================
-def step7_deploy(idx_map, clover_tag_path):
+def step7_deploy(idx_map, clover_tag_path, keep_ratio):
     """复制 read.txt/ref.txt + 生成 GT tags + 生成 GT refs (抽取 ref[33:150] payload)。"""
     banner("Step 7  部署到实验目录")
 
@@ -450,13 +466,11 @@ def step7_deploy(idx_map, clover_tag_path):
                         fout.write(full_seq[PAYLOAD_START:payload_end] + '\n')
                         n_refs_written += 1
                     else:
-                        # 兜底：长度不够时写空行保持行号对齐
                         fout.write('\n')
                         n_refs_skipped += 1
                 cur_seq_parts = []
             else:
                 cur_seq_parts.append(line)
-        # 最后一条
         if cur_seq_parts:
             full_seq = ''.join(cur_seq_parts)
             if len(full_seq) >= payload_end:
@@ -473,17 +487,42 @@ def step7_deploy(idx_map, clover_tag_path):
         print(f"     长度不足:    {n_refs_skipped:,}  (写空行保持行号对齐)")
 
     print()
+    ratio_tag = f"p{keep_ratio}"
+    log_name = f"pe_ayb_{ratio_tag}_verify.log"
+    exp_rel = f"CC/Step0/Experiments/pe_ayb_{ratio_tag}"
+    run_cmd = (
+        f"cd /mnt/st_data/liangxinyi/code\n"
+        f"python -m models.main_loop \\\n"
+        f"    --experiment_dir {exp_rel}/ \\\n"
+        f"    --feddna_checkpoint result/FLDNA_I/I_1214234233/model/epoch1_I.pth \\\n"
+        f"    --gt_tags_file {exp_rel}/pe_ayb_tags_reads.txt \\\n"
+        f"    --gt_refs_file {exp_rel}/pe_ayb_refs.txt \\\n"
+        f"    --max_iterations 3 --max_length 201 \\\n"
+        f"    --cl_mode ours --ref_length {REF_LEN} --primer_prefix 0 --primer_suffix 0 \\\n"
+        f"    --split_tau 5 --split_min_size 6 \\\n"
+        f"    2>&1 | tee {exp_rel}/{log_name}"
+    )
     print(f"  🚀 运行实验:")
-    print(f"     cd /mnt/st_data/liangxinyi/code/models")
-    print(f"     python main_loop.py \\")
-    print(f"       --experiment_dir {EXPERIMENT_DIR}/ \\")
-    print(f"       --feddna_checkpoint /mnt/st_data/liangxinyi/code/result/FLDNA_I/I_1214234233/model/epoch1_I.pth \\")
-    print(f"       --max_iterations 3 --max_length 201 --ref_length {REF_LEN} --cl_mode ours \\")
-    print(f"       --gt_tags_file {gt_tags_path} \\")
-    print(f"       --gt_refs_file {gt_refs_path} \\")
-    print(f"       2>&1 | tee pe_ayb_ours_v1.log")
+    for ln in run_cmd.split("\n"):
+        print(f"     {ln}")
+
+    # ── 评估命令（实验跑完后执行）──
+    # ★ gt_refs 必须用抽取 payload 后的 pe_ayb_refs.txt（117bp），不是原始 183bp ref.fasta
+    eval_cmd = (
+        f"cd /mnt/st_data/liangxinyi/code/models\n"
+        f"python eval_reconstruction.py \\\n"
+        f"    --experiment_dir /mnt/st_data/liangxinyi/code/{exp_rel}/ \\\n"
+        f"    --gt_refs /mnt/st_data/liangxinyi/code/{exp_rel}/pe_ayb_refs.txt \\\n"
+        f"    --gt_tags /mnt/st_data/liangxinyi/code/{exp_rel}/pe_ayb_tags_reads.txt \\\n"
+        f"    --out reconstruction_eval_pe_ayb_{ratio_tag}.tsv"
+    )
+    print()
+    print(f"  📊 评估命令（实验跑完后执行）:")
+    for ln in eval_cmd.split("\n"):
+        print(f"     {ln}")
     print()
     print(f"  ⚠️  GT refs 已抽取 payload (117bp)，与 reads/MV 同长，无需在主代码再做对齐")
+    print(f"  ⚠️  primer_prefix/suffix 设为 0：reads 无 adapter，payload 即全长")
 
 
 # ============================================================
@@ -491,15 +530,35 @@ def step7_deploy(idx_map, clover_tag_path):
 # ============================================================
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='PE_AYB Pipeline（打薄版）')
+    parser = argparse.ArgumentParser(description='PE_AYB Pipeline（全局随机打薄版）')
     parser.add_argument('--skip_clover', action='store_true')
-    parser.add_argument('--max_reads_per_tag', type=int, default=MAX_READS_PER_TAG)
+    parser.add_argument('--keep_ratio', type=float, default=KEEP_RATIO,
+                        help=f'全局随机打薄保留比例（默认 {KEEP_RATIO} = 1/10）')
     parser.add_argument('--min_reads', type=int, default=MIN_READS_PER_CLUSTER)
     args = parser.parse_args()
+
+    # ── 根据 keep_ratio 生成目录后缀，多个 p 完全对称、互不覆盖 ──
+    global OUTPUT_DIR, EXPERIMENT_DIR
+    ratio_tag = f"p{args.keep_ratio}"
+    OUTPUT_DIR = os.path.join(BASE_DIR, f'clover_out_{ratio_tag}')
+    EXPERIMENT_DIR = f'/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/pe_ayb_{ratio_tag}'
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(os.path.join(OUTPUT_DIR, '04_FedDNA_In'), exist_ok=True)
     os.makedirs(EXPERIMENT_DIR, exist_ok=True)
+
+    # ── 开启 Tee：全程输出同时写实验目录 data_detail.txt ──
+    detail_path = os.path.join(EXPERIMENT_DIR, 'data_detail.txt')
+    _detail_fh = open(detail_path, 'w')
+    _orig_stdout = sys.stdout
+    sys.stdout = _Tee(_orig_stdout, _detail_fh)
+    print("=" * 60)
+    print("  运行命令:")
+    print(f"    python {os.path.abspath(__file__)} --keep_ratio {args.keep_ratio}"
+          + (f" --min_reads {args.min_reads}" if args.min_reads != MIN_READS_PER_CLUSTER else "")
+          + (" --skip_clover" if args.skip_clover else ""))
+    print(f"  日志文件: {detail_path}")
+    print("=" * 60)
 
     input_file       = os.path.join(BASE_DIR, 'output.txt')
     clover_input     = os.path.join(OUTPUT_DIR, '01_clover_input.txt')
@@ -509,10 +568,11 @@ def main():
     stats_path       = os.path.join(OUTPUT_DIR, '03_stats.txt')
     read_path        = os.path.join(OUTPUT_DIR, '04_FedDNA_In', 'read.txt')
     ref_path         = os.path.join(OUTPUT_DIR, '04_FedDNA_In', 'ref.txt')
+    dist_png         = os.path.join(EXPERIMENT_DIR, f'dist_preserve_{ratio_tag}.png')
 
     print()
     print("=" * 60)
-    print("  🚀  PE_AYB Pipeline（打薄版）")
+    print("  🚀  PE_AYB Pipeline（全局随机打薄版）")
     print("=" * 60)
     print()
     print(f"  数据目录:         {BASE_DIR}")
@@ -523,7 +583,7 @@ def main():
     print(f"  ref_len (GT):     {GT_REF_LEN}bp (从 ref[{PAYLOAD_START}:{PAYLOAD_START+GT_REF_LEN}] 抽取)")
     print(f"  raw ref:          {RAW_REF_LEN}bp (含 adapter)")
     print(f"  N_GT_TAGS:        {N_GT_TAGS:,}")
-    print(f"  max_reads/tag:    {args.max_reads_per_tag}")
+    print(f"  keep_ratio:       {args.keep_ratio}  ← 全局随机打薄参数")
     print(f"  min_reads/簇:     {args.min_reads}")
     print(f"  Clover:           D={CLOVER_TREE_DEPTH} V={CLOVER_V_DRIFT} H={CLOVER_H_DRIFT}")
     print(f"                    h_idx={CLOVER_H_INDEX} e_idx={CLOVER_E_INDEX} "
@@ -531,7 +591,7 @@ def main():
 
     t_start = time.time()
 
-    cleaned = step0_preprocess_and_thin(input_file, args.max_reads_per_tag)
+    cleaned = step0_preprocess_and_thin(input_file, args.keep_ratio, dist_png)
     if not cleaned:
         print("\n  ❌ Step 0 后无 reads，终止。")
         sys.exit(1)
@@ -549,7 +609,7 @@ def main():
     cid_to_idxs = step3_5_filter_small_clusters(cid_to_idxs, args.min_reads)
     purity, coverage = step4_statistics(cid_to_idxs, idx_map, args.min_reads, stats_path)
     step56_write_output(cid_to_idxs, idx_map, read_path, ref_path)
-    step7_deploy(idx_map, clover_tag_input)
+    step7_deploy(idx_map, clover_tag_input, args.keep_ratio)
 
     elapsed = time.time() - t_start
     print()
@@ -558,9 +618,14 @@ def main():
     print("=" * 60)
     print()
     print(f"  总耗时:         {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    print(f"  打薄:           全局随机保留 {args.keep_ratio} (seed={RANDOM_SEED})")
     print(f"  Purity:         {purity*100:.2f}%")
     print(f"  Coverage:       {coverage*100:.2f}%")
     print()
+
+    # ── 关闭 Tee ──
+    sys.stdout = _orig_stdout
+    _detail_fh.close()
 
 
 if __name__ == '__main__':

@@ -2,20 +2,22 @@
 """
 pipeline_seq1d.py
 =================
-Sequencing_data_first_dimension 专用 Pipeline（打薄版）
+Sequencing_data_first_dimension 专用 Pipeline（全局随机打薄版）
 
-  output.txt → 预处理 → 打薄(每tag最多N条) → Clover聚类 → 小簇过滤 → 统计 → read.txt + ref.txt
+  output.txt → 预处理 → 全局随机打薄(保留比例 keep_ratio) → Clover聚类 → 小簇过滤 → 统计 → read.txt + ref.txt
 
 用法:
     cd /mnt/st_data/liangxinyi/code/CC/Step0/Sequencing_data_first_dimension
-    python pipeline_seq1d.py                          # 完整运行（默认每tag最多30条）
-    python pipeline_seq1d.py --max_reads_per_tag 15   # 更激进打薄
-    python pipeline_seq1d.py --skip_clover            # 跳过 Clover，复用已有结果
+    python pipeline_seq1d.py                       # 完整运行（默认保留 1/5）
+    python pipeline_seq1d.py --keep_ratio 0.1      # 更激进打薄（保留 1/10）
+    python pipeline_seq1d.py --skip_clover         # 跳过 Clover，复用已有结果
 
-打薄策略（与 FedDNA 论文一致）:
-    FedDNA: "for each DNA cluster, 5 to 30 reads were randomly sampled"
-    本脚本: 对每个 BWA tag，随机采样最多 max_reads_per_tag 条 reads
-    打薄在 Clover 之前执行 → Clover 可用冗余减少 → 聚类质量下降 → SSI-EC 有提升空间
+打薄策略（全局随机采样，无 GT 先验）:
+    对过滤后的全体 reads 做一次全局随机采样，精确保留 keep_ratio 比例。
+    不按 tag/簇分组、不设保底、不看任何 label —— 与真实"无 GT 测序数据"
+    场景一致：拿到的只是 reads，按比例随机抽稀以节省时间和算力。
+    因此打薄后整体冗余分布的形状保持不变（仅整体缩放），低冗余分子
+    被随机抽掉即视为真实低采样下的自然丢失。
 """
 
 import os
@@ -26,20 +28,40 @@ import time
 import random
 from collections import defaultdict, Counter
 
+# 分布保持验证模块（公共模块，位于 CC/Step0/）
+sys.path.insert(0, '/mnt/st_data/liangxinyi/code/CC/Step0')
+from thinning_verify import verify_distribution_preserved
+
+
+class _Tee:
+    """把 stdout 同时写到屏幕和日志文件。"""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
 # ============================================================
 # 配置
 # ============================================================
 BASE_DIR    = '/mnt/st_data/liangxinyi/code/CC/Step0/Sequencing_data_first_dimension'
 CLOVER_DIR  = '/mnt/st_data/liangxinyi/code/CC/Step0/Clover'
-OUTPUT_DIR  = os.path.join(BASE_DIR, 'clover_out')
-EXPERIMENT_DIR = '/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/seq_1d'
+OUTPUT_DIR  = None  # 运行时根据 keep_ratio 设置（见 main）
+EXPERIMENT_DIR = None  # 运行时根据 keep_ratio 设置
 
 REF_LEN     = 196
 LEN_MIN     = REF_LEN - 5   # 191
 LEN_MAX     = REF_LEN + 5   # 201
 MIN_READS_PER_CLUSTER = 5   # Clover 聚类后小簇过滤
 N_GT_TAGS   = 11826          # design 总数
-MAX_READS_PER_TAG = 30       # 每个 tag 最多保留的 reads 数（FedDNA: 5-30）
+TARGET_CLUSTERS = 11736      # main_loop --target_clusters 固定期望簇数（三个 p 通用）
+KEEP_RATIO  = 0.2            # 全局随机打薄：保留比例（默认 1/5）
 RANDOM_SEED = 42
 
 # Clover 参数
@@ -59,16 +81,20 @@ def banner(title):
 # ============================================================
 # Step 0: 预处理 + 打薄
 # ============================================================
-def step0_preprocess_and_thin(input_file, max_reads_per_tag):
+def step0_preprocess_and_thin(input_file, keep_ratio, png_path):
     """
-    读 output.txt → 去N + 长度过滤 → 按 tag 分组 → 每 tag 随机采样 ≤ max_reads_per_tag 条。
+    读 output.txt → 去N + 长度过滤 → 对全体 reads 做一次全局随机采样，
+    精确保留 keep_ratio 比例。不分组、不保底、不看任何 label。
+
+    tag 信息随 read 一起保留（仅供下游 Step 7 写 GT 评估文件 / 日志统计用），
+    抽样过程完全不依赖 tag。
     """
-    banner("Step 0  预处理 + 打薄")
+    banner("Step 0  预处理 + 全局随机打薄")
 
     total = 0
     n_dropped = 0
     len_dropped = 0
-    tag_to_reads = defaultdict(list)  # tag → [(tag, read), ...]
+    all_reads = []  # [(tag, seq), ...] 过滤后的全体 reads（不分组）
 
     with open(input_file, 'r') as f:
         for line in f:
@@ -89,27 +115,16 @@ def step0_preprocess_and_thin(input_file, max_reads_per_tag):
                 len_dropped += 1
                 continue
 
-            tag_to_reads[tag].append((tag, seq))
+            all_reads.append((tag, seq))
 
-    after_filter = sum(len(v) for v in tag_to_reads.values())
-    n_tags_before = len(tag_to_reads)
+    after_filter = len(all_reads)
+    n_tags_before = len(set(t for t, _ in all_reads))
 
-    # ── 打薄：每 tag 随机采样 ──
+    # ── 全局随机打薄：精确保留 keep_ratio ──
     rng = random.Random(RANDOM_SEED)
-    cleaned = []
-    thinned_reads = 0
-
-    for tag in sorted(tag_to_reads.keys(), key=lambda x: int(x)):
-        reads = tag_to_reads[tag]
-        if len(reads) > max_reads_per_tag:
-            sampled = rng.sample(reads, max_reads_per_tag)
-            thinned_reads += len(reads) - max_reads_per_tag
-        else:
-            sampled = reads
-        cleaned.extend(sampled)
-
-    # ── 丢弃打薄后 < MIN_READS_PER_CLUSTER 的 tag ──
-    # （打薄不会让 tag 变少，因为 max_reads_per_tag >= MIN_READS_PER_CLUSTER）
+    n_keep = int(round(after_filter * keep_ratio))
+    cleaned = rng.sample(all_reads, n_keep)
+    thinned_reads = after_filter - n_keep
 
     n_tags_after = len(set(t for t, _ in cleaned))
 
@@ -121,22 +136,19 @@ def step0_preprocess_and_thin(input_file, max_reads_per_tag):
     print(f"  因长度不合格剔除:    {len_dropped:,}")
     print(f"  过滤后 reads:        {after_filter:,}  ({n_tags_before:,} tags)")
     print()
-    print(f"  ── 打薄 ──")
-    print(f"  max_reads_per_tag:   {max_reads_per_tag}")
+    print(f"  ── 全局随机打薄 ──")
+    print(f"  keep_ratio:          {keep_ratio}  (1/{1/keep_ratio:.1f})")
+    print(f"  random_seed:         {RANDOM_SEED}")
     print(f"  打薄丢弃:            {thinned_reads:,} 条 reads")
     print(f"  打薄后 reads:        {len(cleaned):,}  ({n_tags_after:,} tags)")
-    print()
+    lost_tags = n_tags_before - n_tags_after
+    print(f"  随机抽稀导致 {lost_tags:,} 个低冗余 tag 完全丢失（真实低采样的自然结果）")
 
-    # 打薄前后的每 tag 统计
-    before_sizes = [len(v) for v in tag_to_reads.values()]
-    after_tag_counts = Counter(t for t, _ in cleaned)
-    after_sizes = list(after_tag_counts.values())
-
-    print(f"  每 tag reads 数变化:")
-    print(f"    打薄前:  avg={sum(before_sizes)/len(before_sizes):.1f}, "
-          f"max={max(before_sizes)}, med={sorted(before_sizes)[len(before_sizes)//2]}")
-    print(f"    打薄后:  avg={sum(after_sizes)/len(after_sizes):.1f}, "
-          f"max={max(after_sizes)}, med={sorted(after_sizes)[len(after_sizes)//2]}")
+    # ── 分布保持验证（五项证据 + PNG）──
+    verify_distribution_preserved(
+        all_reads, cleaned, keep_ratio,
+        dataset_name="Seq_1D", png_path=png_path,
+    )
 
     return cleaned
 
@@ -396,7 +408,7 @@ def step56_write_output(cid_to_idxs, idx_map, read_path, ref_path):
 # ============================================================
 # Step 7: 自动部署到实验目录
 # ============================================================
-def step7_deploy(idx_map, clover_tag_path):
+def step7_deploy(idx_map, clover_tag_path, keep_ratio):
     """复制 read.txt/ref.txt 到实验目录，生成 GT tags 文件。"""
     banner("Step 7  部署到实验目录")
 
@@ -435,15 +447,38 @@ def step7_deploy(idx_map, clover_tag_path):
 
     print(f"  ✅ GT refs: {gt_refs_path}")
     print()
+    ratio_tag = f"p{keep_ratio}"
+    log_name = f"seq1d_{ratio_tag}_verify.log"
+    exp_rel = f"CC/Step0/Experiments/seq_1d_{ratio_tag}"
+    run_cmd = (
+        f"cd /mnt/st_data/liangxinyi/code\n"
+        f"python -m models.main_loop \\\n"
+        f"    --experiment_dir {exp_rel}/ \\\n"
+        f"    --feddna_checkpoint result/FLDNA_I/I_1214234233/model/epoch1_I.pth \\\n"
+        f"    --gt_tags_file {exp_rel}/seq1d_tags_reads.txt \\\n"
+        f"    --gt_refs_file {exp_rel}/seq1d_refs.txt \\\n"
+        f"    --max_iterations 3 --max_length 201 \\\n"
+        f"    --cl_mode ours --ref_length {REF_LEN} --primer_prefix 20 --primer_suffix 20 \\\n"
+        f"    --split_tau 5 --split_min_size 6 \\\n"
+        f"    2>&1 | tee {exp_rel}/{log_name}"
+    )
     print(f"  🚀 运行实验:")
-    print(f"     cd /mnt/st_data/liangxinyi/code/models")
-    print(f"     python main_loop.py \\")
-    print(f"       --experiment_dir {EXPERIMENT_DIR}/ \\")
-    print(f"       --feddna_checkpoint /mnt/st_data/liangxinyi/code/result/FLDNA_I/I_1214234233/model/epoch1_I.pth \\")
-    print(f"       --max_iterations 3 --max_length {REF_LEN} --cl_mode ours \\")
-    print(f"       --gt_tags_file {gt_tags_path} \\")
-    print(f"       --gt_refs_file {gt_refs_path} \\")
-    print(f"       2>&1 | tee seq1d_ours_v1.log")
+    for ln in run_cmd.split("\n"):
+        print(f"     {ln}")
+
+    # ── 评估命令（实验跑完后执行）──
+    eval_cmd = (
+        f"cd /mnt/st_data/liangxinyi/code/models\n"
+        f"python eval_reconstruction.py \\\n"
+        f"    --experiment_dir /mnt/st_data/liangxinyi/code/{exp_rel}/ \\\n"
+        f"    --gt_refs /mnt/st_data/liangxinyi/code/{exp_rel}/seq1d_refs.txt \\\n"
+        f"    --gt_tags /mnt/st_data/liangxinyi/code/{exp_rel}/seq1d_tags_reads.txt \\\n"
+        f"    --out reconstruction_eval_seq1d_{ratio_tag}.tsv"
+    )
+    print()
+    print(f"  📊 评估命令（实验跑完后执行）:")
+    for ln in eval_cmd.split("\n"):
+        print(f"     {ln}")
 
 
 # ============================================================
@@ -454,20 +489,40 @@ def main():
     parser = argparse.ArgumentParser(description='Seq_1D Pipeline（打薄版）')
     parser.add_argument('--skip_clover', action='store_true',
                         help='跳过 Clover，复用已有结果')
-    parser.add_argument('--max_reads_per_tag', type=int, default=MAX_READS_PER_TAG,
-                        help=f'每个 tag 最多保留的 reads 数（默认 {MAX_READS_PER_TAG}，FedDNA 用 5-30）')
+    parser.add_argument('--keep_ratio', type=float, default=KEEP_RATIO,
+                        help=f'全局随机打薄保留比例（默认 {KEEP_RATIO} = 1/5）')
     parser.add_argument('--min_reads', type=int, default=MIN_READS_PER_CLUSTER,
                         help=f'Clover 聚类后簇最少 reads 数（默认 {MIN_READS_PER_CLUSTER}）')
     args = parser.parse_args()
+
+    # ── 根据 keep_ratio 生成目录后缀，三个 p 完全对称、互不覆盖 ──
+    global OUTPUT_DIR, EXPERIMENT_DIR
+    ratio_tag = f"p{args.keep_ratio}"  # 例: p0.2 / p0.1 / p0.05
+    OUTPUT_DIR = os.path.join(BASE_DIR, f'clover_out_{ratio_tag}')
+    EXPERIMENT_DIR = f'/mnt/st_data/liangxinyi/code/CC/Step0/Experiments/seq_1d_{ratio_tag}'
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(os.path.join(OUTPUT_DIR, '04_FedDNA_In'), exist_ok=True)
     os.makedirs(EXPERIMENT_DIR, exist_ok=True)
 
+    # ── 开启 Tee：本 pipeline 全程输出同时写到实验目录 data_detail.txt ──
+    detail_path = os.path.join(EXPERIMENT_DIR, 'data_detail.txt')
+    _detail_fh = open(detail_path, 'w')
+    _orig_stdout = sys.stdout
+    sys.stdout = _Tee(_orig_stdout, _detail_fh)
+    print("=" * 60)
+    print("  运行命令:")
+    print(f"    python {os.path.abspath(__file__)} --keep_ratio {args.keep_ratio}"
+          + (f" --min_reads {args.min_reads}" if args.min_reads != MIN_READS_PER_CLUSTER else "")
+          + (" --skip_clover" if args.skip_clover else ""))
+    print(f"  日志文件: {detail_path}")
+    print("=" * 60)
+
     input_file       = os.path.join(BASE_DIR, 'output.txt')
     clover_input     = os.path.join(OUTPUT_DIR, '01_clover_input.txt')
     clover_tag_input = os.path.join(OUTPUT_DIR, '01_clover_tag_input.txt')
     clover_out_base  = os.path.join(OUTPUT_DIR, '02_clover_result')
+    dist_png         = os.path.join(EXPERIMENT_DIR, f'dist_preserve_{ratio_tag}.png')
     clover_out_txt   = clover_out_base + '.txt'
     stats_path       = os.path.join(OUTPUT_DIR, '03_stats.txt')
     read_path        = os.path.join(OUTPUT_DIR, '04_FedDNA_In', 'read.txt')
@@ -483,14 +538,14 @@ def main():
     print(f"  实验目录:         {EXPERIMENT_DIR}")
     print()
     print(f"  ref_len:          {REF_LEN}bp")
-    print(f"  max_reads/tag:    {args.max_reads_per_tag}  ← 打薄参数")
+    print(f"  keep_ratio:       {args.keep_ratio}  ← 全局随机打薄参数")
     print(f"  min_reads/簇:     {args.min_reads}")
     print(f"  Clover:           D={CLOVER_TREE_DEPTH} V={CLOVER_V_DRIFT} H={CLOVER_H_DRIFT}")
 
     t_start = time.time()
 
-    # Step 0: 预处理 + 打薄
-    cleaned = step0_preprocess_and_thin(input_file, args.max_reads_per_tag)
+    # Step 0: 预处理 + 全局随机打薄
+    cleaned = step0_preprocess_and_thin(input_file, args.keep_ratio, dist_png)
 
     # Step 1: 写 Clover 输入
     idx_map = step1_write_clover_input(cleaned, clover_input, clover_tag_input)
@@ -518,7 +573,7 @@ def main():
     step56_write_output(cid_to_idxs, idx_map, read_path, ref_path)
 
     # Step 7: 部署到实验目录
-    step7_deploy(idx_map, clover_tag_input)
+    step7_deploy(idx_map, clover_tag_input, args.keep_ratio)
 
     elapsed = time.time() - t_start
     print()
@@ -527,10 +582,14 @@ def main():
     print("=" * 60)
     print()
     print(f"  总耗时:         {elapsed:.1f}s ({elapsed/60:.1f} min)")
-    print(f"  打薄:           每 tag ≤ {args.max_reads_per_tag} reads")
+    print(f"  打薄:           全局随机保留 {args.keep_ratio} (seed={RANDOM_SEED})")
     print(f"  Purity:         {purity*100:.2f}%")
     print(f"  Coverage:       {coverage*100:.2f}%")
     print()
+
+    # ── 关闭 Tee ──
+    sys.stdout = _orig_stdout
+    _detail_fh.close()
 
 
 if __name__ == '__main__':

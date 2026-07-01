@@ -18,7 +18,538 @@ SSI-EC 证据学习模型 (Universal Edition)
   - 不确定性分解 decompose_uncertainty
 """
 import torch
+import torch.nn as nn# models/step1_model.py
+"""
+SSI-EC evidential learning model.
+
+ConMamba encoder -> RNNBlock evidential decoder producing Dirichlet evidence, from
+which epistemic / aleatoric uncertainty is decomposed. Training loss combines an
+uncertainty-weighted contrastive term (InfoNCE + memory queue), a masked Bayes-risk
+reconstruction term against the per-cluster pseudo-reference, and an annealed
+Dirichlet KL regularizer.
+"""
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from models.Model import Encoder, RNNBlock
+from utils.Loss import KLDivergenceLoss
+
+
+# ---------------------------------------------------------------------------
+# Masked Bayes risk loss
+# Masks padding positions (all-zero rows) so padding does not pollute the gradient
+# or the uncertainty estimate.
+# ---------------------------------------------------------------------------
+def masked_bayes_risk(evidence, consensus_target):
+    """
+    Args:
+        evidence:         (B, L, 4) model evidence
+        consensus_target: (B, L, 4) one-hot of the pseudo-reference; padding
+                          positions are all-zero rows [0,0,0,0]
+    Returns:
+        scalar loss, computed only at valid base positions (padding contributes 0)
+    """
+    # Padding positions: consensus_target row is all-zero (seq_to_onehot zero-pads
+    # beyond the sequence). Valid positions have at least one 1.
+    mask = consensus_target.sum(dim=-1) > 0  # (B, L), True at valid positions
+
+    alpha = evidence + 1.0                         # (B, L, 4)
+    S = alpha.sum(dim=-1, keepdim=True)            # (B, L, 1)
+
+    # CEBayesRisk: sum_c y_c * (psi(S) - psi(alpha_c)), per position
+    per_pos_loss = (consensus_target * (
+        torch.digamma(S) - torch.digamma(alpha)
+    )).sum(dim=-1)                                 # (B, L)
+
+    # Keep valid positions only
+    masked_loss = per_pos_loss * mask.float()      # (B, L)
+
+    # Divide by the true valid length, not the fixed max_length
+    valid_len = mask.float().sum(dim=-1).clamp(min=1.0)  # (B,)
+    loss_per_seq = masked_loss.sum(dim=-1) / valid_len   # (B,)
+
+    return loss_per_seq.mean()
+
+
+# ---------------------------------------------------------------------------
+# A. Uncertainty decomposition
+# ---------------------------------------------------------------------------
+def decompose_uncertainty(alpha):
+    """Decompose Dirichlet alpha into epistemic / aleatoric uncertainty
+    (FedDNA Eq.8 / Eq.9)."""
+    S = alpha.sum(dim=-1, keepdim=True)
+    rho = alpha / S
+
+    psi_alpha_plus1 = torch.digamma(alpha + 1)
+    psi_S_plus1 = torch.digamma(S + 1)
+
+    term1 = (rho * (psi_alpha_plus1 - psi_S_plus1)).sum(dim=-1)
+    log_rho = torch.log(rho.clamp(min=1e-10))
+    term2 = -(rho * log_rho).sum(dim=-1)
+    u_epi_per_pos = term1 + term2
+    u_epi = u_epi_per_pos.mean(dim=-1).clamp(min=0.0)
+
+    u_ale_per_pos = (rho * (psi_S_plus1 - psi_alpha_plus1)).sum(dim=-1)
+    u_ale = u_ale_per_pos.mean(dim=-1).clamp(min=0.0)
+
+    return u_epi, u_ale
+
+
+class Step1EvidentialModel(nn.Module):
+    def __init__(self,
+                 dim=256,
+                 max_length=150,
+                 num_clusters=50,
+                 device='cuda',
+                 queue_size=8192,
+                 tau_sim=0.1,
+                 tau_weight=1.0,
+                 r_ale=8.0,
+                 cl_mode='ours'):
+        super().__init__()
+
+        self.encoder = Encoder(dim=dim)
+        self.length_adapter = None
+        self.rnnblock = RNNBlock(in_channels=dim, lstm_hidden_dim=256, rnn_dropout_p=0.1)
+
+        self.projection_head = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim, 128)
+        )
+
+        self.dim = dim
+        self.max_length = max_length
+        self.num_clusters = num_clusters
+        self.device = device
+
+        self.tau_sim    = tau_sim
+        self.tau_weight = tau_weight
+        self.r_ale      = r_ale      # noise penalty exponent (1-max_U_ale)^r; larger = steeper
+        self.cl_mode    = cl_mode    # ablation mode: 'standard'|'ale_only'|'epi_only'|'ours'
+
+        # Memory queue
+        emb_dim = dim
+        self.queue_size = queue_size
+
+        self.register_buffer('queue_z',     torch.randn(queue_size, emb_dim))
+        self.register_buffer('queue_u_epi', torch.zeros(queue_size, 1))
+        self.register_buffer('queue_u_ale', torch.zeros(queue_size, 1))
+        self.register_buffer('queue_labels', torch.full((queue_size,), -1, dtype=torch.long))
+        self.register_buffer('queue_ptr',   torch.zeros(1, dtype=torch.long))
+        self.register_buffer('queue_count', torch.zeros(1, dtype=torch.long))
+
+        self.queue_z.copy_(F.normalize(torch.randn(queue_size, emb_dim), dim=-1))
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, proj_emb, u_epi, u_ale, labels):
+        B = proj_emb.shape[0]
+        ptr = int(self.queue_ptr.item())
+
+        # When B >= queue_size, keep only the last queue_size entries (avoids
+        # remain > queue_size overflow)
+        if B >= self.queue_size:
+            self.queue_z.copy_(proj_emb[-self.queue_size:].detach())
+            self.queue_u_epi.copy_(u_epi[-self.queue_size:].detach().unsqueeze(1))
+            self.queue_u_ale.copy_(u_ale[-self.queue_size:].detach().unsqueeze(1))
+            self.queue_labels.copy_(labels[-self.queue_size:].detach())
+            self.queue_ptr[0] = 0
+            self.queue_count[0] = self.queue_size
+            return
+
+        if ptr + B <= self.queue_size:
+            self.queue_z[ptr:ptr+B] = proj_emb.detach()
+            self.queue_u_epi[ptr:ptr+B] = u_epi.detach().unsqueeze(1)
+            self.queue_u_ale[ptr:ptr+B] = u_ale.detach().unsqueeze(1)
+            self.queue_labels[ptr:ptr+B] = labels.detach()
+        else:
+            space = self.queue_size - ptr
+            self.queue_z[ptr:] = proj_emb[:space].detach()
+            self.queue_u_epi[ptr:] = u_epi[:space].detach().unsqueeze(1)
+            self.queue_u_ale[ptr:] = u_ale[:space].detach().unsqueeze(1)
+            self.queue_labels[ptr:] = labels[:space].detach()
+            remain = B - space          # remain < queue_size (B >= queue_size handled above)
+            self.queue_z[:remain] = proj_emb[space:].detach()
+            self.queue_u_epi[:remain] = u_epi[space:].detach().unsqueeze(1)
+            self.queue_u_ale[:remain] = u_ale[space:].detach().unsqueeze(1)
+            self.queue_labels[:remain] = labels[space:].detach()
+
+        self.queue_ptr[0] = (ptr + B) % self.queue_size
+        self.queue_count[0] = min(self.queue_count[0] + B, self.queue_size)
+
+    # ------------------------------------------------------------------
+    # Encoder + Decoder
+    # ------------------------------------------------------------------
+    def encode_reads(self, reads):
+        # The FedDNA encoder expects (B, L, 4) and unsqueezes internally to treat
+        # it as a 2D image; pass it through directly without permute.
+        embeddings = self.encoder(reads)  # (B, L, dim)
+
+        if self.length_adapter is not None:
+            embeddings = self.length_adapter(embeddings.permute(0, 2, 1)).permute(0, 2, 1)
+
+        pooled_emb = embeddings.mean(dim=1)  # (B, dim)
+        return embeddings, pooled_emb
+
+    def decode_to_evidence(self, embeddings):
+        # RNNBlock: LSTM(dim->256) -> Linear(256->4) -> softplus, output (B, L, 4)
+        output = self.rnnblock(embeddings)   # (B, L, 4)
+        evidence = output                    # Softplus already applied inside RNNBlock
+
+        alpha = evidence + 1                 # Dirichlet parameters
+        strength = alpha.sum(dim=-1)         # (B, L), Dirichlet concentration
+        return evidence, strength, alpha
+
+    # ------------------------------------------------------------------
+    # Contrastive learning
+    # ------------------------------------------------------------------
+    def _pair_weight(self, ue_i, ue_j, ua_i, ua_j):
+        """Unified entry for the ablation: the pair-weight formula is selected by
+        cl_mode.
+
+          'standard' -- plain InfoNCE, w=1 (no weighting)
+          'ale_only' -- penalize noisy pairs using aleatoric uncertainty only
+          'epi_only' -- down-weight hard samples using epistemic uncertainty only
+          'ours'     -- full design (paper method)
+        """
+        if self.cl_mode == 'standard':
+            return torch.ones_like(ue_i)
+
+        elif self.cl_mode == 'ale_only':
+            return (1.0 - torch.max(ua_i, ua_j)).clamp(min=0.0) ** self.r_ale
+
+        elif self.cl_mode == 'epi_only':
+            return torch.exp(-(ue_i + ue_j) / self.tau_weight)
+
+        else:  # 'ours' (default)
+            epi_term = torch.exp(-(ue_i + ue_j) / self.tau_weight)
+            ale_term = (1.0 - torch.max(ua_i, ua_j)).clamp(min=0.0) ** self.r_ale
+            return epi_term * ale_term
+
+    def uncertainty_weighted_contrastive(self, pooled_emb, cluster_labels, u_epi, u_ale):
+        """Uncertainty-weighted contrastive loss.
+
+        Three key differences from plain InfoNCE:
+          1. U_epi and U_ale carry separate semantics, not summed together
+          2. positives are unweighted (no w in the numerator); negatives are
+             weighted (w_neg * exp in the denominator)
+          3. the loss is averaged with weight sum(w_{i,pos}), not a plain mean
+
+        Formula:
+          L = - (1/sum w_{i,pos}) sum_i w_{i,pos} * log[
+                    exp(s_{i,pos}/tau)
+                  / (exp(s_{i,pos}/tau) + sum_{k in N_i} w_{ik}*exp(s_{ik}/tau))
+              ]
+        """
+        proj_emb = F.normalize(pooled_emb, dim=-1)
+        B = proj_emb.shape[0]
+
+        # In-batch similarity + mask
+        sim_inbatch  = torch.matmul(proj_emb, proj_emb.T) / self.tau_sim  # (B, B)
+        labels_row   = cluster_labels.unsqueeze(1)
+        labels_col   = cluster_labels.unsqueeze(0)
+        self_mask    = torch.eye(B, dtype=torch.bool, device=self.device)
+        pos_mask_inbatch = (labels_row == labels_col) & ~self_mask         # (B, B)
+
+        # In-batch pair weights
+        ue_r = u_epi.unsqueeze(1).expand(B, B)
+        ue_c = u_epi.unsqueeze(0).expand(B, B)
+        ua_r = u_ale.unsqueeze(1).expand(B, B)
+        ua_c = u_ale.unsqueeze(0).expand(B, B)
+        w_inbatch = self._pair_weight(ue_r, ue_c, ua_r, ua_c)             # (B, B)
+
+        # Queue
+        if int(self.queue_count.item()) > 0:
+            q_count  = int(self.queue_count.item())
+            q_z      = self.queue_z[:q_count].detach().clone()             # (Q, 128)
+            q_labels = self.queue_labels[:q_count].detach().clone()
+            q_ue     = self.queue_u_epi[:q_count].detach().clone().squeeze(1)  # (Q,)
+            q_ua     = self.queue_u_ale[:q_count].detach().clone().squeeze(1)
+
+            sim_queue    = torch.matmul(proj_emb, q_z.T) / self.tau_sim   # (B, Q)
+            pos_mask_q   = (cluster_labels.unsqueeze(1) == q_labels.unsqueeze(0))
+
+            ue_r_q = u_epi.unsqueeze(1).expand(B, q_count)
+            ua_r_q = u_ale.unsqueeze(1).expand(B, q_count)
+            w_queue = self._pair_weight(
+                ue_r_q, q_ue.unsqueeze(0).expand(B, q_count),
+                ua_r_q, q_ua.unsqueeze(0).expand(B, q_count)
+            )                                                              # (B, Q)
+
+            sim_full      = torch.cat([sim_inbatch, sim_queue],  dim=1)   # (B, B+Q)
+            w_full        = torch.cat([w_inbatch,   w_queue],    dim=1)
+            pos_mask_full = torch.cat([pos_mask_inbatch, pos_mask_q], dim=1)
+        else:
+            sim_full      = sim_inbatch
+            w_full        = w_inbatch
+            pos_mask_full = pos_mask_inbatch
+
+        # Loss (positives unweighted, negatives weighted)
+        # Numerical stability: subtract the per-row max
+        sim_stable = sim_full - sim_full.max(dim=1, keepdim=True)[0].detach()
+        exp_sim    = torch.exp(sim_stable)                                 # (B, B+Q)
+
+        neg_mask_full = ~pos_mask_full & ~torch.cat(
+            [self_mask, torch.zeros(B, sim_full.shape[1]-B,
+                                    dtype=torch.bool, device=self.device)], dim=1
+        )
+
+        # Soft negative masking (adaptive annealing).
+        # High-similarity cross-cluster pairs (cos > 0.98) have their repulsion
+        # removed from the negative set: such pairs are most likely homologous
+        # fragments of the same molecule that Clover split apart, so pushing them
+        # away would erect a repulsion barrier against re-merging. The masking is
+        # data-driven: early in training proj_emb has not converged so few pairs
+        # cross the threshold (the masking is dormant); after convergence
+        # homologous fragments exceed 0.98 and the masking smoothly engages, with
+        # no manual schedule. It operates on proj_emb (L2-normalized, 128-d), the
+        # same hypersphere where the InfoNCE gradient lives, avoiding any space
+        # mismatch.
+        with torch.no_grad():
+            # proj_emb is L2-normalized, so matmul gives the cosine similarity matrix
+            cos_sim_batch   = torch.matmul(proj_emb, proj_emb.T)         # (B, B)
+            diff_label_mask = ~pos_mask_inbatch & ~self_mask             # in-batch cross-cluster, non-self
+            high_sim_mask   = (cos_sim_batch > 0.98) & diff_label_mask   # high-similarity cross-cluster pairs (threshold 0.98 to prevent collapse)
+
+        # Mask in-batch columns and queue columns alike: with an 8192-entry queue,
+        # homologous fragments are likely split across batch and queue, so the queue
+        # columns also need the high-similarity pairs masked.
+        neg_mask_full[:, :B] &= ~high_sim_mask   # in-batch columns
+
+        # Queue columns
+        if sim_full.shape[1] > B:
+            q_count = sim_full.shape[1] - B
+            with torch.no_grad():
+                q_z_local    = self.queue_z[:q_count].detach().clone()           # (Q, 128)
+                cos_sim_queue = torch.matmul(proj_emb, q_z_local.T)             # (B, Q)
+                q_labels_local = self.queue_labels[:q_count].detach().clone()   # (Q,)
+                diff_label_q   = (cluster_labels.unsqueeze(1) !=
+                                  q_labels_local.unsqueeze(0))                   # (B, Q)
+                high_sim_q     = (cos_sim_queue > 0.98) & diff_label_q   # high-similarity cross-cluster pairs in the queue
+            neg_mask_full[:, B:] &= ~high_sim_q
+            n_soft_masked_q = int(high_sim_q.sum().item())
+        else:
+            n_soft_masked_q = 0
+
+        n_soft_masked = int(high_sim_mask.sum().item()) + n_soft_masked_q
+
+        # Numerator: positive exp (unweighted)
+        pos_exp_sum = (exp_sim * pos_mask_full.float()).sum(dim=1)         # (B,)
+        # Denominator: positive exp + weighted negative exp
+        neg_exp_sum = (exp_sim * w_full * neg_mask_full.float()).sum(dim=1)
+        denominator = pos_exp_sum + neg_exp_sum + 1e-10
+        numerator   = pos_exp_sum + 1e-10
+        log_prob    = torch.log(numerator) - torch.log(denominator)        # (B,)
+
+        # has_pos must use pos_mask_full (includes queue), not pos_mask_inbatch: a
+        # read with no same-cluster sample in the batch but one in the queue would
+        # otherwise be dropped. w_pos_per_read likewise uses w_full * pos_mask_full
+        # so numerator weights and denominator positives stay aligned.
+        has_pos = (pos_mask_full.sum(dim=1) > 0)
+        if not has_pos.any():
+            self._dequeue_and_enqueue(proj_emb, u_epi, u_ale, cluster_labels)
+            return torch.tensor(0.0, device=self.device, requires_grad=True), {}
+
+        w_pos_per_read = (w_full * pos_mask_full.float()).sum(dim=1)[has_pos].clamp(min=1e-6)
+        loss = -(w_pos_per_read * log_prob[has_pos]).sum() / w_pos_per_read.sum()
+
+        # Diagnostic probes: verify the weights are polarized and the embedding is
+        # separating.
+        probe_stats = {}
+        probe_stats['soft_neg_masked'] = n_soft_masked   # soft-masking count (anneal progress)
+        with torch.no_grad():
+            ale_median = u_ale.median()
+            clean_mask = (u_ale < ale_median)
+            dirty_mask = (u_ale >= ale_median)
+
+            # Probe A: mean w_ij for clean-clean pairs vs dirty-any pairs
+            cc_mask = clean_mask.unsqueeze(1) & clean_mask.unsqueeze(0) & ~self_mask
+            dd_mask = dirty_mask.unsqueeze(1) & ~self_mask
+            if cc_mask.any():
+                probe_stats['w_clean_clean'] = w_inbatch[cc_mask].mean().item()
+            if dd_mask.any():
+                probe_stats['w_dirty_any']   = w_inbatch[dd_mask].mean().item()
+
+            # Probe B: mean cosine similarity of positives vs negatives (no /tau)
+            cos_sim = torch.matmul(proj_emb, proj_emb.T)                  # (B, B)
+            if pos_mask_inbatch.any():
+                probe_stats['cos_sim_pos'] = cos_sim[pos_mask_inbatch].mean().item()
+            neg_mask_inbatch = ~pos_mask_inbatch & ~self_mask
+            if neg_mask_inbatch.any():
+                probe_stats['cos_sim_neg'] = cos_sim[neg_mask_inbatch].mean().item()
+
+        self._dequeue_and_enqueue(proj_emb, u_epi, u_ale, cluster_labels)
+        return loss, probe_stats
+
+    # ------------------------------------------------------------------
+    # Reconstruction loss
+    # ------------------------------------------------------------------
+    def self_reconstruction_loss(self, evidence, alpha, cluster_labels, consensus_target):
+        """
+        Args:
+            evidence:         (B, L, 4) model evidence output
+            alpha:            (B, L, 4) Dirichlet parameters
+            cluster_labels:   (B,) cluster IDs
+            consensus_target: (B, L, 4) one-hot of the pseudo-reference
+        """
+        kld_loss_fn = KLDivergenceLoss().to(self.device)
+
+        # masked_bayes_risk masks padding positions (all-zero rows) to avoid
+        # gradient pollution
+        input_recon_loss = masked_bayes_risk(evidence, consensus_target)
+
+        total_kl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        processed_clusters = 0
+
+        unique_labels = torch.unique(cluster_labels)
+        for label in unique_labels:
+            if label < 0: continue
+            mask = (cluster_labels == label)
+            if mask.sum() < 2: continue
+
+            cluster_evidence = evidence[mask]
+            weights = F.softmax(
+                torch.log(alpha[mask].sum(dim=-1).mean(dim=1) + 1), dim=0
+            ).view(-1, 1, 1)
+            fused_evidence = torch.sum(
+                cluster_evidence * weights, dim=0, keepdim=True
+            ).detach()
+
+            target_one_hot = F.one_hot(
+                fused_evidence.argmax(dim=-1), num_classes=4
+            ).float().expand(mask.sum(), -1, -1)
+
+            # KL padding mask: at padding positions evidence is ~0 and argmax
+            # defaults to 0 (='A'); without masking, KL would force the model to
+            # emit a confident 'A' in blank regions, distorting the latent manifold.
+            # Fix: zero the evidence at padding (-> alpha=[1,1,1,1], the prior) and
+            # set the target to uniform (0.25), so KL(prior || prior)=0 with no gradient.
+            cluster_consensus = consensus_target[mask]
+            valid_pos = cluster_consensus[0].sum(dim=-1) > 0  # (L,)
+            padding_mask = ~valid_pos
+            if padding_mask.any():
+                cluster_evidence = cluster_evidence.clone()
+                cluster_evidence[:, padding_mask, :] = 0.0
+                target_one_hot = target_one_hot.clone()
+                target_one_hot[:, padding_mask, :] = 0.25
+
+            total_kl_loss = total_kl_loss + kld_loss_fn(cluster_evidence, target_one_hot)
+            processed_clusters += 1
+
+        if processed_clusters > 0:
+            total_kl_loss = total_kl_loss / processed_clusters
+
+        return input_recon_loss, total_kl_loss, {}
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+    def forward(self, reads, cluster_labels, consensus_target, epoch=0, round_idx=1):
+        """
+        Args:
+            reads:            (B, L, 4) one-hot input reads
+            cluster_labels:   (B,) cluster IDs
+            consensus_target: (B, L, 4) one-hot pseudo-reference
+            epoch:            current training epoch
+            round_idx:        current iteration round (controls annealing_coef)
+        """
+        embeddings, pooled_emb = self.encode_reads(reads)
+        evidence, strength, alpha = self.decode_to_evidence(embeddings)
+        strength_seq = strength.mean(dim=-1)
+
+        u_epi, u_ale = decompose_uncertainty(alpha)
+
+        con_loss, probe_stats = self.uncertainty_weighted_contrastive(
+            pooled_emb, cluster_labels, u_epi, u_ale
+        )
+
+        recon_loss, kl_loss, _ = self.self_reconstruction_loss(
+            evidence, alpha, cluster_labels, consensus_target
+        )
+
+        annealing_coef = min(1.0, max(0.0, (epoch - 5) / 10.0)) if round_idx == 1 else 1.0
+        total_loss = con_loss + recon_loss + annealing_coef * 0.05 * kl_loss
+
+        loss_dict = {
+            'total':           total_loss,
+            'contrastive':     con_loss,
+            'reconstruction':  recon_loss,
+            'kl_divergence':   kl_loss,
+            'annealing_coef':  annealing_coef
+        }
+        outputs = {
+            'avg_strength':     strength_seq.mean().item(),
+            'high_conf_ratio':  (strength_seq > 10.0).float().mean().item(),
+            'u_epi_mean':       u_epi.mean().item(),
+            'u_ale_mean':       u_ale.mean().item(),
+            'queue_count':      int(self.queue_count.item()),
+            'u_epi':            u_epi.detach(),
+            'u_ale':            u_ale.detach(),
+            # Diagnostic probes (printed per batch: weight polarization + soft-mask anneal)
+            'w_clean_clean':    probe_stats.get('w_clean_clean',   float('nan')),
+            'w_dirty_any':      probe_stats.get('w_dirty_any',     float('nan')),
+            'cos_sim_pos':      probe_stats.get('cos_sim_pos',     float('nan')),
+            'cos_sim_neg':      probe_stats.get('cos_sim_neg',     float('nan')),
+            'soft_neg_masked':  probe_stats.get('soft_neg_masked', 0),
+        }
+        return loss_dict, outputs
+
+
+# ---------------------------------------------------------------------------
+# Pretrained loading
+# ---------------------------------------------------------------------------
+def load_pretrained_feddna(model, path, device, max_length=150):
+    """Load FedDNA pretrained weights into the SSI-EC model.
+
+    length_adapter is dynamically restored: model.__init__ sets length_adapter to
+    None, so model.state_dict() lacks its keys and a `k in model_sd` filter would
+    silently drop the checkpoint's length_adapter weights. We probe the checkpoint
+    first and, if the dimensions are compatible with the current max_length,
+    instantiate length_adapter before filtering so the weights match and load.
+
+    Args:
+        model:      Step1EvidentialModel instance
+        path:       checkpoint path
+        device:     compute device
+        max_length: SSI-EC's unified sequence length. Both input and output dims of
+                    length_adapter must equal max_length to be compatible (in SSI-EC
+                    reads and consensus are both padded to max_length, so there is no
+                    length-mapping need).
+    """
+    try:
+        ckpt = torch.load(path, map_location=device)
+        sd = ckpt['model'] if 'model' in ckpt else (
+            ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+        )
+
+        # Dynamically probe and instantiate length_adapter before building model_sd.
+        # FedDNA's length_adapter is nn.Linear(noise_length, label_length), so
+        # weight shape = (label_length, noise_length) = (out_features, in_features).
+        # In SSI-EC the encoder output length = max_length, so both dims must equal
+        # max_length.
+        if 'length_adapter.weight' in sd:
+            sh = sd['length_adapter.weight'].shape  # (out_features, in_features)
+            if sh[1] == max_length and sh[0] == max_length:
+                # Both dims match, safe to load
+                import torch.nn as nn_
+                model.length_adapter = nn_.Linear(sh[1], sh[0]).to(device)
+                print(f"   dynamically restored length_adapter: Linear({sh[1]}, {sh[0]})")
+            else:
+                # Dim mismatch (FedDNA noise_length/label_length != max_length):
+                # skip length_adapter; Round 1 training adapts the model without it.
+                print(f"   [warn] checkpoint length_adapter dim {sh} "
+                      f"incompatible with max_length={max_length}, skipped")
+                print(f"   [hint] to use the full pretrained weights, set --max_length {sh[1]}")
+
+        # If length_adapter was instantiated, model.state_dict() now includes its keys
+        model_sd = model.state_dict()
+        new_sd = {k: v for k, v in sd.items() if k in model_sd and v.shape == model_sd[k].shape}
+        model.load_state_dict(new_sd, strict=False)
+        print(f"   loaded pretrained weights: {len(new_sd)} layers")
+    except Exception as e:
+        print(f"   [warn] weight loading failed: {e}")
+    return model
 import torch.nn.functional as F
 from models.Model import Encoder, RNNBlock
 from utils.Loss import CEBayesRiskLoss, KLDivergenceLoss

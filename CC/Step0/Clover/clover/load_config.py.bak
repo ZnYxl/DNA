@@ -9,12 +9,12 @@ import getopt
 import sys
 
 config_dict={
-    "read_len" : 152,
+    "read_len" : 110,
     "end_tree_len" : 15, 
     "other_tree_len" : 15,
     "other_tree_nums" : 2,
-    "thd_tree_loc" : 40,
-    "four_tree_loc" : 40,
+    "thd_tree_loc" : 21,
+    "four_tree_loc" : 56,
     "Vertical_drift" : 2,
     "Horizontal_drift" : 3,
     "tree_threshold" : 10,
@@ -24,7 +24,7 @@ config_dict={
     "Cluster_size_threshold" : 1,
     "h_index_nums" : 0,
     "e_index_nums" : 0,
-    "read_len_min" : 0,
+    "read_len_min" : 105,
 
     "align_fuc" : False ,
     "mmr_mode" : False ,
